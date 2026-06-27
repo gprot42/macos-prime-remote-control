@@ -1,0 +1,11 @@
+node_modules/
+dist/
+src-tauri/target/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+amazon/out/
+amazon/play/
+amazon/searchcontent/
+amazon/showcontent/

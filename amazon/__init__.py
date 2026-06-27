@@ -1,0 +1,1 @@
+"""Amazon Prime Video helpers for LG webOS integration."""
