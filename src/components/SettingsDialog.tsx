@@ -62,8 +62,8 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
   const [projectRoot, setProjectRoot] = useState(config.project_root);
   const [cacheTtl, setCacheTtl] = useState(config.cache_ttl_secs ?? 21600);
   const [showPrime, setShowPrime] = useState(config.show_prime ?? true);
-  const [showChannel, setShowChannel] = useState(config.show_channel ?? true);
-  const [showRentBuy, setShowRentBuy] = useState(config.show_rent_buy ?? true);
+  const [showChannel, setShowChannel] = useState(config.show_channel ?? false);
+  const [showRentBuy, setShowRentBuy] = useState(config.show_rent_buy ?? false);
   const [showOther, setShowOther] = useState(config.show_other ?? true);
 
   const [saving, setSaving] = useState(false);

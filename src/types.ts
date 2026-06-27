@@ -51,8 +51,8 @@ export const DEFAULT_CONFIG: AppConfig = {
   project_root: "",
   cache_ttl_secs: 21600,
   show_prime: true,
-  show_channel: true,
-  show_rent_buy: true,
+  show_channel: false,
+  show_rent_buy: false,
   show_other: true,
 };
 

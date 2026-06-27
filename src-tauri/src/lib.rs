@@ -21,10 +21,10 @@ pub struct AppConfig {
     #[serde(default = "default_true")]
     pub show_prime: bool,
     /// Show titles available via a channel add-on (e.g. Lionsgate+, Max).
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub show_channel: bool,
     /// Show titles that require renting or buying.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub show_rent_buy: bool,
     /// Show titles with unknown / unresolved availability.
     #[serde(default = "default_true")]
@@ -39,6 +39,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_false() -> bool {
+    false
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
@@ -47,8 +51,8 @@ impl Default for AppConfig {
             project_root: default_project_root().to_string_lossy().to_string(),
             cache_ttl_secs: default_ttl(),
             show_prime: true,
-            show_channel: true,
-            show_rent_buy: true,
+            show_channel: false,
+            show_rent_buy: false,
             show_other: true,
         }
     }
@@ -900,8 +904,18 @@ async fn list_episodes(content_id: String) -> Result<String, String> {
 // App entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(target_os = "macos")]
+fn set_macos_process_name(name: &str) {
+    use objc2_foundation::{NSProcessInfo, NSString};
+    let process_name = NSString::from_str(name);
+    NSProcessInfo::processInfo().setProcessName(&process_name);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "macos")]
+    set_macos_process_name("Prime Remote Control");
+
     let port_state = ImageServerPort(Arc::new(Mutex::new(0u16)));
     let port_arc = Arc::clone(&port_state.0);
 
