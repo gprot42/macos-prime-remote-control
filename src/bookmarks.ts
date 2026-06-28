@@ -1,4 +1,29 @@
-import { Bookmark, PrimeTitle, PrimeEpisode } from "./types";
+import { Bookmark, CatalogGroup, PrimeTitle, PrimeEpisode } from "./types";
+
+export function isMovieBookmark(item: PrimeTitle): boolean {
+  return item.entity_type === "Movie";
+}
+
+export function isTvBookmark(item: PrimeTitle): boolean {
+  return item.entity_type === "TV Show" || item.entity_type === "TV Episode";
+}
+
+/** Split bookmark items into Movies and TV Series carousel rows. */
+export function groupBookmarks(items: PrimeTitle[]): CatalogGroup[] {
+  const movies: PrimeTitle[] = [];
+  const tv: PrimeTitle[] = [];
+  const other: PrimeTitle[] = [];
+  for (const item of items) {
+    if (isMovieBookmark(item)) movies.push(item);
+    else if (isTvBookmark(item)) tv.push(item);
+    else other.push(item);
+  }
+  const groups: CatalogGroup[] = [];
+  if (movies.length > 0) groups.push({ label: "Movies", items: movies });
+  if (tv.length > 0) groups.push({ label: "TV Series", items: tv });
+  if (other.length > 0) groups.push({ label: "Other", items: other });
+  return groups;
+}
 
 /** Stable bookmark key for a title or a specific episode. */
 export function bookmarkId(item: PrimeTitle, episode?: PrimeEpisode | null): string {

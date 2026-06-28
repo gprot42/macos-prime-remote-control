@@ -17,7 +17,10 @@ import {
 import {
   bookmarkSnapshot,
   findBookmark,
+  groupBookmarks,
   isEpisodeBookmark,
+  isMovieBookmark,
+  isTvBookmark,
   resolveEpisodePlayId,
 } from "./bookmarks";
 import CatalogGroupRow from "./components/CatalogGroup";
@@ -475,14 +478,15 @@ export default function App() {
       return isTitleVisible(item, config);
     });
     if (viewMode === "bookmarks") {
-      return items.length > 0 ? [{ label: "Saved titles", items }] : [];
+      return groupBookmarks(items);
     }
     return groupTitles(items).filter((g) => g.items.length > 0);
   }, [sourceItems, typeFilter, config, viewMode]);
 
   const totalFiltered = filteredGroups.reduce((s, g) => s + g.items.length, 0);
-  const movieCount    = sourceItems.filter((i) => i.entity_type === "Movie").length;
-  const showCount     = sourceItems.filter((i) => i.entity_type === "TV Show").length;
+  const movieCount    = sourceItems.filter((i) => isMovieBookmark(i)).length;
+  const showCount     = sourceItems.filter((i) => isTvBookmark(i)).length;
+  const sourceCount   = sourceItems.length;
 
   const isLoading = viewMode === "catalog" && (loadState === "loading" || searching);
   const activeCollection = COLLECTIONS.find((c) => c.slug === collection)!;
@@ -691,7 +695,7 @@ export default function App() {
           <div className="flex items-center gap-1 px-6 pb-2.5">
             {(
               [
-                { key: "all",     label: "All",      count: allItems.length },
+                { key: "all",     label: "All",      count: sourceCount },
                 { key: "Movie",   label: "Movies",   count: movieCount },
                 { key: "TV Show", label: "TV Shows", count: showCount },
               ] as { key: EntityTypeFilter; label: string; count: number }[]
