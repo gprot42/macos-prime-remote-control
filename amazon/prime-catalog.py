@@ -556,27 +556,69 @@ def _entities_to_titles(
     return dedupe_titles(titles)
 
 
-def _merge_collection_pages(
+COLLECTION_ALIASES: dict[str, str] = {
+    # Prime Video's /collection/TopRatedMovies page is empty; TopRated has the catalog.
+    "TopRatedMovies": "TopRated",
+    "topratedmovies": "TopRated",
+}
+
+GENRE_LABELS: dict[str, str] = {
+    "science-fiction": "Sci-Fi",
+}
+
+
+def resolve_collection_slug(slug: str) -> str:
+    slug = slug.strip("/")
+    return COLLECTION_ALIASES.get(slug, slug)
+
+
+def parse_catalog_slug(slug: str) -> tuple[str, str]:
+    """Return (storefront_kind, slug) for collection or genre pages."""
+    slug = resolve_collection_slug(slug.strip("/"))
+    if slug.startswith("genre/"):
+        return "genre", slug.removeprefix("genre/").strip("/")
+    return "collection", slug
+
+
+def list_genres() -> list[tuple[str, str]]:
+    """Return (slug, label) pairs scraped from Prime Video /categories."""
+    html = fetch_html(f"{BASE_URL}/categories")
+    slugs = sorted(set(re.findall(r"/genre/([a-z0-9-]+)", html)))
+    return [
+        (
+            f"genre/{slug}",
+            GENRE_LABELS.get(slug, slug.replace("-", " ").title()),
+        )
+        for slug in slugs
+    ]
+
+
+def _storefront_url(kind: str, slug: str, *, page: int = 1) -> str:
+    slug = slug.strip("/")
+    base = f"{BASE_URL}/{kind}/{slug}"
+    if page <= 1:
+        return base
+    return f"{base}?page={page}"
+
+
+def _merge_storefront_pages(
     slug: str,
     *,
+    kind: str = "collection",
     max_pages: int = 8,
     full_carousels: bool = False,
     max_carousel_rounds: int = 10,
 ) -> tuple[list[PrimeTitle], str]:
-    """Fetch a collection storefront across paginated ?page=N views."""
+    """Fetch a collection or genre storefront across paginated ?page=N views."""
     slug = slug.strip("/")
-    source = f"collection:{slug}"
+    source = f"{kind}:{slug}"
     seen: dict[str, PrimeTitle] = {}
     order: list[str] = []
     last_html = ""
     completed_carousel_targets: set[str] = set()
 
     for page in range(1, max_pages + 1):
-        url = (
-            f"{BASE_URL}/collection/{slug}"
-            if page == 1
-            else f"{BASE_URL}/collection/{slug}?page={page}"
-        )
+        url = _storefront_url(kind, slug, page=page)
         html = fetch_html(url)
         last_html = html
         groups = extract_collection_groups(
@@ -613,8 +655,10 @@ def list_collection(
     full_carousels: bool = True,
     max_carousel_rounds: int = 10,
 ) -> list[PrimeTitle]:
-    items, html = _merge_collection_pages(
-        slug,
+    kind, bare_slug = parse_catalog_slug(slug)
+    items, html = _merge_storefront_pages(
+        bare_slug,
+        kind=kind,
         full_carousels=full_carousels,
         max_carousel_rounds=max_carousel_rounds,
     )
@@ -980,14 +1024,22 @@ def parse_args() -> argparse.Namespace:
   %(prog)s --url https://www.primevideo.com/detail/0P3ONZ4IHQ75ZC4ZMIZ9D4NE7Q
   %(prog)s --search superman --resolve-asin --json
 
-Known collections (region-dependent): newandupcoming, IncludedwithPrime, TopRatedMovies""",
+Known collections (region-dependent): newandupcoming, IncludedwithPrime, TopRated
+  Genre slugs: genre/action, genre/anime, genre/comedy, genre/documentary, genre/drama,
+    genre/fantasy, genre/historical, genre/horror, genre/romance, genre/science-fiction,
+    genre/suspense (use --list-genres to refresh from Prime Video)""",
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--search", metavar="QUERY", help="Search Prime Video")
     group.add_argument(
         "--collection",
         metavar="SLUG",
-        help="List titles from a Prime Video collection page",
+        help="List titles from a Prime Video collection or genre page",
+    )
+    group.add_argument(
+        "--list-genres",
+        action="store_true",
+        help="List genre slugs from Prime Video /categories",
     )
     group.add_argument(
         "--url",
@@ -1050,6 +1102,10 @@ def main() -> None:
     args = parse_args()
 
     try:
+        if args.list_genres:
+            for slug, label in list_genres():
+                print(f"{slug}\t{label}")
+            return
         if args.search:
             items = search_prime(args.search)
         elif args.collection:

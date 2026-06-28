@@ -30,9 +30,20 @@ import type { PlaybackState } from "./components/TVRemote";
 
 // ─── Collection definitions ───────────────────────────────────────────────────
 const COLLECTIONS = [
-  { slug: "IncludedwithPrime", label: "Included with Prime", color: "emerald" },
-  { slug: "newandupcoming",    label: "New & Upcoming",      color: "sky"     },
-  { slug: "TopRatedMovies",    label: "Top Rated Movies",    color: "amber"   },
+  { slug: "IncludedwithPrime",      label: "Included with Prime", color: "emerald" },
+  { slug: "newandupcoming",         label: "New & Upcoming",      color: "sky"     },
+  { slug: "TopRated",               label: "Top Rated",           color: "amber"   },
+  { slug: "genre/action",           label: "Action",              color: "orange"  },
+  { slug: "genre/anime",            label: "Anime",               color: "pink"    },
+  { slug: "genre/comedy",           label: "Comedy",              color: "yellow"  },
+  { slug: "genre/documentary",      label: "Documentary",         color: "teal"    },
+  { slug: "genre/drama",            label: "Drama",               color: "rose"    },
+  { slug: "genre/fantasy",          label: "Fantasy",             color: "indigo"  },
+  { slug: "genre/historical",       label: "Historical",          color: "stone"   },
+  { slug: "genre/horror",           label: "Horror",              color: "red"     },
+  { slug: "genre/romance",          label: "Romance",             color: "fuchsia" },
+  { slug: "genre/science-fiction",  label: "Sci-Fi",              color: "violet"  },
+  { slug: "genre/suspense",         label: "Suspense",            color: "cyan"    },
 ] as const;
 
 type CollectionSlug = (typeof COLLECTIONS)[number]["slug"];
@@ -624,13 +635,27 @@ export default function App() {
 
         {/* Collection tabs (hidden when searching) */}
         {!searchQuery && (
-          <div className="flex items-center gap-1 px-6 pt-0.5 pb-2">
+          <div
+            className="flex items-center gap-1 px-6 pt-0.5 pb-2 overflow-x-auto"
+            style={{ scrollbarWidth: "thin" }}
+          >
             {COLLECTIONS.map((col) => {
               const active = viewMode === "catalog" && col.slug === collection;
               const colorMap: Record<string, string> = {
                 emerald: active ? "bg-emerald-600 text-white" : "text-emerald-400/70 hover:text-emerald-300",
                 sky:     active ? "bg-sky-600 text-white"     : "text-sky-400/70 hover:text-sky-300",
                 amber:   active ? "bg-amber-600 text-white"   : "text-amber-400/70 hover:text-amber-300",
+                violet:  active ? "bg-violet-600 text-white" : "text-violet-400/70 hover:text-violet-300",
+                rose:    active ? "bg-rose-600 text-white"    : "text-rose-400/70 hover:text-rose-300",
+                yellow:  active ? "bg-yellow-600 text-white"  : "text-yellow-400/70 hover:text-yellow-300",
+                red:     active ? "bg-red-600 text-white"     : "text-red-400/70 hover:text-red-300",
+                orange:  active ? "bg-orange-600 text-white" : "text-orange-400/70 hover:text-orange-300",
+                pink:    active ? "bg-pink-600 text-white"    : "text-pink-400/70 hover:text-pink-300",
+                teal:    active ? "bg-teal-600 text-white"    : "text-teal-400/70 hover:text-teal-300",
+                indigo:  active ? "bg-indigo-600 text-white"  : "text-indigo-400/70 hover:text-indigo-300",
+                stone:   active ? "bg-stone-600 text-white"   : "text-stone-400/70 hover:text-stone-300",
+                fuchsia: active ? "bg-fuchsia-600 text-white" : "text-fuchsia-400/70 hover:text-fuchsia-300",
+                cyan:    active ? "bg-cyan-600 text-white"    : "text-cyan-400/70 hover:text-cyan-300",
               };
               return (
                 <button
@@ -648,23 +673,6 @@ export default function App() {
                 </button>
               );
             })}
-            <button
-              onClick={() => setViewMode("bookmarks")}
-              className={`px-3.5 py-1.5 rounded-full text-xs font-semibold transition-colors ${
-                viewMode === "bookmarks"
-                  ? "bg-amber-600 text-white"
-                  : "text-amber-400/70 hover:text-amber-300 hover:bg-zinc-800/60"
-              }`}
-            >
-              Bookmarks
-              {bookmarks.length > 0 && (
-                <span className={`ml-1.5 text-[10px] ${
-                  viewMode === "bookmarks" ? "text-amber-100" : "text-amber-500/80"
-                }`}>
-                  {bookmarks.length}
-                </span>
-              )}
-            </button>
             {showCatalogData && allItems.length > 0 && (
               <span className="ml-2 text-xs text-zinc-600">
                 {allItems.length} titles
