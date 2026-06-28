@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -82,6 +82,55 @@ fn save_config_to_disk(cfg: &AppConfig) -> Result<(), String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Bookmarks
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bookmark {
+    pub content_id: String,
+    pub added_at: u64,
+    pub item: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_item: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_content_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub play_episode: Option<i32>,
+}
+
+fn bookmarks_path() -> PathBuf {
+    home_dir()
+        .join(".config")
+        .join("prime-remote-control-bookmarks.json")
+}
+
+fn load_bookmarks() -> Vec<Bookmark> {
+    let path = bookmarks_path();
+    if path.exists() {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(list) = serde_json::from_str::<Vec<Bookmark>>(&data) {
+                return list;
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn save_bookmarks_to_disk(bookmarks: &[Bookmark]) -> Result<(), String> {
+    let path = bookmarks_path();
+    ensure_dir(&path)?;
+    let data = serde_json::to_string_pretty(bookmarks).map_err(|e| e.to_string())?;
+    std::fs::write(&path, data).map_err(|e| e.to_string())
+}
+
+fn bookmark_content_id(item: &serde_json::Value) -> Result<String, String> {
+    item.get("content_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "Missing content_id".to_string())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Filesystem helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -112,7 +161,6 @@ fn image_cache_dir() -> PathBuf {
 }
 
 /// Sanitise a content_id so it is safe to use as a filename (used by cache-images.py side).
-#[allow(dead_code)]
 fn safe_filename(content_id: &str) -> String {
     content_id
         .chars()
@@ -163,20 +211,24 @@ async fn handle_image_conn(mut conn: tokio::net::TcpStream) {
         .and_then(|l| l.split_whitespace().nth(1))
         .unwrap_or("/")
         .trim_start_matches('/')
+        .split('?')
+        .next()
+        .unwrap_or("")
         .to_string();
+
+    // Only serve bare filenames from the cache directory (no path segments).
+    let safe_name = !filename.is_empty()
+        && !filename.contains('/')
+        && !filename.contains('\\')
+        && !filename.contains("..")
+        && filename
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.');
 
     let cache_dir = image_cache_dir();
     let file_path = cache_dir.join(&filename);
 
-    // Path-traversal guard: resolved path must stay inside cache_dir
-    let safe = file_path
-        .canonicalize()
-        .ok()
-        .and_then(|p| cache_dir.canonicalize().ok().map(|d| (p, d)))
-        .map(|(p, d)| p.starts_with(d))
-        .unwrap_or(false);
-
-    if safe {
+    if safe_name {
         if let Ok(data) = tokio::fs::read(&file_path).await {
             let header = format!(
                 "HTTP/1.1 200 OK\r\n\
@@ -305,6 +357,35 @@ fn python_exe(root: &PathBuf) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Tauri commands — external links
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let url = url.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("Only http(s) URLs are allowed".to_string());
+    }
+    if !url.contains("themoviedb.org") {
+        return Err("Only themoviedb.org links are allowed".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .status()
+            .map_err(|e| format!("Failed to open URL: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Opening URLs is only supported on macOS".to_string())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tauri commands — config
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -316,6 +397,73 @@ async fn get_config() -> Result<AppConfig, String> {
 #[tauri::command]
 async fn save_config(cfg: AppConfig) -> Result<(), String> {
     save_config_to_disk(&cfg)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tauri commands — bookmarks
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn get_bookmarks() -> Result<Vec<Bookmark>, String> {
+    Ok(load_bookmarks())
+}
+
+#[tauri::command]
+async fn add_bookmark(item: serde_json::Value) -> Result<(), String> {
+    let content_id = bookmark_content_id(&item)?;
+    let mut bookmarks = load_bookmarks();
+    if bookmarks.iter().any(|b| b.content_id == content_id) {
+        return Ok(());
+    }
+    bookmarks.insert(
+        0,
+        Bookmark {
+            content_id,
+            added_at: now_secs(),
+            item,
+            source_item: None,
+            episode_content_id: None,
+            play_episode: None,
+        },
+    );
+    save_bookmarks_to_disk(&bookmarks)
+}
+
+#[tauri::command]
+async fn remove_bookmark(content_id: String) -> Result<(), String> {
+    let mut bookmarks = load_bookmarks();
+    bookmarks.retain(|b| b.content_id != content_id);
+    save_bookmarks_to_disk(&bookmarks)
+}
+
+#[tauri::command]
+async fn toggle_bookmark(
+    item: serde_json::Value,
+    source_item: Option<serde_json::Value>,
+    episode_content_id: Option<String>,
+    play_episode: Option<i32>,
+) -> Result<bool, String> {
+    let content_id = bookmark_content_id(&item)?;
+    let mut bookmarks = load_bookmarks();
+    if let Some(pos) = bookmarks.iter().position(|b| b.content_id == content_id) {
+        bookmarks.remove(pos);
+        save_bookmarks_to_disk(&bookmarks)?;
+        Ok(false)
+    } else {
+        bookmarks.insert(
+            0,
+            Bookmark {
+                content_id,
+                added_at: now_secs(),
+                item,
+                source_item,
+                episode_content_id,
+                play_episode,
+            },
+        );
+        save_bookmarks_to_disk(&bookmarks)?;
+        Ok(true)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -512,7 +660,8 @@ async fn prefetch_images(app: tauri::AppHandle, items: Vec<ImageItem>) -> Result
             let mut parts = rest.splitn(2, '\t');
             // Emit just the content_id — frontend constructs URL via image server port
             if let Some(content_id) = parts.next() {
-                let _ = app.emit("image-cached", content_id.to_string());
+                let stem = safe_filename(content_id);
+                let _ = app.emit("image-cached", stem);
             }
         }
     }
@@ -911,6 +1060,24 @@ fn set_macos_process_name(name: &str) {
     NSProcessInfo::processInfo().setProcessName(&process_name);
 }
 
+/// Set the Dock/window icon when running an unbundled binary (avoids the generic "exec" tile).
+fn set_app_icon(app: &tauri::App) -> Result<(), String> {
+    let icon = tauri::include_image!("icons/icon.png");
+    if let Some(window) = app.handle().get_webview_window("main") {
+        window.set_icon(icon).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn prevent_default_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    use tauri_plugin_prevent_default::Flags;
+
+    // Block the native WKWebView menu (dev shows "Reload" only) so our custom menus work.
+    tauri_plugin_prevent_default::Builder::new()
+        .with_flags(Flags::CONTEXT_MENU | Flags::RELOAD | Flags::pointer())
+        .build()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "macos")]
@@ -920,8 +1087,10 @@ pub fn run() {
     let port_arc = Arc::clone(&port_state.0);
 
     tauri::Builder::default()
+        .plugin(prevent_default_plugin())
         .manage(port_state)
-        .setup(move |_app| {
+        .setup(move |app| {
+            set_app_icon(app)?;
             let port_arc = Arc::clone(&port_arc);
             tauri::async_runtime::spawn(async move {
                 let port = start_image_server().await;
@@ -930,8 +1099,13 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            open_external_url,
             get_config,
             save_config,
+            get_bookmarks,
+            add_bookmark,
+            remove_bookmark,
+            toggle_bookmark,
             load_catalog,
             search_catalog,
             play_on_tv,

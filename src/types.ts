@@ -1,3 +1,23 @@
+/** Short cache-bust token for locally cached poster JPEGs. */
+export function imageUrlVersion(url: string): string {
+  let h = 0;
+  for (let i = 0; i < url.length; i++) {
+    h = (Math.imul(31, h) + url.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h).toString(36);
+}
+
+export function cachedImageHttpUrl(
+  port: number,
+  contentId: string,
+  imageUrl: string | null | undefined,
+): string | undefined {
+  if (!port || !imageUrl) return undefined;
+  const stem = contentId.replace(/[^\w\-]/g, "_");
+  const v = imageUrlVersion(imageUrl);
+  return `http://127.0.0.1:${port}/${stem}.jpg?v=${v}`;
+}
+
 export interface PrimeTitle {
   title: string;
   content_id: string;
@@ -71,6 +91,18 @@ export interface CatalogGroup {
   items: PrimeTitle[];
 }
 
+export interface Bookmark {
+  content_id: string;
+  added_at: number;
+  item: PrimeTitle;
+  /** Original series item when bookmarking a specific episode. */
+  source_item?: PrimeTitle | null;
+  /** Episode detail ID to launch on the TV (most reliable for episode bookmarks). */
+  episode_content_id?: string | null;
+  /** Episode number to play when opening an episode bookmark. */
+  play_episode?: number | null;
+}
+
 // ─── Availability label ───────────────────────────────────────────────────────
 
 export type AccessLabel = "Prime" | "Channel" | "Rent/Buy" | "Rent" | "Buy" | "?" | "-";
@@ -86,13 +118,27 @@ export function getAccessLabel(item: PrimeTitle): AccessLabel {
   if (item.buy_from) return "Buy";
   const s = (item.availability || "").toLowerCase();
   if (!s) return "-";
-  // A per-title monthly subscription price (e.g. "auto-renews at $4.99/month",
-  // "4.99 per month") is a paid channel add-on — NOT Prime. Check this before
-  // the "auto-renew"/"prime" heuristics below so it isn't mislabeled as Prime.
+  // Prime membership trial/renewal copy (not a channel add-on).
+  if (
+    s.includes("prime trial") ||
+    s.includes("free prime") ||
+    s.includes("trial of prime") ||
+    (s.includes("prime") && s.includes("trial"))
+  ) {
+    return "Prime";
+  }
+  // Regional Prime upsell omits the word "Prime" (e.g. "Auto-renews at SEK 69/month after trial").
+  if (
+    (s.includes("auto-renew") || s.includes("auto renew")) &&
+    s.includes("after trial")
+  ) {
+    return "Prime";
+  }
+  // Paid channel add-on monthly pricing — but not Prime membership renewal.
   const monthlyPrice = /\d+(?:[.,]\d+)?\s*(?:\/|per\s+|a\s+)mo(?:nth)?\b/.test(s);
   const autoRenewMonthly =
     (s.includes("auto-renew") || s.includes("auto renew")) && s.includes("month");
-  if (monthlyPrice || autoRenewMonthly) return "Channel";
+  if ((monthlyPrice || autoRenewMonthly) && !s.includes("prime")) return "Channel";
   if (s.includes("rent") || s.includes("buy")) return "Rent/Buy";
   if (s.includes("channel")) return "Channel";
   if (

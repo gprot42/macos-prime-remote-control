@@ -1,16 +1,32 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { isBookmarked } from "../bookmarks";
 import { PrimeTitle, PrimeEpisode, getAccessLabel, accessBadgeStyle, AppConfig } from "../types";
+import { ContextMenuItem } from "./ContextMenu";
+import { showMediaContextMenu } from "../contextMenuBus";
+import { BookmarkIcon, ExternalLinkIcon, PlayIcon } from "./BookmarkMenuIcons";
+import { openTmdbLookup, tmdbUrlForEpisode, tmdbUrlForTitle } from "../tmdb";
 
 interface PlayDialogProps {
   item: PrimeTitle;
   config: AppConfig;
+  initialEpisode?: number | null;
+  /** When set, launch this Prime detail ID instead of item.content_id + episode. */
+  launchContentId?: string | null;
+  bookmarkedIds?: Set<string>;
+  onToggleBookmark?: (
+    item: PrimeTitle,
+    options?: {
+      episode?: PrimeEpisode | null;
+      episodeIndex?: number;
+      sourceItem?: PrimeTitle;
+      playEpisode?: number;
+    }
+  ) => void;
   onClose: () => void;
   onOpenSettings: () => void;
-  /** Called immediately when the user presses Play — before the TV command runs. */
   onStartPlaying: (item: PrimeTitle, episode: number | null) => void;
-  /** Called after the TV command succeeds — used to close the dialog. */
   onPlayed: (item: PrimeTitle) => void;
 }
 
@@ -19,6 +35,10 @@ type PlayState = "idle" | "playing" | "done" | "error";
 export default function PlayDialog({
   item,
   config,
+  initialEpisode = null,
+  launchContentId = null,
+  bookmarkedIds,
+  onToggleBookmark,
   onClose,
   onOpenSettings,
   onStartPlaying,
@@ -33,7 +53,8 @@ export default function PlayDialog({
 
   // TV series episode selection (movies ignore this)
   const isSeries = item.entity_type === "TV Show";
-  const [episode, setEpisode] = useState(1);
+  const [episode, setEpisode] = useState(initialEpisode ?? 1);
+
 
   // Full episode list (fetched for TV shows). Falls back to the numeric
   // stepper when the list can't be loaded.
@@ -68,6 +89,79 @@ export default function PlayDialog({
     };
   }, [isSeries, item.content_id]);
 
+  useEffect(() => {
+    if (initialEpisode != null) setEpisode(initialEpisode);
+  }, [initialEpisode, item.content_id]);
+
+  const openMenu = (e: React.MouseEvent, items: ContextMenuItem[]) => {
+    e.preventDefault();
+    e.stopPropagation();
+    window.getSelection()?.removeAllRanges();
+    if (items.length > 0) {
+      showMediaContextMenu({ x: e.clientX, y: e.clientY, items });
+    }
+  };
+
+  const titleBookmarked = bookmarkedIds ? isBookmarked(bookmarkedIds, item) : false;
+
+  const titleMenuItems = (): ContextMenuItem[] => {
+    const items: ContextMenuItem[] = [
+      {
+        label: "Look up on TMDB",
+        icon: <ExternalLinkIcon />,
+        onClick: () => void openTmdbLookup(tmdbUrlForTitle(item)),
+      },
+    ];
+    if (onToggleBookmark) {
+      items.push({
+        label: titleBookmarked
+          ? "Remove bookmark"
+          : isSeries
+          ? "Bookmark series"
+          : "Bookmark",
+        icon: <BookmarkIcon filled={titleBookmarked} />,
+        onClick: () => onToggleBookmark(item),
+        destructive: titleBookmarked,
+      });
+    }
+    return items;
+  };
+
+  const episodeMenuItems = (ep: PrimeEpisode, idx: number): ContextMenuItem[] => {
+    const epNum = ep.sequence_number ?? idx + 1;
+    const bookmarked = bookmarkedIds ? isBookmarked(bookmarkedIds, item, ep) : false;
+    const items: ContextMenuItem[] = [
+      {
+        label: `Play episode ${epNum}`,
+        icon: <PlayIcon />,
+        onClick: () => {
+          setEpisode(idx + 1);
+          void handlePlayAt(idx + 1);
+        },
+      },
+    ];
+    items.push({
+      label: "Look up episode on TMDB",
+      icon: <ExternalLinkIcon />,
+      onClick: () => void openTmdbLookup(tmdbUrlForEpisode(item, ep, idx)),
+    });
+    if (onToggleBookmark) {
+      items.push({
+        label: bookmarked ? "Remove bookmark" : "Bookmark episode",
+        icon: <BookmarkIcon filled={bookmarked} />,
+        onClick: () =>
+          onToggleBookmark(item, {
+            episode: ep,
+            episodeIndex: idx,
+            sourceItem: item,
+            playEpisode: epNum,
+          }),
+        destructive: bookmarked,
+      });
+    }
+    return items;
+  };
+
   const hasEpisodeList = isSeries && epListState === "done" && episodes.length > 0;
   const selectedEpisode = hasEpisodeList ? episodes[episode - 1] : null;
 
@@ -92,19 +186,21 @@ export default function PlayDialog({
     };
   }, []);
 
-  const handlePlay = async () => {
+  const handlePlayAt = async (epNum: number) => {
     setLog([]);
     setPlayState("playing");
-    const ep = isSeries ? episode : null;
+    const useLaunchId = launchContentId?.trim() || null;
+    const ep = useLaunchId ? null : isSeries ? epNum : null;
     // For a TV episode, surface the episode's own runtime (if known) in the dock
     // so the position bar has a correct end length instead of the series value.
-    const epRuntimeMin = selectedEpisode?.runtime_min ?? null;
+    const epRow = hasEpisodeList ? episodes[epNum - 1] : null;
+    const epRuntimeMin = epRow?.runtime_min ?? null;
     const playedItem = epRuntimeMin ? { ...item, runtime_min: epRuntimeMin } : item;
     // ↓ Set nowPlaying in the dock IMMEDIATELY — don't wait for the TV to respond
-    onStartPlaying(playedItem, ep);
+    onStartPlaying(playedItem, useLaunchId ? epNum : ep);
     try {
       await invoke("play_on_tv", {
-        contentId: item.content_id,
+        contentId: useLaunchId ?? item.content_id,
         profile,
         tvIp: config.tv_ip,
         episode: ep,
@@ -116,6 +212,8 @@ export default function PlayDialog({
       setPlayState("error");
     }
   };
+
+  const handlePlay = () => handlePlayAt(episode);
 
   // Keyboard: Escape closes
   useEffect(() => {
@@ -137,10 +235,26 @@ export default function PlayDialog({
         if (e.target === e.currentTarget && playState !== "playing") onClose();
       }}
     >
-      <div className="bg-[#1A242F] rounded-2xl shadow-2xl w-full max-w-lg mx-4 overflow-hidden">
+      <div
+        data-media-dialog
+        className="bg-[#1A242F] rounded-2xl shadow-2xl w-full max-w-lg mx-4 overflow-hidden select-none"
+        onContextMenu={(e) => {
+          const items = titleMenuItems();
+          if (items.length > 0) openMenu(e, items);
+        }}
+        onMouseDown={(e) => {
+          if (e.button === 2) window.getSelection()?.removeAllRanges();
+        }}
+      >
 
         {/* ── Hero banner ────────────────────────────────────────────────── */}
-        <div className="relative h-44">
+        <div
+          className="relative h-44"
+          onContextMenu={(e) => {
+            const items = titleMenuItems();
+            if (items.length > 0) openMenu(e, items);
+          }}
+        >
           {imageUrl ? (
             <img
               src={imageUrl}
@@ -152,6 +266,23 @@ export default function PlayDialog({
           )}
           {/* dark scrim so text is always readable */}
           <div className="absolute inset-0 bg-gradient-to-t from-[#1A242F] via-black/40 to-transparent" />
+
+          {onToggleBookmark && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleBookmark(item);
+              }}
+              title={titleBookmarked ? "Remove bookmark" : "Bookmark series"}
+              className={`absolute top-3 left-3 p-1.5 rounded-full transition-colors ${
+                titleBookmarked
+                  ? "bg-amber-500 text-white"
+                  : "bg-black/50 text-zinc-300 hover:text-white hover:bg-black/70"
+              }`}
+            >
+              <BookmarkIcon filled={titleBookmarked} />
+            </button>
+          )}
 
           {/* close button */}
           <button
@@ -279,34 +410,41 @@ export default function PlayDialog({
                     const num = ep.sequence_number ?? idx + 1;
                     const active = episode === idx + 1;
                     return (
-                      <button
+                      <div
                         key={ep.content_id || idx}
-                        onClick={() => setEpisode(idx + 1)}
-                        disabled={playState === "playing"}
-                        className={`w-full flex items-center gap-3 px-3 py-2 text-left transition-colors
-                                    disabled:opacity-50 ${
-                          active
-                            ? "bg-emerald-600/30"
-                            : "hover:bg-emerald-900/30"
+                        className={`flex items-center gap-1 pr-1 transition-colors ${
+                          active ? "bg-emerald-600/30" : "hover:bg-emerald-900/30"
                         }`}
                       >
-                        <span className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-md
-                                          text-xs font-bold tabular-nums ${
-                          active ? "bg-emerald-500 text-white" : "bg-zinc-700 text-zinc-300"
-                        }`}>
-                          {num}
-                        </span>
-                        <span className={`flex-1 min-w-0 text-sm truncate ${
-                          active ? "text-white font-medium" : "text-zinc-300"
-                        }`}>
-                          {ep.title || `Episode ${num}`}
-                        </span>
-                        {active && (
-                          <svg className="w-4 h-4 text-emerald-400 shrink-0" fill="currentColor" viewBox="0 0 20 20">
-                            <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z" />
-                          </svg>
-                        )}
-                      </button>
+                        <button
+                          type="button"
+                          onClick={() => setEpisode(idx + 1)}
+                          onContextMenu={(e) => openMenu(e, episodeMenuItems(ep, idx))}
+                          disabled={playState === "playing"}
+                          className="flex-1 flex items-center gap-3 px-3 py-2 text-left
+                                     disabled:opacity-50 min-w-0"
+                        >
+                          <span className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-md
+                                            text-xs font-bold tabular-nums ${
+                            active ? "bg-emerald-500 text-white" : "bg-zinc-700 text-zinc-300"
+                          }`}>
+                            {num}
+                          </span>
+                          <span className={`flex-1 min-w-0 text-sm truncate ${
+                            active ? "text-white font-medium" : "text-zinc-300"
+                          }`}>
+                            {ep.title || `Episode ${num}`}
+                          </span>
+                          {bookmarkedIds && isBookmarked(bookmarkedIds, item, ep) && (
+                            <BookmarkIcon filled />
+                          )}
+                          {active && (
+                            <svg className="w-4 h-4 text-emerald-400 shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                              <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z" />
+                            </svg>
+                          )}
+                        </button>
+                      </div>
                     );
                   })}
                 </div>
@@ -399,18 +537,17 @@ export default function PlayDialog({
           )}
 
           {/* Action buttons */}
-          <div className="flex gap-3">
+          <div className="flex gap-2">
             <button
               onClick={handlePlay}
               disabled={playState === "playing"}
-              className="flex-1 bg-emerald-600 hover:bg-emerald-500 disabled:bg-zinc-600
-                         text-white font-bold py-3 px-4 rounded-xl
-                         flex items-center justify-center gap-2.5 transition-colors
-                         text-base shadow-lg shadow-emerald-900/30"
+              className="flex-1 bg-[#00A8E1] hover:bg-[#0090c0] disabled:bg-zinc-600
+                         text-white text-sm font-semibold py-2 px-3 rounded-md
+                         flex items-center justify-center gap-2 transition-colors"
             >
               {playState === "playing" ? (
                 <>
-                  <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
+                  <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                   </svg>
@@ -418,9 +555,7 @@ export default function PlayDialog({
                 </>
               ) : (
                 <>
-                  <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                    <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z" />
-                  </svg>
+                  <PlayIcon />
                   {playState === "done" ? "Play Again"
                     : playState === "error" ? "Retry"
                     : selectedEpisode ? `Play ${selectedEpisode.title || `Episode ${selectedEpisode.sequence_number ?? episode}`}`
@@ -433,14 +568,15 @@ export default function PlayDialog({
             <button
               onClick={onClose}
               disabled={playState === "playing"}
-              className="px-5 py-3 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-40
-                         text-white rounded-xl transition-colors text-sm font-medium"
+              className="px-4 py-2 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-40
+                         text-white rounded-md transition-colors text-sm font-medium"
             >
               {playState === "done" || playState === "error" ? "Close" : "Cancel"}
             </button>
           </div>
         </div>
       </div>
+
     </div>
   );
 }

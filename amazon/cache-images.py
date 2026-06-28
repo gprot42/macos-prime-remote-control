@@ -38,6 +38,11 @@ def safe_filename(content_id: str) -> str:
     return re.sub(r"[^\w\-]", "_", content_id) + ".jpg"
 
 
+def meta_filename(content_id: str) -> str:
+    """Sidecar recording which remote URL was cached for a content_id."""
+    return re.sub(r"[^\w\-]", "_", content_id) + ".meta"
+
+
 def resize_amazon_url(url: str, w: int, h: int) -> str:
     """Replace the Amazon CDN size parameter with the requested dimensions."""
     return re.sub(r"\._UR\d+,\d+_\.", f"._UR{w},{h}_.", url)
@@ -49,10 +54,15 @@ def download_image(content_id: str, url: str) -> tuple[str, str | None]:
     Returns (content_id, local_path) on success, (content_id, None) on failure.
     """
     dest = CACHE_DIR / safe_filename(content_id)
+    meta = CACHE_DIR / meta_filename(content_id)
 
-    # Already cached – no need to re-download
-    if dest.exists() and dest.stat().st_size > 0:
-        return content_id, str(dest)
+    # Reuse only when the on-disk JPEG matches this exact source URL.
+    if dest.exists() and dest.stat().st_size > 512 and meta.exists():
+        try:
+            if meta.read_text().strip() == url:
+                return content_id, str(dest)
+        except OSError:
+            pass
 
     sized_url = resize_amazon_url(url, CARD_WIDTH, CARD_HEIGHT)
     try:
@@ -65,6 +75,7 @@ def download_image(content_id: str, url: str) -> tuple[str, str | None]:
         if len(data) < 512:
             return content_id, None  # suspiciously small – probably an error page
         dest.write_bytes(data)
+        meta.write_text(url)
         return content_id, str(dest)
     except (urllib.error.URLError, OSError, TimeoutError):
         return content_id, None

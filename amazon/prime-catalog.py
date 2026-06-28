@@ -163,34 +163,94 @@ def parse_content_id(value: str) -> str:
     raise ValueError(f"Unrecognized content id or URL: {value!r}")
 
 
+_SKIP_IMAGE_KEYS = frozenset({"titleLogo"})
+_IMAGE_KEY_RANK = {
+    "hero": 0,
+    "keyart": 1,
+    "landscape": 2,
+    "poster": 3,
+    "poster2x3": 4,
+    "packshot": 5,
+    "cover": 6,
+}
+
+
+def _is_branded_carousel_image(url: str) -> bool:
+    """Prime carousel composites (pv-target-images) bake in title/Prime logos."""
+    return "pv-target-images" in url
+
+
+def _sonata_folder(url: str) -> str | None:
+    match = re.search(r"sonata-images-prod/([^/]+)/", url)
+    return match.group(1) if match else None
+
+
+def _is_play_cta_url(url: str) -> bool:
+    """Sonata hero banners are full-frame “Play on TV” CTAs — not poster art."""
+    if "sonata-images-prod" not in url:
+        return False
+    folder = _sonata_folder(url) or ""
+    # Still/cover variants (…_RM_UI_CO1, …_CO3) are safe for cards.
+    if re.search(r"_CO\d*$", folder) or "_CO_" in folder:
+        return False
+    # Bare *_RM_UI folders are rotating hero banners with a giant play button.
+    return folder.endswith("_RM_UI") or bool(re.search(r"_Hero_.*_RM_UI$", folder))
+
+
+def _is_play_cta_image(url: str, key: str) -> bool:
+    return key == "hero" and _is_play_cta_url(url)
+
+
+def _image_url_rank(url: str, key: str) -> tuple[int, int, int]:
+    """Lower rank = better card art (prefer scene stills over marketing overlays)."""
+    cta = 1 if _is_play_cta_image(url, key) else 0
+    branded = 1 if _is_branded_carousel_image(url) else 0
+    return (cta, branded, _IMAGE_KEY_RANK.get(key, 99))
+
+
+def _image_url_rank_auto(url: str) -> tuple[int, int, int]:
+    """Rank a URL when merging across carousel rows (key may be unknown)."""
+    if _is_play_cta_url(url):
+        return (9, 9, 99)
+    return min(_image_url_rank(url, k) for k in _IMAGE_KEY_RANK)
+
+
 def _extract_image_url(images: Any) -> str | None:
-    """Return a hero image URL from an entity's images dict."""
+    """Return the best landscape card image from an entity's images dict."""
     if not isinstance(images, dict):
         return None
-    # Try keys in preference order; Amazon uses different keys per carousel type.
-    # 'cover'     – used by genre rows (Binge-worthy, Romance TV, Drama TV, etc.)
-    # 'hero'      – used by Amazon Originals, Top 10, etc.
-    # 'poster2x3' – portrait poster used in some contexts
-    # others      – legacy / regional variants
-    for key in ("cover", "hero", "packshot", "poster2x3", "poster", "landscape", "keyart"):
-        img = images.get(key)
-        if isinstance(img, dict):
-            url = img.get("url")
-            if isinstance(url, str) and url.startswith("http"):
-                return url
-    return None
-
-
-def _extract_title_logo_url(images: Any) -> str | None:
-    """Return the title logo URL from an entity's images dict."""
-    if not isinstance(images, dict):
-        return None
-    img = images.get("titleLogo")
-    if isinstance(img, dict):
+    best: tuple[tuple[int, int, int], str] | None = None
+    for key, img in images.items():
+        if key in _SKIP_IMAGE_KEYS or not isinstance(img, dict):
+            continue
         url = img.get("url")
-        if isinstance(url, str) and url.startswith("http"):
-            return url
-    return None
+        if not isinstance(url, str) or not url.startswith("http"):
+            continue
+        rank = _image_url_rank(url, key)
+        if best is None or rank < best[0]:
+            best = (rank, url)
+    return best[1] if best else None
+
+
+def _prefer_image_url(current: str | None, candidate: str | None) -> str | None:
+    """Keep the higher-quality image when the same title appears in multiple carousels."""
+    if not candidate:
+        return current
+    if not current:
+        return candidate
+    cur_rank = _image_url_rank_auto(current)
+    cand_rank = _image_url_rank_auto(candidate)
+    return candidate if cand_rank < cur_rank else current
+
+
+def _merge_title_item(existing: PrimeTitle, new: PrimeTitle) -> PrimeTitle:
+    """Merge duplicate carousel rows for the same content_id."""
+    existing.image_url = _prefer_image_url(existing.image_url, new.image_url)
+    if not existing.synopsis and new.synopsis:
+        existing.synopsis = new.synopsis
+    if not existing.container and new.container:
+        existing.container = new.container
+    return existing
 
 
 def _parse_runtime_str(runtime: Any) -> tuple[int | None, str | None]:
@@ -234,7 +294,7 @@ def entity_to_title(entity: dict[str, Any], *, source: str) -> PrimeTitle | None
         gti=gti,
         source=source,
         image_url=_extract_image_url(images),
-        title_logo_url=_extract_title_logo_url(images),
+        title_logo_url=None,
         synopsis=str(synopsis).strip() if synopsis else None,
     )
     cues = entity.get("entitlementCues")
@@ -261,14 +321,15 @@ def walk_entities(obj: Any) -> list[dict[str, Any]]:
 
 
 def dedupe_titles(items: list[PrimeTitle]) -> list[PrimeTitle]:
-    seen: set[str] = set()
-    unique: list[PrimeTitle] = []
+    seen: dict[str, PrimeTitle] = {}
+    order: list[str] = []
     for item in items:
         if item.content_id in seen:
+            seen[item.content_id] = _merge_title_item(seen[item.content_id], item)
             continue
-        seen.add(item.content_id)
-        unique.append(item)
-    return unique
+        seen[item.content_id] = item
+        order.append(item.content_id)
+    return [seen[content_id] for content_id in order]
 
 
 def extract_titles_from_html(html: str, *, source: str) -> list[PrimeTitle]:
@@ -286,31 +347,284 @@ def search_prime(query: str) -> list[PrimeTitle]:
     return extract_titles_from_html(html, source=f"search:{query}")
 
 
-def list_collection(slug: str) -> list[PrimeTitle]:
+@dataclass
+class SwiftRequestParams:
+    page_type: str
+    page_id: str
+    decoration_scheme: str
+    feature_scheme: str
+    widget_scheme: str
+    dynamic_features: list[str]
+    variant: str = "Desktop"
+
+
+def fetch_json(url: str, *, timeout: float = 20.0) -> Any:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "x-requested-with": "XMLHttpRequest",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code} for {url}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not fetch {url}: {exc.reason}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON from {url}") from exc
+
+
+def extract_swift_params(html: str) -> SwiftRequestParams | None:
+    """Page-level scheme/variant params required by paginateCollection."""
+    for blob in parse_json_blobs(html):
+        if not isinstance(blob, dict):
+            continue
+        body = (
+            blob.get("init", {})
+            .get("preparations", {})
+            .get("body", {})
+        )
+        if not isinstance(body, dict):
+            continue
+        swift = body.get("swiftPageParameters")
+        if not isinstance(swift, dict):
+            continue
+        pagination = body.get("pagination")
+        qp: dict[str, Any] = {}
+        if isinstance(pagination, dict):
+            raw_qp = pagination.get("queryParameters")
+            if isinstance(raw_qp, dict):
+                qp = raw_qp
+        dynamic = qp.get("dynamicFeatures")
+        return SwiftRequestParams(
+            page_type=str(swift.get("pageType") or ""),
+            page_id=str(swift.get("pageId") or ""),
+            decoration_scheme=str(
+                qp.get("decorationScheme")
+                or body.get("decorationScheme")
+                or "web-decoration-gti-v4"
+            ),
+            feature_scheme=str(
+                qp.get("featureScheme")
+                or body.get("featureScheme")
+                or "web-features-v6"
+            ),
+            widget_scheme=str(
+                qp.get("widgetScheme")
+                or body.get("widgetScheme")
+                or "web-explore-v33"
+            ),
+            dynamic_features=list(dynamic) if isinstance(dynamic, list) else [],
+            variant=str(qp.get("variant") or "Desktop"),
+        )
+    return None
+
+
+def _build_paginate_collection_url(
+    swift: SwiftRequestParams,
+    *,
+    service_token: str,
+    start_index: int,
+    target_id: str,
+    journey_ingress: str | None = None,
+) -> str:
+    params: list[tuple[str, str]] = [
+        ("pageType", swift.page_type),
+        ("pageId", swift.page_id),
+        ("collectionType", "Container"),
+        ("paginationTargetId", target_id),
+        ("serviceToken", service_token),
+        ("startIndex", str(start_index)),
+        ("actionScheme", "default"),
+        ("payloadScheme", "default"),
+        ("decorationScheme", swift.decoration_scheme),
+        ("featureScheme", swift.feature_scheme),
+        ("widgetScheme", swift.widget_scheme),
+        ("variant", swift.variant),
+    ]
+    if journey_ingress:
+        params.append(("journeyIngressContext", journey_ingress))
+    for feature in swift.dynamic_features:
+        params.append(("dynamicFeatures", str(feature)))
+    return f"{BASE_URL}/api/paginateCollection?{urllib.parse.urlencode(params)}"
+
+
+def paginate_carousel_entities(
+    container: dict[str, Any],
+    swift: SwiftRequestParams,
+    *,
+    max_rounds: int = 10,
+) -> list[dict[str, Any]]:
+    """Fetch all entities for a horizontally paginated carousel row."""
+    entities: list[dict[str, Any]] = [
+        entity
+        for entity in (container.get("entities") or [])
+        if isinstance(entity, dict)
+    ]
+    token = container.get("paginationServiceToken")
+    if not isinstance(token, str) or not token.strip():
+        return entities
+
+    start_index = container.get("paginationStartIndex", len(entities))
+    if not isinstance(start_index, int):
+        try:
+            start_index = int(start_index)
+        except (TypeError, ValueError):
+            start_index = len(entities)
+
+    target_id = container.get("paginationTargetId") or ""
+    if not isinstance(target_id, str):
+        target_id = str(target_id)
+
+    journey = container.get("journeyIngressContext")
+    journey_ingress = str(journey) if journey is not None else None
+
+    seen_ids: set[str] = set()
+    for entity in entities:
+        link = entity.get("link") if isinstance(entity.get("link"), dict) else {}
+        if cid := content_id_from_link(link.get("url")):
+            seen_ids.add(cid)
+
+    for _ in range(max_rounds):
+        url = _build_paginate_collection_url(
+            swift,
+            service_token=token,
+            start_index=start_index,
+            target_id=target_id,
+            journey_ingress=journey_ingress,
+        )
+        try:
+            data = fetch_json(url)
+        except RuntimeError:
+            break
+        if not isinstance(data, dict):
+            break
+
+        batch = data.get("entities") or []
+        if not isinstance(batch, list) or not batch:
+            break
+
+        for entity in batch:
+            if not isinstance(entity, dict):
+                continue
+            link = entity.get("link") if isinstance(entity.get("link"), dict) else {}
+            cid = content_id_from_link(link.get("url"))
+            if cid and cid in seen_ids:
+                continue
+            if cid:
+                seen_ids.add(cid)
+            entities.append(entity)
+
+        if not data.get("hasMoreItems"):
+            break
+
+        pagination = data.get("pagination")
+        if not isinstance(pagination, dict):
+            break
+        next_token = pagination.get("serviceToken")
+        if not isinstance(next_token, str) or not next_token.strip():
+            break
+        token = next_token
+
+        next_start = data.get("startIndex", pagination.get("startIndex"))
+        if not isinstance(next_start, int):
+            try:
+                next_start = int(next_start)
+            except (TypeError, ValueError):
+                break
+        start_index = next_start
+
+    return entities
+
+
+def _entities_to_titles(
+    entities: list[dict[str, Any]],
+    *,
+    source: str,
+    container_label: str,
+) -> list[PrimeTitle]:
+    titles: list[PrimeTitle] = []
+    for entity in entities:
+        if parsed := entity_to_title(entity, source=source):
+            parsed.container = container_label
+            titles.append(parsed)
+    return dedupe_titles(titles)
+
+
+def _merge_collection_pages(
+    slug: str,
+    *,
+    max_pages: int = 8,
+    full_carousels: bool = False,
+    max_carousel_rounds: int = 10,
+) -> tuple[list[PrimeTitle], str]:
+    """Fetch a collection storefront across paginated ?page=N views."""
     slug = slug.strip("/")
-    url = f"{BASE_URL}/collection/{slug}"
-    html = fetch_html(url)
-    groups = extract_collection_groups(html, source=f"collection:{slug}")
-    if groups:
-        # The collection page is a storefront of carousels (hero, Top 10, genre
-        # rows, ...). Keep each title once, tagged with the first meaningful row
-        # it appears in, so the listing is grouped instead of an undifferentiated
-        # flat dump of every carousel.
-        seen: set[str] = set()
-        items: list[PrimeTitle] = []
-        for _label, titles in groups:
-            for item in titles:
-                if item.content_id in seen:
-                    continue
-                seen.add(item.content_id)
-                items.append(item)
-        if items:
-            return items
-    return extract_titles_from_html(html, source=f"collection:{slug}")
+    source = f"collection:{slug}"
+    seen: dict[str, PrimeTitle] = {}
+    order: list[str] = []
+    last_html = ""
+    completed_carousel_targets: set[str] = set()
+
+    for page in range(1, max_pages + 1):
+        url = (
+            f"{BASE_URL}/collection/{slug}"
+            if page == 1
+            else f"{BASE_URL}/collection/{slug}?page={page}"
+        )
+        html = fetch_html(url)
+        last_html = html
+        groups = extract_collection_groups(
+            html,
+            source=source,
+            full_carousels=full_carousels,
+            max_carousel_rounds=max_carousel_rounds,
+            completed_carousel_targets=completed_carousel_targets,
+        )
+        page_items: list[PrimeTitle] = []
+        if groups:
+            for _label, titles in groups:
+                page_items.extend(titles)
+        else:
+            page_items = extract_titles_from_html(html, source=source)
+
+        added = 0
+        for item in page_items:
+            if item.content_id in seen:
+                seen[item.content_id] = _merge_title_item(seen[item.content_id], item)
+                continue
+            seen[item.content_id] = item
+            order.append(item.content_id)
+            added += 1
+        if page > 1 and added == 0:
+            break
+
+    return [seen[content_id] for content_id in order], last_html
 
 
-# Rotating banner that just repeats titles from the real rows below it.
+def list_collection(
+    slug: str,
+    *,
+    full_carousels: bool = True,
+    max_carousel_rounds: int = 10,
+) -> list[PrimeTitle]:
+    items, html = _merge_collection_pages(
+        slug,
+        full_carousels=full_carousels,
+        max_carousel_rounds=max_carousel_rounds,
+    )
+    return merge_hero_banner_images(html, items)
+
+
+# StandardHero is the rotating top banner — skip it as a catalog row (titles
+# repeat below), but still mine it for cleaner hero art in merge_hero_banner_images.
 SKIP_CONTAINER_TYPES = {"StandardHero"}
+HERO_BANNER_CONTAINER_TYPES = {"StandardHero"}
 
 
 def _find_container_lists(node: Any) -> list[list[Any]]:
@@ -327,11 +641,91 @@ def _find_container_lists(node: Any) -> list[list[Any]]:
     return found
 
 
+def merge_hero_banner_images(html: str, items: list[PrimeTitle]) -> list[PrimeTitle]:
+    """Upgrade card art using the top StandardHero banner (cleaner scene stills)."""
+    if not items:
+        return items
+    by_id = {item.content_id: item for item in items}
+    for blob in parse_json_blobs(html):
+        for containers in _find_container_lists(blob):
+            for container in containers:
+                if not isinstance(container, dict):
+                    continue
+                if container.get("containerType") not in HERO_BANNER_CONTAINER_TYPES:
+                    continue
+                entities = container.get("entities")
+                if not isinstance(entities, list):
+                    continue
+                for entity in entities:
+                    if not isinstance(entity, dict):
+                        continue
+                    if parsed := entity_to_title(entity, source="hero-banner"):
+                        if (
+                            parsed.content_id in by_id
+                            and parsed.image_url
+                            and not _is_play_cta_url(parsed.image_url)
+                        ):
+                            by_id[parsed.content_id] = _merge_title_item(
+                                by_id[parsed.content_id], parsed
+                            )
+    return [by_id[item.content_id] for item in items]
+
+
+def _carousel_target_id(container: dict[str, Any]) -> str:
+    target = container.get("paginationTargetId") or ""
+    return str(target) if target else ""
+
+
+def _resolve_container_entities(
+    container: dict[str, Any],
+    swift: SwiftRequestParams | None,
+    *,
+    full_carousels: bool,
+    max_carousel_rounds: int,
+    completed_targets: set[str] | None = None,
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Return (entities, carousel_target_id) or (None, _) if already paginated."""
+    raw_entities = container.get("entities")
+    if not isinstance(raw_entities, list):
+        return None, None
+
+    target_id = _carousel_target_id(container) or None
+    if (
+        full_carousels
+        and completed_targets is not None
+        and target_id
+        and target_id in completed_targets
+    ):
+        return None, target_id
+
+    if full_carousels and swift and container.get("paginationServiceToken"):
+        entities = paginate_carousel_entities(
+            container,
+            swift,
+            max_rounds=max_carousel_rounds,
+        )
+        return entities, target_id
+
+    return [entity for entity in raw_entities if isinstance(entity, dict)], target_id
+
+
 def extract_collection_groups(
-    html: str, *, source: str
+    html: str,
+    *,
+    source: str,
+    full_carousels: bool = False,
+    max_carousel_rounds: int = 10,
+    completed_carousel_targets: set[str] | None = None,
 ) -> list[tuple[str, list[PrimeTitle]]]:
     """Parse a collection page into (carousel label, titles) groups."""
-    groups: list[tuple[str, list[PrimeTitle]]] = []
+    swift = extract_swift_params(html) if full_carousels else None
+    completed_targets = (
+        completed_carousel_targets
+        if completed_carousel_targets is not None
+        else set()
+    )
+
+    pending: list[tuple[str, dict[str, Any], bool]] = []
     for blob in parse_json_blobs(html):
         for containers in _find_container_lists(blob):
             for container in containers:
@@ -339,25 +733,68 @@ def extract_collection_groups(
                     continue
                 if container.get("containerType") in SKIP_CONTAINER_TYPES:
                     continue
-                entities = container.get("entities")
-                if not isinstance(entities, list):
+                if not isinstance(container.get("entities"), list):
                     continue
-                label = (
+                label = str(
                     container.get("text")
                     or container.get("title")
                     or container.get("containerType")
                     or "Titles"
                 )
-                titles: list[PrimeTitle] = []
-                for entity in entities:
-                    if not isinstance(entity, dict):
-                        continue
-                    if parsed := entity_to_title(entity, source=source):
-                        parsed.container = str(label)
-                        titles.append(parsed)
-                titles = dedupe_titles(titles)
-                if titles:
-                    groups.append((str(label), titles))
+                needs_api = bool(
+                    full_carousels
+                    and swift
+                    and container.get("paginationServiceToken")
+                    and _carousel_target_id(container) not in completed_targets
+                )
+                pending.append((label, container, needs_api))
+
+    entities_by_label: list[tuple[str, list[dict[str, Any]]]] = []
+    api_jobs = [(label, container) for label, container, needs_api in pending if needs_api]
+    inline_jobs = [
+        (label, container)
+        for label, container, needs_api in pending
+        if not needs_api
+    ]
+
+    if api_jobs and swift:
+        workers = min(6, len(api_jobs))
+
+        def fetch_row(
+            job: tuple[str, dict[str, Any]],
+        ) -> tuple[str, list[dict[str, Any]] | None, str | None]:
+            label, container = job
+            entities, target_id = _resolve_container_entities(
+                container,
+                swift,
+                full_carousels=True,
+                max_carousel_rounds=max_carousel_rounds,
+            )
+            return label, entities, target_id
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for label, entities, target_id in pool.map(fetch_row, api_jobs):
+                if target_id:
+                    completed_targets.add(target_id)
+                if entities:
+                    entities_by_label.append((label, entities))
+
+    for label, container in inline_jobs:
+        entities, _target_id = _resolve_container_entities(
+            container,
+            swift,
+            full_carousels=full_carousels,
+            max_carousel_rounds=max_carousel_rounds,
+            completed_targets=completed_targets,
+        )
+        if entities:
+            entities_by_label.append((label, entities))
+
+    groups: list[tuple[str, list[PrimeTitle]]] = []
+    for label, entities in entities_by_label:
+        titles = _entities_to_titles(entities, source=source, container_label=label)
+        if titles:
+            groups.append((label, titles))
     return groups
 
 
@@ -594,6 +1031,18 @@ Known collections (region-dependent): newandupcoming, IncludedwithPrime, TopRate
         action="store_true",
         help="Include example lg-tv-connect.py command per title (JSON only)",
     )
+    parser.add_argument(
+        "--no-full-carousels",
+        action="store_true",
+        help="Only first screen of each carousel row (~20 titles; faster)",
+    )
+    parser.add_argument(
+        "--carousel-rounds",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Max horizontal pagination API calls per carousel row (default 10)",
+    )
     return parser.parse_args()
 
 
@@ -604,7 +1053,11 @@ def main() -> None:
         if args.search:
             items = search_prime(args.search)
         elif args.collection:
-            items = list_collection(args.collection)
+            items = list_collection(
+                args.collection,
+                full_carousels=not args.no_full_carousels,
+                max_carousel_rounds=max(1, args.carousel_rounds),
+            )
         else:
             items = [lookup_url(args.url)]
     except (RuntimeError, ValueError) as exc:

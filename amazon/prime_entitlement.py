@@ -567,12 +567,18 @@ def _messages_indicate_rent_or_buy(*messages: str | None) -> bool:
     joined = " ".join(m for m in messages if m).lower()
     if not joined:
         return False
+    # Carousel glance text — appears on Prime-catalog titles, not rent/buy storefront.
+    if "free trial or buy" in joined:
+        return False
     rent_buy_markers = (
-        "rent",
-        "buy",
-        "purchase",
         "available to rent",
         "available to buy",
+        "rent from",
+        "buy from",
+        "to rent",
+        "to buy",
+        "purchase for",
+        "purchase ",
     )
     return any(marker in joined for marker in rent_buy_markers)
 
@@ -614,6 +620,12 @@ def _messages_indicate_prime_subscription_offer(
     joined = " ".join(m for m in messages if m).lower()
     if not joined:
         return False
+
+    # Prime membership renewal on collection cards (regional copy may omit "Prime").
+    if "after trial" in joined and (
+        "auto-renews at" in joined or "auto renews at" in joined
+    ):
+        return True
 
     strong_focus_markers = (
         "watch with a",

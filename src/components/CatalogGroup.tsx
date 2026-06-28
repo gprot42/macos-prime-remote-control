@@ -1,5 +1,5 @@
 import { useRef } from "react";
-import { CatalogGroup as CatalogGroupType, PrimeTitle } from "../types";
+import { CatalogGroup as CatalogGroupType, PrimeTitle, cachedImageHttpUrl } from "../types";
 import TitleCard from "./TitleCard";
 
 interface CatalogGroupProps {
@@ -7,11 +7,18 @@ interface CatalogGroupProps {
   onPlay: (item: PrimeTitle) => void;
   imageCache: Set<string>;
   imgPort: number;
+  bookmarkedIds?: Set<string>;
+  onToggleBookmark?: (item: PrimeTitle) => void;
 }
 
-function safeId(id: string) { return id.replace(/[^\w\-]/g, "_"); }
-
-export default function CatalogGroupRow({ group, onPlay, imageCache, imgPort }: CatalogGroupProps) {
+export default function CatalogGroupRow({
+  group,
+  onPlay,
+  imageCache,
+  imgPort,
+  bookmarkedIds,
+  onToggleBookmark,
+}: CatalogGroupProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const scrollLeft = () => {
@@ -54,10 +61,10 @@ export default function CatalogGroupRow({ group, onPlay, imageCache, imgPort }: 
           style={{ scrollbarWidth: "thin", scrollbarColor: "#2a3a4a #0f171e" }}
         >
           {group.items.map((item) => {
-            const stem = safeId(item.content_id);
+            const stem = item.content_id.replace(/[^\w\-]/g, "_");
             const cachedSrc =
               imgPort && imageCache.has(stem)
-                ? `http://127.0.0.1:${imgPort}/${stem}.jpg`
+                ? cachedImageHttpUrl(imgPort, item.content_id, item.image_url)
                 : undefined;
             return (
               <TitleCard
@@ -65,6 +72,8 @@ export default function CatalogGroupRow({ group, onPlay, imageCache, imgPort }: 
                 item={item}
                 onPlay={onPlay}
                 cachedImageSrc={cachedSrc}
+                isBookmarked={bookmarkedIds?.has(item.content_id)}
+                onToggleBookmark={onToggleBookmark}
               />
             );
           })}

@@ -8,6 +8,29 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      function isTextField(el) {
+        return el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+      }
+
+      // Block macOS "Look Up / Translate" menus on selected synopsis text.
+      document.addEventListener("selectstart", function (e) {
+        if (!isTextField(e.target)) e.preventDefault();
+      }, { capture: true });
+
+      document.addEventListener("mousedown", function (e) {
+        if (e.button === 2 && !isTextField(e.target)) {
+          window.getSelection()?.removeAllRanges();
+        }
+      }, { capture: true });
+
+      document.addEventListener("contextmenu", function (e) {
+        if (!isTextField(e.target)) {
+          window.getSelection()?.removeAllRanges();
+        }
+        e.preventDefault();
+      }, { capture: true, passive: false });
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

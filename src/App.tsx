@@ -3,16 +3,27 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   PrimeTitle,
+  PrimeEpisode,
   AppConfig,
   DEFAULT_CONFIG,
   CatalogGroup,
   EntityTypeFilter,
+  Bookmark,
   groupTitles,
   formatCacheAge,
   isTitleVisible,
+  cachedImageHttpUrl,
 } from "./types";
+import {
+  bookmarkSnapshot,
+  findBookmark,
+  isEpisodeBookmark,
+  resolveEpisodePlayId,
+} from "./bookmarks";
 import CatalogGroupRow from "./components/CatalogGroup";
+import ContextMenu, { ContextMenuItem } from "./components/ContextMenu";
 import PlayDialog from "./components/PlayDialog";
+import { MEDIA_CONTEXT_MENU_EVENT, MediaContextMenuDetail } from "./contextMenuBus";
 import SettingsDialog from "./components/SettingsDialog";
 import TVRemote from "./components/TVRemote";
 import type { PlaybackState } from "./components/TVRemote";
@@ -25,8 +36,13 @@ const COLLECTIONS = [
 ] as const;
 
 type CollectionSlug = (typeof COLLECTIONS)[number]["slug"];
+type ViewMode = "catalog" | "bookmarks";
 
 type LoadState = "idle" | "loading" | "done" | "error";
+
+function safeId(id: string) {
+  return id.replace(/[^\w\-]/g, "_");
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function parseResult(raw: string): { data: PrimeTitle[]; stale: boolean } {
@@ -49,8 +65,10 @@ export default function App() {
   const [isStale, setIsStale]       = useState(false);
   const [cacheAgeSecs, setCacheAge] = useState<number | null>(null);
 
-  // Collection selector
+  // Collection / bookmarks view
+  const [viewMode, setViewMode] = useState<ViewMode>("catalog");
   const [collection, setCollection] = useState<CollectionSlug>("IncludedwithPrime");
+  const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
 
   // Image server port (0 until the server starts)
   const [imgPort, setImgPort] = useState(0);
@@ -67,12 +85,71 @@ export default function App() {
 
   // Dialogs
   const [selectedItem, setSelectedItem] = useState<PrimeTitle | null>(null);
+  const [selectedEpisode, setSelectedEpisode] = useState<number | null>(null);
+  const [selectedLaunchContentId, setSelectedLaunchContentId] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [globalMenu, setGlobalMenu] = useState<{
+    x: number;
+    y: number;
+    items: ContextMenuItem[];
+  } | null>(null);
 
   // Now-playing (drives the TVRemote bar)
   const [nowPlaying, setNowPlaying]         = useState<PrimeTitle | null>(null);
   const [nowPlayingEpisode, setNPEpisode]   = useState<number | null>(null);
   const [playbackState, setPlaybackState]   = useState<PlaybackState>("playing");
+
+  // ── Global media context menu (single instance above all UI) ─────────────────
+  useEffect(() => {
+    const onMenu = (e: Event) => {
+      const detail = (e as CustomEvent<MediaContextMenuDetail>).detail;
+      setGlobalMenu(detail);
+    };
+    window.addEventListener(MEDIA_CONTEXT_MENU_EVENT, onMenu);
+    return () => window.removeEventListener(MEDIA_CONTEXT_MENU_EVENT, onMenu);
+  }, []);
+
+  // Suppress macOS text lookup menus outside search fields.
+  useEffect(() => {
+    const isTextField = (el: EventTarget | null) => {
+      if (!(el instanceof HTMLElement)) return false;
+      return (
+        el instanceof HTMLInputElement ||
+        el instanceof HTMLTextAreaElement ||
+        el.isContentEditable
+      );
+    };
+
+    const onSelectStart = (e: Event) => {
+      if (!isTextField(e.target)) e.preventDefault();
+    };
+
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button === 2 && !isTextField(e.target)) {
+        window.getSelection()?.removeAllRanges();
+      }
+    };
+
+    const onContextMenu = (e: MouseEvent) => {
+      if (isTextField(e.target)) return;
+      window.getSelection()?.removeAllRanges();
+      // Let media cards/dialogs show the custom menu (Play, TMDB, Bookmark).
+      const onMedia = (e.target as HTMLElement).closest(
+        "[data-media-card], [data-media-dialog]",
+      );
+      if (onMedia) return;
+      e.preventDefault();
+    };
+
+    document.addEventListener("selectstart", onSelectStart, { capture: true });
+    document.addEventListener("mousedown", onMouseDown, { capture: true });
+    document.addEventListener("contextmenu", onContextMenu, { capture: true });
+    return () => {
+      document.removeEventListener("selectstart", onSelectStart, { capture: true });
+      document.removeEventListener("mousedown", onMouseDown, { capture: true });
+      document.removeEventListener("contextmenu", onContextMenu, { capture: true });
+    };
+  }, []);
 
   // ── Config load ─────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -81,7 +158,136 @@ export default function App() {
       .catch(() => {});
   }, []);
 
+  // ── Bookmarks load ──────────────────────────────────────────────────────────
+  const reloadBookmarks = useCallback(() => {
+    invoke<Bookmark[]>("get_bookmarks")
+      .then(setBookmarks)
+      .catch(() => {});
+  }, []);
 
+  useEffect(() => {
+    reloadBookmarks();
+  }, [reloadBookmarks]);
+
+  useEffect(() => {
+    if (bookmarks.length === 0 || !imgPort) return;
+    const missing = bookmarks
+      .map((b) => b.item)
+      .filter((item) => item.image_url && !imageCache.has(safeId(item.content_id)));
+    if (missing.length > 0) {
+      invoke("prefetch_images", {
+        items: missing.map((i) => ({ content_id: i.content_id, url: i.image_url! })),
+      }).catch(() => {});
+    }
+  }, [bookmarks, imgPort, imageCache]);
+
+  const handleToggleBookmark = useCallback(
+    async (
+      item: PrimeTitle,
+      options?: {
+        episode?: PrimeEpisode | null;
+        episodeIndex?: number;
+        sourceItem?: PrimeTitle;
+        playEpisode?: number;
+      }
+    ) => {
+      const snapshot = options?.episode
+        ? bookmarkSnapshot(item, options.episode, options.episodeIndex)
+        : item;
+      const sourceItem = options?.sourceItem ?? (options?.episode ? item : null);
+      const playEpisode =
+        options?.playEpisode ??
+        (options?.episode
+          ? options.episode.sequence_number ?? (options.episodeIndex != null ? options.episodeIndex + 1 : null)
+          : null);
+      const episodeContentId = options?.episode?.content_id ?? null;
+
+      try {
+        const added = await invoke<boolean>("toggle_bookmark", {
+          item: snapshot,
+          sourceItem,
+          episodeContentId,
+          playEpisode,
+        });
+        const updated = await invoke<Bookmark[]>("get_bookmarks");
+        setBookmarks(updated);
+        const imageSource = sourceItem ?? item;
+        if (added && imageSource.image_url) {
+          const stem = safeId(imageSource.content_id);
+          if (!imageCache.has(stem)) {
+            invoke("prefetch_images", {
+              items: [{ content_id: imageSource.content_id, url: imageSource.image_url }],
+            }).catch(() => {});
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    },
+    [imageCache]
+  );
+
+  const playEpisodeBookmark = useCallback(
+    async (bookmark: Bookmark): Promise<boolean> => {
+      const episodeId = resolveEpisodePlayId(bookmark);
+      if (!episodeId) return false;
+
+      setSelectedItem(null);
+      setSelectedEpisode(null);
+      setNowPlaying(bookmark.item);
+      setNPEpisode(bookmark.play_episode ?? null);
+      setPlaybackState("playing");
+
+      try {
+        await invoke("play_on_tv", {
+          contentId: episodeId,
+          profile: config.profile,
+          tvIp: config.tv_ip,
+          episode: null,
+        });
+        return true;
+      } catch (err) {
+        setError(String(err));
+        setPlaybackState("paused");
+        setNowPlaying(null);
+        setNPEpisode(null);
+        return false;
+      }
+    },
+    [config]
+  );
+
+  const handleOpenTitle = useCallback(
+    async (item: PrimeTitle) => {
+      const bm = findBookmark(bookmarks, item);
+
+      if (bm && isEpisodeBookmark(bm)) {
+        const played = await playEpisodeBookmark(bm);
+        if (played) return;
+        if (bm.source_item && bm.play_episode) {
+          setSelectedItem(bm.source_item);
+          setSelectedEpisode(bm.play_episode);
+          setSelectedLaunchContentId(resolveEpisodePlayId(bm));
+          return;
+        }
+      }
+
+      setSelectedLaunchContentId(null);
+      if (bm?.source_item && bm.play_episode) {
+        setSelectedItem(bm.source_item);
+        setSelectedEpisode(bm.play_episode);
+      } else {
+        setSelectedItem(item);
+        setSelectedEpisode(null);
+      }
+    },
+    [bookmarks, playEpisodeBookmark]
+  );
+
+  const bookmarkedIds = useMemo(
+    () => new Set(bookmarks.map((b) => b.content_id)),
+    [bookmarks]
+  );
 
   // ── Fetch the image HTTP server port + pre-existing cache IDs ───────────────
   useEffect(() => {
@@ -134,13 +340,18 @@ export default function App() {
           .then((age) => setCacheAge(age ?? null))
           .catch(() => {});
 
-        // Kick off background image prefetch for any unresolved images
-        const missing = data.filter(
-          (item) => item.image_url && !imageCache.has(item.content_id)
-        );
-        if (missing.length > 0) {
+        // Prefetch posters; on hard refresh re-download even if a JPEG already exists.
+        const toPrefetch = data.filter((item) => {
+          if (!item.image_url) return false;
+          if (forceRefresh) return true;
+          return !imageCache.has(safeId(item.content_id));
+        });
+        if (toPrefetch.length > 0) {
           invoke("prefetch_images", {
-            items: missing.map((i) => ({ content_id: i.content_id, url: i.image_url! })),
+            items: toPrefetch.map((i) => ({
+              content_id: i.content_id,
+              url: i.image_url!,
+            })),
           }).catch(() => {});
         }
       } catch (err) {
@@ -153,18 +364,22 @@ export default function App() {
   );
 
   useEffect(() => {
+    if (viewMode !== "catalog") return;
     loadCatalog(false, collection);
-    // Reset type filter when switching collections
     setTypeFilter("all");
-  }, [collection]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [collection, viewMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Debounced search ────────────────────────────────────────────────────────
   const handleSearchChange = (q: string) => {
     setSearchQuery(q);
     if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
 
+    if (q.trim()) {
+      setViewMode("catalog");
+    }
+
     if (!q.trim()) {
-      loadCatalog(false, collection);
+      if (viewMode === "catalog") loadCatalog(false, collection);
       return;
     }
 
@@ -189,7 +404,7 @@ export default function App() {
 
         // Prefetch images for search results too
         const missing = data.filter(
-          (item) => item.image_url && !imageCache.has(item.content_id)
+          (item) => item.image_url && !imageCache.has(safeId(item.content_id))
         );
         if (missing.length > 0) {
           invoke("prefetch_images", {
@@ -231,21 +446,37 @@ export default function App() {
   };
 
   // ── Filtered groups ─────────────────────────────────────────────────────────
+  const sourceItems = useMemo<PrimeTitle[]>(
+    () => (viewMode === "bookmarks" ? bookmarks.map((b) => b.item) : allItems),
+    [viewMode, bookmarks, allItems]
+  );
+
   const filteredGroups = useMemo<CatalogGroup[]>(() => {
-    const items = allItems.filter((item) => {
-      if (typeFilter === "Movie"   && item.entity_type !== "Movie")   return false;
-      if (typeFilter === "TV Show" && item.entity_type !== "TV Show") return false;
+    const items = sourceItems.filter((item) => {
+      if (typeFilter === "Movie" && item.entity_type !== "Movie") return false;
+      if (
+        typeFilter === "TV Show"
+        && item.entity_type !== "TV Show"
+        && item.entity_type !== "TV Episode"
+      ) {
+        return false;
+      }
       return isTitleVisible(item, config);
     });
+    if (viewMode === "bookmarks") {
+      return items.length > 0 ? [{ label: "Saved titles", items }] : [];
+    }
     return groupTitles(items).filter((g) => g.items.length > 0);
-  }, [allItems, typeFilter, config]);
+  }, [sourceItems, typeFilter, config, viewMode]);
 
   const totalFiltered = filteredGroups.reduce((s, g) => s + g.items.length, 0);
-  const movieCount    = allItems.filter((i) => i.entity_type === "Movie").length;
-  const showCount     = allItems.filter((i) => i.entity_type === "TV Show").length;
+  const movieCount    = sourceItems.filter((i) => i.entity_type === "Movie").length;
+  const showCount     = sourceItems.filter((i) => i.entity_type === "TV Show").length;
 
-  const isLoading = loadState === "loading" || searching;
+  const isLoading = viewMode === "catalog" && (loadState === "loading" || searching);
   const activeCollection = COLLECTIONS.find((c) => c.slug === collection)!;
+  const showCatalogData = viewMode === "catalog" && loadState === "done";
+  const showBookmarksData = viewMode === "bookmarks";
 
   return (
     <div className="min-h-screen bg-[#0F171E] flex flex-col">
@@ -298,7 +529,40 @@ export default function App() {
           {/* Right actions */}
           <div className="flex items-center gap-2 ml-auto shrink-0">
             {/* Cache age */}
-            {cacheAgeSecs !== null && loadState === "done" && !searchQuery && (
+            {viewMode === "bookmarks" ? (
+              <button
+                onClick={() => setViewMode("bookmarks")}
+                title="Bookmarks"
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium
+                           bg-amber-600/20 text-amber-300 border border-amber-700/60 rounded-lg"
+              >
+                <svg className="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 20 20">
+                  <path d="M5 4a2 2 0 012-2h6a2 2 0 012 2v14l-5-2.5L5 18V4z" />
+                </svg>
+                {bookmarks.length}
+              </button>
+            ) : (
+              <button
+                onClick={() => { setViewMode("bookmarks"); setSearchQuery(""); }}
+                title="View bookmarks"
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium
+                           text-zinc-400 hover:text-amber-300 hover:bg-zinc-800/60
+                           border border-zinc-700 hover:border-amber-700/50 rounded-lg transition-colors"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round"
+                    d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0111.186 0z" />
+                </svg>
+                Bookmarks
+                {bookmarks.length > 0 && (
+                  <span className="text-[10px] bg-amber-600/80 text-white px-1.5 py-0.5 rounded-full min-w-[1.25rem] text-center">
+                    {bookmarks.length}
+                  </span>
+                )}
+              </button>
+            )}
+
+            {cacheAgeSecs !== null && showCatalogData && !searchQuery && (
               <div className={`hidden sm:flex items-center gap-1.5 text-[11px] px-2.5 py-1
                               rounded-full border ${isStale
                 ? "bg-orange-950/60 border-orange-700 text-orange-300"
@@ -318,8 +582,10 @@ export default function App() {
             </div>
 
             {/* Soft reload */}
-            <button onClick={() => loadCatalog(false, collection)} disabled={isLoading}
-              title="Reload from cache"
+            <button
+              onClick={() => viewMode === "bookmarks" ? reloadBookmarks() : loadCatalog(false, collection)}
+              disabled={isLoading}
+              title={viewMode === "bookmarks" ? "Reload bookmarks" : "Reload from cache"}
               className="p-1.5 text-zinc-500 hover:text-white hover:bg-zinc-700/60 rounded-lg
                          transition-colors disabled:opacity-30">
               <svg className={`w-4 h-4 ${loadState === "loading" && !searching ? "animate-spin" : ""}`}
@@ -330,7 +596,7 @@ export default function App() {
             </button>
 
             {/* Hard refresh */}
-            <button onClick={handleHardRefresh} disabled={isLoading}
+            <button onClick={handleHardRefresh} disabled={isLoading || viewMode === "bookmarks"}
               title="Re-download from Prime Video"
               className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium
                          text-zinc-300 hover:text-white bg-zinc-800/60 hover:bg-zinc-700
@@ -360,7 +626,7 @@ export default function App() {
         {!searchQuery && (
           <div className="flex items-center gap-1 px-6 pt-0.5 pb-2">
             {COLLECTIONS.map((col) => {
-              const active = col.slug === collection;
+              const active = viewMode === "catalog" && col.slug === collection;
               const colorMap: Record<string, string> = {
                 emerald: active ? "bg-emerald-600 text-white" : "text-emerald-400/70 hover:text-emerald-300",
                 sky:     active ? "bg-sky-600 text-white"     : "text-sky-400/70 hover:text-sky-300",
@@ -370,6 +636,7 @@ export default function App() {
                 <button
                   key={col.slug}
                   onClick={() => {
+                    setViewMode("catalog");
                     if (col.slug !== collection) {
                       setCollection(col.slug as CollectionSlug);
                     }
@@ -381,16 +648,38 @@ export default function App() {
                 </button>
               );
             })}
-            {loadState === "done" && allItems.length > 0 && (
+            <button
+              onClick={() => setViewMode("bookmarks")}
+              className={`px-3.5 py-1.5 rounded-full text-xs font-semibold transition-colors ${
+                viewMode === "bookmarks"
+                  ? "bg-amber-600 text-white"
+                  : "text-amber-400/70 hover:text-amber-300 hover:bg-zinc-800/60"
+              }`}
+            >
+              Bookmarks
+              {bookmarks.length > 0 && (
+                <span className={`ml-1.5 text-[10px] ${
+                  viewMode === "bookmarks" ? "text-amber-100" : "text-amber-500/80"
+                }`}>
+                  {bookmarks.length}
+                </span>
+              )}
+            </button>
+            {showCatalogData && allItems.length > 0 && (
               <span className="ml-2 text-xs text-zinc-600">
                 {allItems.length} titles
+              </span>
+            )}
+            {showBookmarksData && (
+              <span className="ml-2 text-xs text-zinc-600">
+                {bookmarks.length} saved
               </span>
             )}
           </div>
         )}
 
         {/* Entity-type filter + count row (after data loads) */}
-        {loadState === "done" && allItems.length > 0 && (
+        {((showCatalogData && allItems.length > 0) || (showBookmarksData && bookmarks.length > 0)) && (
           <div className="flex items-center gap-1 px-6 pb-2.5">
             {(
               [
@@ -447,7 +736,7 @@ export default function App() {
         )}
 
         {/* Error */}
-        {loadState === "error" && error && (
+        {viewMode === "catalog" && loadState === "error" && error && (
           <div className="mx-6 mt-4">
             <div className="bg-red-950/50 border border-red-800 rounded-xl p-5">
               <h3 className="text-red-300 font-semibold mb-2">Failed to load catalog</h3>
@@ -462,7 +751,7 @@ export default function App() {
         )}
 
         {/* Stale warning */}
-        {isStale && loadState === "done" && (
+        {viewMode === "catalog" && isStale && loadState === "done" && (
           <div className="mx-6 mb-4">
             <div className="bg-orange-950/40 border border-orange-800/60 rounded-lg px-4 py-2.5
                             flex items-center gap-3">
@@ -483,20 +772,35 @@ export default function App() {
         )}
 
         {/* Empty */}
-        {loadState === "done" && filteredGroups.length === 0 && (
+        {((showCatalogData || showBookmarksData) && filteredGroups.length === 0) && (
           <div className="flex flex-col items-center justify-center h-64 gap-3 text-zinc-500">
-            <svg className="w-12 h-12 opacity-20" fill="none" stroke="currentColor" strokeWidth={1} viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round"
-                d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-            </svg>
-            <p className="text-sm">
-              {searchQuery ? `No results for "${searchQuery}"` : "No titles found"}
-            </p>
-            {typeFilter !== "all" && (
-              <button onClick={() => setTypeFilter("all")}
-                className="text-xs text-emerald-400 hover:underline">
-                Clear type filter
-              </button>
+            {viewMode === "bookmarks" ? (
+              <>
+                <svg className="w-12 h-12 opacity-20" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round"
+                    d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0111.186 0z" />
+                </svg>
+                <p className="text-sm">No bookmarks yet</p>
+                <p className="text-xs text-zinc-600 max-w-xs text-center">
+                  Right-click any title and choose Bookmark to save it here.
+                </p>
+              </>
+            ) : (
+              <>
+                <svg className="w-12 h-12 opacity-20" fill="none" stroke="currentColor" strokeWidth={1} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round"
+                    d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                </svg>
+                <p className="text-sm">
+                  {searchQuery ? `No results for "${searchQuery}"` : "No titles found"}
+                </p>
+                {typeFilter !== "all" && (
+                  <button onClick={() => setTypeFilter("all")}
+                    className="text-xs text-emerald-400 hover:underline">
+                    Clear type filter
+                  </button>
+                )}
+              </>
             )}
           </div>
         )}
@@ -506,9 +810,11 @@ export default function App() {
           <CatalogGroupRow
             key={group.label}
             group={group}
-            onPlay={setSelectedItem}
+            onPlay={handleOpenTitle}
             imageCache={imageCache}
             imgPort={imgPort}
+            bookmarkedIds={bookmarkedIds}
+            onToggleBookmark={handleToggleBookmark}
           />
         ))}
       </main>
@@ -518,8 +824,21 @@ export default function App() {
         <PlayDialog
           item={selectedItem}
           config={config}
-          onClose={() => setSelectedItem(null)}
-          onOpenSettings={() => { setSelectedItem(null); setShowSettings(true); }}
+          initialEpisode={selectedEpisode}
+          launchContentId={selectedLaunchContentId}
+          bookmarkedIds={bookmarkedIds}
+          onToggleBookmark={handleToggleBookmark}
+          onClose={() => {
+            setSelectedItem(null);
+            setSelectedEpisode(null);
+            setSelectedLaunchContentId(null);
+          }}
+          onOpenSettings={() => {
+            setSelectedItem(null);
+            setSelectedEpisode(null);
+            setSelectedLaunchContentId(null);
+            setShowSettings(true);
+          }}
           onStartPlaying={(item, episode) => {
             // Show in the dock immediately — before the TV command completes
             setNowPlaying(item);
@@ -541,6 +860,15 @@ export default function App() {
         />
       )}
 
+      {globalMenu && (
+        <ContextMenu
+          x={globalMenu.x}
+          y={globalMenu.y}
+          items={globalMenu.items}
+          onClose={() => setGlobalMenu(null)}
+        />
+      )}
+
       {/* ── TV Remote — always visible ───────────────────────────────────── */}
       {/* nowPlaying ?? selectedItem: show the selected title in the dock
           as soon as the user opens a title card, even before pressing Play */}
@@ -551,9 +879,9 @@ export default function App() {
         cachedImageSrc={(() => {
           const item = nowPlaying ?? selectedItem;
           if (!item || !imgPort) return undefined;
-          const stem = item.content_id.replace(/[^\w\-]/g, "_");
+          const stem = safeId(item.content_id);
           return imageCache.has(stem)
-            ? `http://127.0.0.1:${imgPort}/${stem}.jpg`
+            ? cachedImageHttpUrl(imgPort, item.content_id, item.image_url)
             : undefined;
         })()}
         onPlaybackStateChange={setPlaybackState}
