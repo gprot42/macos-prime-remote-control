@@ -148,45 +148,73 @@ def _print_connect_troubleshooting(ip: str) -> None:
 
 
 async def connect(ip: str) -> "WebOsClient":
-    """Connect and pair with TV, returning a connected client."""
+    """Connect and pair with TV, returning a connected client.
+
+    Transient failures (timeouts, momentary refusals, a TV still waking from
+    standby) are retried a few times with a short backoff, since a single
+    immediate attempt otherwise surfaces a spurious "Could not connect" error
+    even though the TV becomes reachable a second later. A pairing rejection is
+    NOT retried — it needs the user to accept the prompt.
+    """
     from aiowebostv import WebOsClient, WebOsTvPairError
 
     key = load_key()
-    client = WebOsClient(ip, client_key=key)
+    attempts = max(1, int(os.environ.get("LG_TV_CONNECT_ATTEMPTS", "3")))
+    backoff = float(os.environ.get("LG_TV_CONNECT_BACKOFF", "1.5"))
 
     print(f"Connecting to {ip}:3000 ...")
     if not key:
         print("  No saved key — TV will show a pairing prompt. Accept it now.")
 
-    try:
-        await asyncio.wait_for(client.connect(), timeout=DEFAULT_CONNECT_TIMEOUT)
-    except WebOsTvPairError:
-        await _safe_disconnect(client)
-        print("  ERROR: Pairing rejected. Accept the prompt on the TV and retry.")
-        sys.exit(1)
-    except (asyncio.TimeoutError, TimeoutError):
-        await _safe_disconnect(client)
-        print(
-            f"  ERROR: Timed out connecting to {ip}:3000 "
-            f"(>{DEFAULT_CONNECT_TIMEOUT:g}s)",
-            file=sys.stderr,
-        )
-        _print_connect_troubleshooting(ip)
-        sys.exit(1)
-    except Exception as exc:
-        await _safe_disconnect(client)
-        print(
-            f"  ERROR: Could not reach TV at {ip}:3000 — {_format_connect_error(exc)}",
-            file=sys.stderr,
-        )
-        _print_connect_troubleshooting(ip)
-        sys.exit(1)
+    for attempt in range(1, attempts + 1):
+        client = WebOsClient(ip, client_key=key)
+        try:
+            await asyncio.wait_for(client.connect(), timeout=DEFAULT_CONNECT_TIMEOUT)
+        except WebOsTvPairError:
+            await _safe_disconnect(client)
+            print("  ERROR: Pairing rejected. Accept the prompt on the TV and retry.")
+            sys.exit(1)
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            await _safe_disconnect(client)
+            if attempt < attempts:
+                print(
+                    f"  Connect attempt {attempt}/{attempts} timed out; retrying ...",
+                    file=sys.stderr,
+                )
+                await asyncio.sleep(backoff)
+                continue
+            print(
+                f"  ERROR: Timed out connecting to {ip}:3000 "
+                f"(>{DEFAULT_CONNECT_TIMEOUT:g}s, {attempts} attempts)",
+                file=sys.stderr,
+            )
+            _print_connect_troubleshooting(ip)
+            sys.exit(1)
+        except Exception as exc:
+            await _safe_disconnect(client)
+            if attempt < attempts:
+                print(
+                    f"  Connect attempt {attempt}/{attempts} failed "
+                    f"({_format_connect_error(exc)}); retrying ...",
+                    file=sys.stderr,
+                )
+                await asyncio.sleep(backoff)
+                continue
+            print(
+                f"  ERROR: Could not reach TV at {ip}:3000 — {_format_connect_error(exc)}",
+                file=sys.stderr,
+            )
+            _print_connect_troubleshooting(ip)
+            sys.exit(1)
 
-    if client.client_key and client.client_key != key:
-        save_key(client.client_key)
+        if client.client_key and client.client_key != key:
+            save_key(client.client_key)
 
-    print(f"  Connected. paired={client.is_registered()}")
-    return client
+        print(f"  Connected. paired={client.is_registered()}")
+        return client
+
+    # Unreachable: every failure path above either returns or exits.
+    raise RuntimeError("connect() exhausted retries without resolving")
 
 
 async def cmd_info(client: "WebOsClient") -> None:
