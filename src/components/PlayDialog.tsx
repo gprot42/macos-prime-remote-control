@@ -312,14 +312,16 @@ export default function PlayDialog({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm
+                 px-4 pt-6 pb-24"
       onClick={(e) => {
         if (e.target === e.currentTarget && playState !== "playing") onClose();
       }}
     >
       <div
         data-media-dialog
-        className="bg-[#1A242F] rounded-2xl shadow-2xl w-full max-w-lg mx-4 overflow-hidden select-none"
+        className="bg-[#1A242F] rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden select-none
+                   flex flex-col max-h-full"
         onContextMenu={(e) => {
           const items = titleMenuItems();
           if (items.length > 0) openMenu(e, items);
@@ -331,7 +333,7 @@ export default function PlayDialog({
 
         {/* ── Hero banner ────────────────────────────────────────────────── */}
         <div
-          className="relative h-44"
+          className="relative h-44 shrink-0"
           onContextMenu={(e) => {
             const items = titleMenuItems();
             if (items.length > 0) openMenu(e, items);
@@ -402,7 +404,7 @@ export default function PlayDialog({
         </div>
 
         {/* ── Body ───────────────────────────────────────────────────────── */}
-        <div className="p-5 space-y-4">
+        <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
 
           {/* Synopsis */}
           {item.synopsis && (
@@ -631,10 +633,15 @@ export default function PlayDialog({
             </p>
           )}
 
-          {/* Length + optional start position ─────────────────────────── */}
-          <div className="flex items-center gap-3 bg-zinc-800/60 rounded-xl px-4 py-3">
-            {/* Clock icon */}
-            <svg className="w-6 h-6 text-zinc-400 shrink-0" fill="none" stroke="currentColor"
+        </div>
+
+        {/* Pinned footer — length + start position + actions stay visible so a
+            long episode list can never push them off-screen / under the bottom
+            position bar. */}
+        <div className="shrink-0 border-t border-zinc-800/70 px-5 py-4 space-y-3">
+          {/* Length + optional start position */}
+          <div className="flex items-center gap-3 bg-zinc-800/60 rounded-xl px-4 py-2.5">
+            <svg className="w-5 h-5 text-zinc-400 shrink-0" fill="none" stroke="currentColor"
               strokeWidth={1.5} viewBox="0 0 24 24">
               <circle cx="12" cy="12" r="9" />
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 7v5l3 2" />
