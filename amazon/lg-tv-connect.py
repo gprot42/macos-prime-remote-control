@@ -1460,18 +1460,84 @@ Use --profile-highlight to verify the mapped index on TV.""",
     return parser.parse_args()
 
 
-async def cmd_media_stop(client: "WebOsClient") -> None:
-    """Stop playback via SSAP and the STOP key."""
-    print("Stopping playback...")
+def _is_prime_app(app_id: str | None) -> bool:
+    if not app_id:
+        return False
+    return app_id in {PRIME_VIDEO_APP_ID, "com.amazon.firebat"} or app_id.startswith("amazon")
+
+
+async def _current_app_id(client: "WebOsClient") -> str | None:
     try:
-        result = await client.request("ssap://media.controls/stop", {})
-        if not result.get("returnValue", True):
-            print(f"  media.controls/stop: {result}", file=sys.stderr)
-    except Exception as exc:
-        print(f"  media.controls/stop unavailable ({exc}); falling back to key", file=sys.stderr)
-    await asyncio.sleep(PLAY_KEY_DELAY)
-    await client.button("STOP")
-    print("  Stopped.")
+        app_id = await client.get_current_app()
+        if isinstance(app_id, str) and app_id:
+            return app_id
+    except Exception:
+        pass
+    return client.tv_state.current_app_id or None
+
+
+async def _prefer_remote_keys(client: "WebOsClient") -> bool:
+    """Prime and unknown players need LG remote keys — SSAP media.controls won't work."""
+    app_id = await _current_app_id(client)
+    print(f"  foreground app: {app_id or 'unknown'}", file=sys.stderr)
+    if app_id is None:
+        return True
+    return _is_prime_app(app_id)
+
+
+async def _send_button(client: "WebOsClient", name: str) -> bool:
+    """Send a remote key, reconnecting once if the input socket dropped."""
+    for attempt in range(2):
+        try:
+            await client.button(name)
+            print(f"  Sent {name} key.", file=sys.stderr)
+            return True
+        except Exception as exc:
+            print(f"  button {name} failed (attempt {attempt + 1}): {exc}", file=sys.stderr)
+            if attempt == 0:
+                try:
+                    await _safe_disconnect(client)
+                    await asyncio.sleep(0.4)
+                    await asyncio.wait_for(client.connect(), timeout=DEFAULT_CONNECT_TIMEOUT)
+                    await asyncio.sleep(0.2)
+                except Exception as reconnect_exc:
+                    print(f"  reconnect failed: {reconnect_exc}", file=sys.stderr)
+                    return False
+    return False
+
+
+async def cmd_media_stop(client: "WebOsClient") -> None:
+    """Stop playback — remote keys first (Prime), SSAP fallback."""
+    print("Stopping playback...")
+    sent = False
+
+    if await _prefer_remote_keys(client):
+        # BACK x2 exits Prime player → detail/browse; EXIT/STOP as fallback.
+        for key in ("BACK", "BACK", "EXIT", "STOP"):
+            if await _send_button(client, key):
+                sent = True
+                await asyncio.sleep(PLAY_KEY_DELAY)
+        try:
+            result = await client.close()
+            if result.get("returnValue", True):
+                sent = True
+                print("  media.viewer/close succeeded.", file=sys.stderr)
+        except Exception as exc:
+            print(f"  media.viewer/close: {exc}", file=sys.stderr)
+    else:
+        try:
+            result = await client.stop()
+            if result.get("returnValue", True):
+                sent = True
+        except Exception as exc:
+            print(f"  media.controls/stop: {exc}", file=sys.stderr)
+        if await _send_button(client, "STOP"):
+            sent = True
+
+    if not sent:
+        print("error: could not stop TV playback", file=sys.stderr)
+        sys.exit(1)
+    print("Stopped.")
 
 
 async def cmd_seek(
@@ -1691,37 +1757,55 @@ async def cmd_set_mute(client: "WebOsClient", muted: bool) -> None:
 
 
 async def cmd_media_pause(client: "WebOsClient") -> None:
-    """Send media pause via SSAP and the PAUSE key."""
+    """Pause playback via SSAP and the PAUSE key (works for Prime and built-in players)."""
     print("Pausing playback...")
+    sent = False
+
     try:
         result = await client.pause()
-        if not result.get("returnValue", True):
-            print(f"  media.controls/pause: {result}", file=sys.stderr)
+        if result.get("returnValue", True):
+            sent = True
     except Exception as exc:
-        print(f"  media.controls/pause unavailable ({exc}); falling back to key", file=sys.stderr)
+        print(f"  media.controls/pause: {exc}", file=sys.stderr)
+
     await asyncio.sleep(PLAY_KEY_DELAY)
-    await client.button("PAUSE")
-    print("  Paused.")
+    if await _send_button(client, "PAUSE"):
+        sent = True
+
+    if not sent:
+        print("error: could not pause TV playback", file=sys.stderr)
+        sys.exit(1)
+    print("Paused.")
 
 
 async def cmd_media_resume(client: "WebOsClient") -> None:
-    """Send media play/resume via SSAP and the PLAY key."""
+    """Resume playback via SSAP and the PLAY key."""
     print("Resuming playback...")
+    sent = False
+
     try:
         result = await client.play()
-        if not result.get("returnValue", True):
-            print(f"  media.controls/play: {result}", file=sys.stderr)
+        if result.get("returnValue", True):
+            sent = True
     except Exception as exc:
-        print(f"  media.controls/play unavailable ({exc}); falling back to key", file=sys.stderr)
+        print(f"  media.controls/play: {exc}", file=sys.stderr)
+
     await asyncio.sleep(PLAY_KEY_DELAY)
-    await client.button("PLAY")
+    if await _send_button(client, "PLAY"):
+        sent = True
+
+    if not sent:
+        print("error: could not resume TV playback", file=sys.stderr)
+        sys.exit(1)
     print("  Resumed.")
 
 
 async def cmd_media_toggle(client: "WebOsClient") -> None:
     """Toggle play/pause by sending the PLAY key (acts as toggle on WebOS)."""
     print("Toggling play/pause...")
-    await client.button("PLAY")
+    if not await _send_button(client, "PLAY"):
+        print("error: could not toggle TV playback", file=sys.stderr)
+        sys.exit(1)
     print("  Sent PLAY (toggle).")
 
 

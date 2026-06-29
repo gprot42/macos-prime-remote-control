@@ -76,6 +76,10 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
   const [playbackTarget, setPlaybackTarget] = useState<PlaybackTarget>(
     config.default_playback_target ?? "tv",
   );
+  const [defaultTvVolume, setDefaultTvVolume] = useState(config.default_tv_volume ?? 13);
+  const [applyDefaultTvVolume, setApplyDefaultTvVolume] = useState(
+    config.apply_default_tv_volume ?? true,
+  );
 
   const [saving, setSaving] = useState(false);
   const [clearing, setClearing] = useState(false);
@@ -108,6 +112,8 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
       show_other: showOther,
       detect_vpn_region: detectVpnRegion,
       default_playback_target: playbackTarget,
+      default_tv_volume: Math.max(0, Math.min(100, defaultTvVolume)),
+      apply_default_tv_volume: applyDefaultTvVolume,
     };
     try {
       await invoke("save_config", { cfg: newCfg });
@@ -246,6 +252,43 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
                 <p className="text-xs text-zinc-500 mt-1.5">
                   0 = first profile slot in the Prime Video picker
                 </p>
+              </div>
+              <div>
+                <label className="flex items-start gap-3 cursor-pointer group">
+                  <input
+                    type="checkbox"
+                    checked={applyDefaultTvVolume}
+                    onChange={(e) => setApplyDefaultTvVolume(e.target.checked)}
+                    className="mt-1 w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-emerald-500
+                               focus:ring-emerald-500 focus:ring-offset-zinc-900"
+                  />
+                  <div className="flex-1">
+                    <p className="text-sm text-zinc-300 group-hover:text-white transition-colors">
+                      Apply default TV volume
+                    </p>
+                    <p className="text-xs text-zinc-500 mt-0.5 leading-relaxed">
+                      Set the TV volume when starting playback and when powering on the TV.
+                    </p>
+                  </div>
+                </label>
+                <div className={`mt-3 ${applyDefaultTvVolume ? "" : "opacity-50 pointer-events-none"}`}>
+                  <label className="block text-sm text-zinc-300 mb-1.5">Default TV Volume</label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    value={defaultTvVolume}
+                    onChange={(e) => {
+                      const n = parseInt(e.target.value, 10);
+                      setDefaultTvVolume(Number.isNaN(n) ? 0 : Math.max(0, Math.min(100, n)));
+                    }}
+                    className="w-24 bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
+                               text-white text-center focus:outline-none focus:border-emerald-500 transition-colors"
+                  />
+                  <p className="text-xs text-zinc-500 mt-1.5">
+                    Level from 0 (mute) to 100. Default is 13.
+                  </p>
+                </div>
               </div>
             </div>
           </section>

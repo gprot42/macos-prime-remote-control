@@ -115,6 +115,40 @@ export default function App() {
   const [nowPlayingEpisode, setNPEpisode]   = useState<number | null>(null);
   const [playbackState, setPlaybackState]   = useState<PlaybackState>("playing");
 
+  const stopTvPlayback = useCallback(async () => {
+    try {
+      await invoke("media_control", { action: "stop" });
+    } catch {
+      // Still clear the dock if the TV is unreachable.
+    }
+    setPlaybackState("paused");
+    setNowPlaying(null);
+    setNPEpisode(null);
+  }, []);
+
+  // Escape stops TV playback when something is playing (same as the stop button).
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || !nowPlaying) return;
+      if (globalMenu || showSettings) return;
+
+      const el = e.target;
+      if (
+        el instanceof HTMLInputElement ||
+        el instanceof HTMLTextAreaElement ||
+        (el instanceof HTMLElement && el.isContentEditable)
+      ) {
+        return;
+      }
+
+      e.preventDefault();
+      void stopTvPlayback();
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [nowPlaying, globalMenu, showSettings, stopTvPlayback]);
+
   // ── Global media context menu (single instance above all UI) ─────────────────
   useEffect(() => {
     const onMenu = (e: Event) => {
@@ -937,6 +971,7 @@ export default function App() {
       <TVRemote
         nowPlaying={nowPlaying ?? selectedItem}
         episode={nowPlaying ? nowPlayingEpisode : null}
+        defaultTvVolume={config.default_tv_volume ?? 13}
         playbackState={nowPlaying ? playbackState : "paused"}
         cachedImageSrc={(() => {
           const item = nowPlaying ?? selectedItem;

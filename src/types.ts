@@ -69,6 +69,10 @@ export interface AppConfig {
   default_playback_target: PlaybackTarget;
   /** Optional MAC for Wake-on-LAN power-on (e.g. AA:BB:CC:DD:EE:FF). */
   tv_mac?: string;
+  /** Default TV volume level (0–100) applied when starting playback. */
+  default_tv_volume?: number;
+  /** When true, set default_tv_volume after play and when powering on the TV. */
+  apply_default_tv_volume?: boolean;
 }
 
 export type PlaybackTarget = "tv" | "mac";
@@ -85,6 +89,8 @@ export const DEFAULT_CONFIG: AppConfig = {
   detect_vpn_region: true,
   default_playback_target: "tv",
   tv_mac: "",
+  default_tv_volume: 13,
+  apply_default_tv_volume: true,
 };
 
 export type EntityTypeFilter = "all" | "Movie" | "TV Show";

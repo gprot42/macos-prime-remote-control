@@ -11,7 +11,7 @@
  * The seek bar is a fully custom div-based component — no <input type="range">
  * controlled-component conflicts. Works reliably in Tauri's WKWebView.
  */
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { PrimeTitle } from "../types";
 
@@ -24,9 +24,128 @@ interface TVRemoteProps {
   episode?: number | null;
   playbackState: PlaybackState;
   cachedImageSrc?: string;
+  /** Configured default TV volume (0–100), used before the TV reports its level. */
+  defaultTvVolume?: number;
   onPlaybackStateChange: (s: PlaybackState) => void;
   onDismissPlaying: () => void;
 }
+
+// ─── Transport controls (stable module-level components — must NOT be defined
+//     inside TVRemote or they remount every position tick and lose clicks/hover) ─
+
+type TransportAction = "pause" | "play" | "stop";
+
+const TransportButton = memo(function TransportButton({
+  action,
+  title,
+  active,
+  busy,
+  anyBusy,
+  onAction,
+  children,
+}: {
+  action: TransportAction;
+  title: string;
+  active?: boolean;
+  busy: boolean;
+  anyBusy: boolean;
+  onAction: (action: TransportAction) => void;
+  children: React.ReactNode;
+}) {
+  const disabled = anyBusy;
+
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      title={title}
+      onPointerDown={(e) => {
+        if (e.button !== 0 || disabled) return;
+        e.preventDefault();
+        e.stopPropagation();
+        onAction(action);
+      }}
+      className={`w-9 h-9 flex items-center justify-center rounded-xl border shrink-0
+                  disabled:opacity-40 ${active
+        ? "bg-emerald-600 border-emerald-500 text-white"
+        : action === "stop"
+          ? "bg-zinc-800/80 border-zinc-700/60 text-zinc-300 hover:bg-red-900/60 hover:border-red-700/60 hover:text-red-300"
+          : "bg-zinc-800/80 border-zinc-700/60 text-zinc-300 hover:bg-zinc-700 hover:text-white"
+      }`}
+    >
+      {busy
+        ? <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+        : children}
+    </button>
+  );
+});
+
+const TransportBar = memo(function TransportBar({
+  tvOn,
+  playbackState,
+  pbBusy,
+  transportErr,
+  onTransport,
+}: {
+  tvOn: boolean | null;
+  playbackState: PlaybackState;
+  pbBusy: TransportAction | null;
+  transportErr: string | null;
+  onTransport: (action: TransportAction) => void;
+}) {
+  const anyBusy = pbBusy !== null;
+
+  return (
+    <div className={`flex flex-col items-center gap-0.5 shrink-0 ${
+      tvOn === false ? "opacity-40 pointer-events-none" : ""
+    }`}>
+      <div className="flex items-center gap-1.5">
+        <TransportButton
+          action="pause"
+          title="Pause"
+          active={playbackState === "paused"}
+          busy={pbBusy === "pause"}
+          anyBusy={anyBusy}
+          onAction={onTransport}
+        >
+          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+            <rect x="6" y="4" width="4" height="16" rx="1"/>
+            <rect x="14" y="4" width="4" height="16" rx="1"/>
+          </svg>
+        </TransportButton>
+        <TransportButton
+          action="play"
+          title="Play / Resume"
+          active={playbackState === "playing"}
+          busy={pbBusy === "play"}
+          anyBusy={anyBusy}
+          onAction={onTransport}
+        >
+          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+            <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z"/>
+          </svg>
+        </TransportButton>
+        <TransportButton
+          action="stop"
+          title="Stop"
+          busy={pbBusy === "stop"}
+          anyBusy={anyBusy}
+          onAction={onTransport}
+        >
+          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+            <rect x="5" y="5" width="14" height="14" rx="2"/>
+          </svg>
+        </TransportButton>
+      </div>
+      {transportErr && (
+        <span className="text-[9px] text-red-400 max-w-[120px] text-center leading-tight truncate"
+              title={transportErr}>
+          {transportErr}
+        </span>
+      )}
+    </div>
+  );
+});
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 function formatTime(secs: number): string {
@@ -190,6 +309,7 @@ function VerticalSlider({ value, muted, onChange }: {
 // ─── Main component ───────────────────────────────────────────────────────────
 export default function TVRemote({
   nowPlaying, episode, playbackState, cachedImageSrc,
+  defaultTvVolume = 13,
   onPlaybackStateChange, onDismissPlaying,
 }: TVRemoteProps) {
 
@@ -197,7 +317,7 @@ export default function TVRemote({
   const [tvOn, setTvOn]       = useState<boolean | null>(null);
   const tvOnRef               = useRef<boolean | null>(null);
   const [vol, setVol]         = useState<VolumeState>({ volume: null, muted: false });
-  const [slider, setSlider]   = useState(50);
+  const [slider, setSlider]   = useState(defaultTvVolume);
   const [volError, setVE]     = useState(false);
   const volDebounce           = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -222,13 +342,13 @@ export default function TVRemote({
     setVE(false);
     try {
       const s = await invoke<VolumeState>("get_tv_volume");
-      setVol(s); setSlider(s.volume ?? 50);
+      setVol(s); setSlider(s.volume ?? defaultTvVolume);
       setVE(false);
     } catch {
       if (tvOnRef.current === true) setVE(true);
       else setVE(false);
     }
-  }, []);
+  }, [defaultTvVolume]);
 
   useEffect(() => {
     refreshTvPower().then((on) => { if (on) fetchVolume(); });
@@ -399,35 +519,27 @@ export default function TVRemote({
   };
 
   // ── Transport ─────────────────────────────────────────────────────────────
-  const [pbBusy, setPbBusy] = useState<string | null>(null);
-  const handleTransport = async (action: "pause" | "play" | "stop") => {
+  const [pbBusy, setPbBusy] = useState<TransportAction | null>(null);
+  const [transportErr, setTransportErr] = useState<string | null>(null);
+
+  const handleTransport = useCallback(async (action: TransportAction) => {
+    if (tvOn === false) {
+      setTransportErr("TV is off");
+      return;
+    }
     setPbBusy(action);
+    setTransportErr(null);
     try {
       await invoke("media_control", { action });
       if (action === "pause") onPlaybackStateChange("paused");
       else if (action === "play") onPlaybackStateChange("playing");
       else { onPlaybackStateChange("paused"); onDismissPlaying(); }
-    } catch { /* ignore */ }
-    finally { setPbBusy(null); }
-  };
-
-  const TBtn = ({ action, title, active, children }: {
-    action: "pause" | "play" | "stop"; title: string; active?: boolean; children: React.ReactNode;
-  }) => (
-    <button onClick={() => handleTransport(action)} disabled={pbBusy !== null} title={title}
-      className={`w-9 h-9 flex items-center justify-center rounded-xl border transition-colors
-                  disabled:opacity-40 shrink-0 ${active
-        ? "bg-emerald-600 border-emerald-500 text-white hover:bg-emerald-500"
-        : action === "stop"
-          ? "bg-zinc-800/80 border-zinc-700/60 text-zinc-300 hover:bg-red-900/60 hover:border-red-700/60 hover:text-red-300"
-          : "bg-zinc-800/80 border-zinc-700/60 text-zinc-300 hover:bg-zinc-700 hover:text-white"
-      }`}
-    >
-      {pbBusy === action
-        ? <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-        : children}
-    </button>
-  );
+    } catch (err) {
+      setTransportErr(String(err).replace(/^Error:\s*/, "").slice(0, 60));
+    } finally {
+      setPbBusy(null);
+    }
+  }, [tvOn, onPlaybackStateChange, onDismissPlaying]);
 
   const volPct    = vol.muted ? 0 : slider;
   const dispVol   = vol.muted ? 0 : (vol.volume ?? slider);
@@ -577,24 +689,13 @@ export default function TVRemote({
         <div className="w-px h-9 bg-zinc-700/60 shrink-0" />
 
         {/* ── TRANSPORT ─────────────────────────────────────────────────── */}
-        <div className="flex items-center gap-1.5 shrink-0">
-          <TBtn action="pause" title="Pause">
-            <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-              <rect x="6" y="4" width="4" height="16" rx="1"/>
-              <rect x="14" y="4" width="4" height="16" rx="1"/>
-            </svg>
-          </TBtn>
-          <TBtn action="play" title="Play / Resume" active>
-            <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-              <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z"/>
-            </svg>
-          </TBtn>
-          <TBtn action="stop" title="Stop">
-            <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-              <rect x="5" y="5" width="14" height="14" rx="2"/>
-            </svg>
-          </TBtn>
-        </div>
+        <TransportBar
+          tvOn={tvOn}
+          playbackState={playbackState}
+          pbBusy={pbBusy}
+          transportErr={transportErr}
+          onTransport={handleTransport}
+        />
 
         <div className="w-px h-9 bg-zinc-700/60 shrink-0" />
 

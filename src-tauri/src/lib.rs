@@ -1,10 +1,17 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
+
+/// Serialize LG TV network commands — the TV accepts one WebSocket client at a time.
+fn tv_cmd_lock() -> &'static AsyncMutex<()> {
+    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| AsyncMutex::new(()))
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -39,6 +46,16 @@ pub struct AppConfig {
     /// Optional TV MAC for Wake-on-LAN when powering on from deep standby.
     #[serde(default)]
     pub tv_mac: String,
+    /// Default TV volume (0–100) applied when starting playback.
+    #[serde(default = "default_tv_volume")]
+    pub default_tv_volume: i32,
+    /// When true, set default_tv_volume after play and when powering on the TV.
+    #[serde(default = "default_true")]
+    pub apply_default_tv_volume: bool,
+}
+
+fn default_tv_volume() -> i32 {
+    13
 }
 
 fn default_playback_tv() -> String {
@@ -71,6 +88,8 @@ impl Default for AppConfig {
             detect_vpn_region: true,
             default_playback_target: default_playback_tv(),
             tv_mac: String::new(),
+            default_tv_volume: default_tv_volume(),
+            apply_default_tv_volume: true,
         }
     }
 }
@@ -177,12 +196,21 @@ fn load_config() -> AppConfig {
     let path = config_path();
     if path.exists() {
         if let Ok(data) = std::fs::read_to_string(&path) {
-            if let Ok(cfg) = serde_json::from_str::<AppConfig>(&data) {
-                return cfg;
+            if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Ok(cfg) = serde_json::from_value::<AppConfig>(raw.clone()) {
+                    let needs_save = raw.get("default_tv_volume").is_none()
+                        || raw.get("apply_default_tv_volume").is_none();
+                    if needs_save {
+                        let _ = save_config_to_disk(&cfg);
+                    }
+                    return cfg;
+                }
             }
         }
     }
-    AppConfig::default()
+    let cfg = AppConfig::default();
+    let _ = save_config_to_disk(&cfg);
+    cfg
 }
 
 fn save_config_to_disk(cfg: &AppConfig) -> Result<(), String> {
@@ -689,6 +717,7 @@ async fn autofill_tv_mac(cfg: &mut AppConfig) -> Result<bool, String> {
 }
 
 async fn run_get_mac_cmd(ip: &str) -> Result<Option<String>, String> {
+    let _tv = tv_cmd_lock().lock().await;
     let cfg = load_config();
     let root = resolve_project_root(&cfg);
     let python = python_exe(&root);
@@ -1062,9 +1091,19 @@ struct VolumeState {
 }
 
 /// Run a volume-related lg-tv-connect.py command and return JSON output.
-async fn run_tv_volume_cmd(args: &[&str]) -> Result<VolumeState, String> {
-    let cfg = load_config();
-    let root = resolve_project_root(&cfg);
+/// When `caller_holds_lock` is true the caller already holds `tv_cmd_lock` — do not
+/// acquire again (tokio::Mutex is not recursive).
+async fn run_tv_volume_cmd_with_cfg(
+    cfg: &AppConfig,
+    args: &[&str],
+    caller_holds_lock: bool,
+) -> Result<VolumeState, String> {
+    let _guard = if caller_holds_lock {
+        None
+    } else {
+        Some(tv_cmd_lock().lock().await)
+    };
+    let root = resolve_project_root(cfg);
     let python = python_exe(&root);
     let script = root
         .join("amazon")
@@ -1108,6 +1147,23 @@ async fn run_tv_volume_cmd(args: &[&str]) -> Result<VolumeState, String> {
         volume: val["volume"].as_i64(),
         muted: val["muted"].as_bool().unwrap_or(false),
     })
+}
+
+async fn run_tv_volume_cmd(args: &[&str]) -> Result<VolumeState, String> {
+    let cfg = load_config();
+    run_tv_volume_cmd_with_cfg(&cfg, args, false).await
+}
+
+/// Set the configured default TV volume when the feature is enabled.
+async fn apply_configured_tv_volume(cfg: &AppConfig, caller_holds_lock: bool) -> Result<(), String> {
+    if !cfg.apply_default_tv_volume {
+        return Ok(());
+    }
+    let level = cfg.default_tv_volume.clamp(0, 100);
+    let level_str = level.to_string();
+    run_tv_volume_cmd_with_cfg(cfg, &["--volume-set", &level_str], caller_holds_lock)
+        .await?;
+    Ok(())
 }
 
 /// Get current volume level and mute state.
@@ -1155,6 +1211,7 @@ struct TvPowerState {
 /// Query whether the TV is powered on (requires network connection).
 #[tauri::command]
 async fn get_tv_power() -> Result<TvPowerState, String> {
+    let _tv = tv_cmd_lock().lock().await;
     let cfg = load_config();
     let root = resolve_project_root(&cfg);
     let python = python_exe(&root);
@@ -1197,6 +1254,7 @@ async fn get_tv_power() -> Result<TvPowerState, String> {
 /// Power the TV on or off ("on" | "off").
 #[tauri::command]
 async fn tv_power(app: tauri::AppHandle, action: String) -> Result<(), String> {
+    let _tv = tv_cmd_lock().lock().await;
     let cfg = load_config();
     let root = resolve_project_root(&cfg);
     let python = python_exe(&root);
@@ -1246,20 +1304,19 @@ async fn tv_power(app: tauri::AppHandle, action: String) -> Result<(), String> {
         }
     }
     if autofill_tv_mac(&mut cfg).await.unwrap_or(false) {
-        let _ = app.emit("config-updated", cfg);
+        let _ = app.emit("config-updated", cfg.clone());
+    }
+
+    if action == "on" {
+        let _ = apply_configured_tv_volume(&cfg, false).await;
     }
 
     Ok(())
 }
 
-/// Send a media control command to the TV (pause / play / toggle).
-#[tauri::command]
-async fn media_control(
-    app: tauri::AppHandle,
-    action: String, // "pause" | "play" | "toggle"
-) -> Result<(), String> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
+/// Run a short media-control lg-tv-connect.py command.
+async fn run_tv_media_cmd(flag: &str) -> Result<(), String> {
+    let _tv = tv_cmd_lock().lock().await;
     let cfg = load_config();
     let root = resolve_project_root(&cfg);
     let python = python_exe(&root);
@@ -1269,6 +1326,29 @@ async fn media_control(
         .to_string_lossy()
         .to_string();
 
+    let output = tokio::process::Command::new(&python)
+        .current_dir(&root)
+        .arg(&script)
+        .arg(&cfg.tv_ip)
+        .arg(flag)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run lg-tv-connect.py: {e}"))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        let out = String::from_utf8_lossy(&output.stdout).to_string();
+        let detail = if err.trim().is_empty() { out } else { err };
+        return Err(format!("TV media command failed: {detail}"));
+    }
+    Ok(())
+}
+
+/// Send a media control command to the TV (pause / play / toggle / stop).
+#[tauri::command]
+async fn media_control(action: String) -> Result<(), String> {
     let flag = match action.as_str() {
         "pause"  => "--media-pause",
         "play" | "resume" => "--media-play",
@@ -1276,39 +1356,7 @@ async fn media_control(
         "stop"   => "--media-stop",
         other    => return Err(format!("Unknown media action: {other}")),
     };
-
-    let mut child = tokio::process::Command::new(&python)
-        .arg(&script)
-        .arg(&cfg.tv_ip)
-        .arg(flag)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to run lg-tv-connect.py: {e}"))?;
-
-    let stdout = child.stdout.take().unwrap();
-    let app_out = app.clone();
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = app_out.emit("play-progress", format!("{line}\n"));
-        }
-    });
-
-    let stderr = child.stderr.take().unwrap();
-    let app_err = app.clone();
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = app_err.emit("play-progress", format!("[err] {line}\n"));
-        }
-    });
-
-    let status = child.wait().await.map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err(format!("media control exited with: {status}"));
-    }
-    Ok(())
+    run_tv_media_cmd(flag).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1368,6 +1416,7 @@ async fn play_on_tv(
 ) -> Result<String, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    let _tv = tv_cmd_lock().lock().await;
     let cfg = load_config();
     let root = resolve_project_root(&cfg);
     let python = python_exe(&root);
@@ -1381,6 +1430,7 @@ async fn play_on_tv(
 
     let mut command = tokio::process::Command::new(&python);
     command
+        .current_dir(&root)
         .arg(&script)
         .arg(&tv_ip)
         .arg("--launch")
@@ -1408,7 +1458,7 @@ async fn play_on_tv(
     let stdout = child.stdout.take().unwrap();
     let mut stdout_lines = BufReader::new(stdout).lines();
     let app_out = app.clone();
-    tokio::spawn(async move {
+    let stdout_task = tokio::spawn(async move {
         while let Ok(Some(line)) = stdout_lines.next_line().await {
             let _ = app_out.emit("play-progress", format!("{line}\n"));
         }
@@ -1417,7 +1467,7 @@ async fn play_on_tv(
     let stderr = child.stderr.take().unwrap();
     let mut stderr_lines = BufReader::new(stderr).lines();
     let app_err = app.clone();
-    tokio::spawn(async move {
+    let stderr_task = tokio::spawn(async move {
         while let Ok(Some(line)) = stderr_lines.next_line().await {
             let _ = app_err.emit("play-progress", format!("[err] {line}\n"));
         }
@@ -1428,7 +1478,11 @@ async fn play_on_tv(
         .await
         .map_err(|e| format!("Process error: {e}"))?;
 
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+
     if status.success() {
+        let _ = apply_configured_tv_volume(&cfg, true).await;
         let _ = app.emit("play-progress", "Done.\n".to_string());
         Ok("Done".to_string())
     } else {
@@ -1447,6 +1501,7 @@ async fn play_on_tv(
 /// at the desired position when the SSAP seek command is unsupported.
 #[tauri::command]
 async fn seek_to(seconds: f64, content_id: Option<String>) -> Result<(), String> {
+    let _tv = tv_cmd_lock().lock().await;
     let cfg = load_config();
     let root = resolve_project_root(&cfg);
     let python = python_exe(&root);
@@ -1485,6 +1540,7 @@ async fn seek_to(seconds: f64, content_id: Option<String>) -> Result<(), String>
 /// Returns `{position: f64|null, duration: f64|null}`.
 #[tauri::command]
 async fn get_playback_position() -> Result<serde_json::Value, String> {
+    let _tv = tv_cmd_lock().lock().await;
     let cfg = load_config();
     let root = resolve_project_root(&cfg);
     let python = python_exe(&root);
