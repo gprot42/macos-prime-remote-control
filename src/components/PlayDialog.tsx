@@ -34,6 +34,25 @@ interface PlayDialogProps {
 type PlayState = "idle" | "playing" | "done" | "error";
 type MacPlayState = "idle" | "opening" | "done" | "error";
 
+/** Format whole minutes as "48 min" or "1 h 23 min". */
+function formatRuntimeMin(min: number): string {
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return h > 0 ? `${h} h ${m} min` : `${m} min`;
+}
+
+/** Parse "ss", "mm:ss" or "h:mm:ss" into seconds. Returns null when invalid. */
+function parseTimeToSeconds(s: string): number | null {
+  const t = s.trim();
+  if (!t) return null;
+  const parts = t.split(":").map((x) => Number(x));
+  if (parts.some((n) => Number.isNaN(n) || n < 0)) return null;
+  if (parts.length === 1) return parts[0];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return null;
+}
+
 export default function PlayDialog({
   item,
   config,
@@ -59,6 +78,9 @@ export default function PlayDialog({
   // TV series episode selection (movies ignore this)
   const isSeries = item.entity_type === "TV Show";
   const [episode, setEpisode] = useState(initialEpisode ?? 1);
+
+  // Optional start position ("mm:ss" / "h:mm:ss") to begin playback from.
+  const [startAt, setStartAt] = useState("");
 
 
   // Full episode list (fetched for TV shows). Falls back to the numeric
@@ -198,6 +220,18 @@ export default function PlayDialog({
   const hasEpisodeList = isSeries && epListState === "done" && episodes.length > 0;
   const selectedEpisode = hasEpisodeList ? episodes[episode - 1] : null;
 
+  // Total length of the media currently selected (the chosen episode for a
+  // series, otherwise the movie itself).
+  const selectedRuntimeMin = isSeries
+    ? selectedEpisode?.runtime_min ?? null
+    : item.runtime_min;
+  const selectedRuntimeStr =
+    selectedRuntimeMin != null
+      ? formatRuntimeMin(selectedRuntimeMin)
+      : !isSeries
+      ? item.runtime_str
+      : null;
+
   const label = getAccessLabel(item);
   const badgeStyle = accessBadgeStyle(label);
 
@@ -233,6 +267,7 @@ export default function PlayDialog({
       await playOnTv(item, { tv_ip: config.tv_ip, profile }, {
         contentId: useLaunchId,
         episode: ep,
+        startSeconds: parseTimeToSeconds(startAt),
       });
       setPlayState("done");
       onPlayed(item);
@@ -482,6 +517,11 @@ export default function PlayDialog({
                           }`}>
                             {ep.title || `Episode ${num}`}
                           </span>
+                          {ep.runtime_min != null && (
+                            <span className="shrink-0 text-[11px] text-zinc-500 tabular-nums">
+                              {formatRuntimeMin(ep.runtime_min)}
+                            </span>
+                          )}
                           {bookmarkedIds && isBookmarked(bookmarkedIds, item, ep) && (
                             <BookmarkIcon filled />
                           )}
@@ -590,6 +630,37 @@ export default function PlayDialog({
               Opened in Prime Video — sign in if prompted.
             </p>
           )}
+
+          {/* Length + optional start position ─────────────────────────── */}
+          <div className="flex items-center gap-3 bg-zinc-800/60 rounded-xl px-4 py-3">
+            {/* Clock icon */}
+            <svg className="w-6 h-6 text-zinc-400 shrink-0" fill="none" stroke="currentColor"
+              strokeWidth={1.5} viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="9" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 7v5l3 2" />
+            </svg>
+            <div className="flex-1 min-w-0">
+              <p className="text-white text-sm font-medium">
+                {selectedRuntimeStr ? `Length: ${selectedRuntimeStr}` : "Length unavailable"}
+              </p>
+              <p className="text-zinc-500 text-xs">Leave blank to start from the beginning</p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <label className="text-xs text-zinc-400 whitespace-nowrap">Start at</label>
+              <input
+                type="text"
+                inputMode="numeric"
+                value={startAt}
+                onChange={(e) => setStartAt(e.target.value)}
+                placeholder="0:00"
+                disabled={playState === "playing"}
+                title="Start playback from this position, e.g. 12:30 or 1:05:00"
+                className="w-20 bg-zinc-700 border border-zinc-600 rounded-lg px-2 py-1 text-sm
+                           text-white text-center font-mono focus:outline-none focus:border-emerald-500
+                           transition-colors disabled:opacity-50"
+              />
+            </div>
+          </div>
 
           {/* Action buttons */}
           <div className="flex gap-2">

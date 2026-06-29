@@ -273,14 +273,43 @@ def list_episodes_from_html(
     """Return episode detail IDs/GTIs from a season or episode page."""
     episodes: list[dict] = []
     seen: set[str] = set()
+    # Prime splits an episode's data across two node shapes: a "link" node that
+    # carries the detail ID + GTI but no metadata, and a richer node that has
+    # title/runtime/duration keyed by episode number but no link/GTI. Collect the
+    # metadata here and merge it onto the linked episodes by sequence number, so
+    # the seek bar gets a real episode runtime instead of None.
+    meta_by_seq: dict[int, dict] = {}
+
+    def _seq_of(node: dict) -> int | None:
+        seq = node.get("sequenceNumber") or node.get("episodeNumber")
+        if isinstance(seq, bool):
+            return None
+        return int(seq) if isinstance(seq, (int, float)) else None
 
     def walk(node: object) -> None:
+        if isinstance(node, list):
+            for value in node:
+                walk(value)
+            return
         if not isinstance(node, dict):
             return
         if node.get("titleType") != "episode":
             for value in node.values():
                 walk(value)
             return
+
+        seq_num = _seq_of(node)
+
+        # Record any metadata this node carries, even when it lacks the link/GTI
+        # needed to launch the episode (the rich node has no link).
+        if seq_num is not None:
+            rt = _episode_runtime_min(node)
+            title = node.get("title") or node.get("displayTitle")
+            meta = meta_by_seq.setdefault(seq_num, {})
+            if rt and not meta.get("runtime_min"):
+                meta["runtime_min"] = rt
+            if title and not meta.get("title"):
+                meta["title"] = title
 
         content_id = _prime_link_content_id(node.get("link")) or node.get("compactGTI")
         gti = node.get("gti")
@@ -294,8 +323,6 @@ def list_episodes_from_html(
             return
 
         seen.add(content_id)
-        sequence = node.get("sequenceNumber") or node.get("episodeNumber")
-        seq_num = int(sequence) if isinstance(sequence, (int, float)) else None
         asins = node.get("asins") if isinstance(node.get("asins"), list) else []
         episodes.append(
             {
@@ -317,9 +344,18 @@ def list_episodes_from_html(
     for blob in parse_json_blobs(html):
         walk(blob)
 
+    # Backfill title/runtime from the metadata nodes for episodes captured from a
+    # bare link node.
+    for ep in episodes:
+        meta = meta_by_seq.get(ep.get("sequence_number"))
+        if not meta:
+            continue
+        if ep.get("runtime_min") is None and meta.get("runtime_min"):
+            ep["runtime_min"] = meta["runtime_min"]
+        if not ep.get("title") and meta.get("title"):
+            ep["title"] = meta["title"]
+
     episodes.sort(key=lambda item: item.get("sequence_number") or 999)
-    if season_content_id:
-        return episodes
     return episodes
 
 

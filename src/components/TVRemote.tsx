@@ -447,8 +447,12 @@ export default function TVRemote({
   const commitSeek = useCallback((seconds: number) => {
     playRef.current = { pos: seconds, time: Date.now() };
     setPos(seconds); setSeekPreview(null);
-    invoke("seek_to", { seconds, contentId: nowPlaying?.content_id ?? null }).catch(() => {});
-  }, [nowPlaying?.content_id]); // eslint-disable-line
+    invoke("seek_to", {
+      seconds,
+      contentId: nowPlaying?.content_id ?? null,
+      episode: episode ?? null,
+    }).catch(() => {});
+  }, [nowPlaying?.content_id, episode]); // eslint-disable-line
 
   const parseTimeStr = (s: string): number | null => {
     const p = s.trim().split(":").map(x => parseFloat(x));
@@ -501,14 +505,23 @@ export default function TVRemote({
     setPowerBusy(true);
     setPowerErr(null);
     try {
-      await invoke("tv_power", { action: turningOff ? "off" : "on" });
+      const applied = await invoke<VolumeState | null>("tv_power", { action: turningOff ? "off" : "on" });
       if (turningOff) {
         setTvOnState(false);
         setVE(false);
         onDismissPlaying();
       } else {
         setTvOnState(true);
-        await fetchVolume();
+        // Prefer the volume the backend just applied (avoids a separate read that
+        // races a just-woken TV and can latch a stale level). Fall back to a live
+        // fetch when the default-volume feature is off.
+        if (applied && applied.volume != null) {
+          setVol(applied);
+          setSlider(applied.volume);
+          setVE(false);
+        } else {
+          await fetchVolume();
+        }
       }
     } catch (err) {
       setPowerErr(String(err).replace(/^Error:\s*/, "").slice(0, 60));

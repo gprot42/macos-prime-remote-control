@@ -281,6 +281,27 @@ def _prime_target_uses_params(target: str) -> bool:
     )
 
 
+def _prime_target_with_start_offset(target: str, pos: int) -> str:
+    """Return a Prime autoplay deep link that starts playback at `pos` seconds.
+
+    Prime Video on webOS honours the ``?t=<seconds>`` query param of the
+    contentTarget deep link (the same mechanism the normal play path uses with
+    ``t=0``). The plain ``{"startTime": N}`` launch param, by contrast, is
+    ignored by Prime's player — which made seeking silently do nothing.
+    """
+    if not _prime_target_uses_params(target):
+        # Bare content / detail ID → build the detail deep link used for play.
+        return f"/detail/{target}?autoplay=1&t={pos}"
+    # Already a deep link: set/replace t= and ensure autoplay is requested.
+    if re.search(r"[?&]t=\d+", target):
+        target = re.sub(r"([?&]t=)\d+", rf"\g<1>{pos}", target)
+    else:
+        target = f"{target}{'&' if '?' in target else '?'}t={pos}"
+    if "autoplay=" not in target:
+        target = f"{target}&autoplay=1"
+    return target
+
+
 def resolve_prime_launch_ids(
     content_id: str,
     *,
@@ -288,6 +309,7 @@ def resolve_prime_launch_ids(
     episode: int | None = None,
     prefer_episode: bool = False,
     autoplay: bool = False,
+    start: int = 0,
 ) -> list[str]:
     """Return Prime content IDs to try, best-first (GTI is what the TV app often expects)."""
     content_id = content_id.strip()
@@ -349,9 +371,19 @@ def resolve_prime_launch_ids(
                         episode_html = None
                     if episode_html:
                         label_html = episode_html
-                if autoplay_target := playback_launch_target_from_html(
+                autoplay_target = playback_launch_target_from_html(
                     label_html, target_id
-                ):
+                )
+                if start and start > 0:
+                    # Begin playback at the chosen position via the same
+                    # ?t=<seconds> deep link the seek path uses. Force a
+                    # /detail/<id>?autoplay=1&t=<pos> link even when the unsigned
+                    # page exposes no Watch-now playbackURL, so positioning still
+                    # works (mirrors cmd_seek).
+                    autoplay_target = _prime_target_with_start_offset(
+                        autoplay_target or target_id, int(start)
+                    )
+                if autoplay_target:
                     _append_launch_id(candidates, seen, autoplay_target)
                     break
 
@@ -458,6 +490,7 @@ async def launch_prime_content_candidates(
     episode: int | None = None,
     prefer_episode: bool = False,
     autoplay: bool = False,
+    start: int = 0,
 ) -> tuple[str, bool]:
     """Launch Prime with the best resolved content ID (or try each candidate)."""
     candidates = resolve_prime_launch_ids(
@@ -466,6 +499,7 @@ async def launch_prime_content_candidates(
         episode=episode,
         prefer_episode=prefer_episode,
         autoplay=autoplay,
+        start=start,
     )
     if len(candidates) > 1:
         print(f"  Resolved launch IDs: {', '.join(candidates)}")
@@ -842,6 +876,7 @@ async def cmd_launch_prime(
     close_after_profile: bool = False,
     skip_entitlement_check: bool = False,
     episode: int | None = None,
+    start: int = 0,
 ) -> None:
     profile_display_name: str | None = None
     effective_profile_type = profile_type or "adult"
@@ -924,6 +959,7 @@ async def cmd_launch_prime(
                 episode=episode,
                 prefer_episode=play or episode is not None,
                 autoplay=play,
+                start=start,
             )
         else:
             # This Prime build re-shows the profile picker whenever it receives
@@ -940,7 +976,12 @@ async def cmd_launch_prime(
                 detail_html=detail_html,
                 episode=episode,
                 prefer_episode=play or episode is not None,
-                autoplay=False,
+                # Normally this flow deep-links without autoplay and lets the
+                # profile picker gate playback. When a start offset is requested
+                # we need the autoplay ?t=<pos> deep link so Prime begins at that
+                # position once the profile is chosen.
+                autoplay=(start or 0) > 0,
+                start=start,
             )
             await select_profile(
                 client,
@@ -971,6 +1012,7 @@ async def cmd_launch_prime(
             episode=episode,
             prefer_episode=play or episode is not None,
             autoplay=play,
+            start=start,
         )
         if profile is not None:
             await select_profile(
@@ -1087,6 +1129,7 @@ async def cmd_launch(
     close_after_profile: bool = False,
     skip_entitlement_check: bool = False,
     episode: int | None = None,
+    start: int = 0,
 ) -> None:
     if app_id == PRIME_VIDEO_APP_ID:
         await cmd_launch_prime(
@@ -1115,6 +1158,7 @@ async def cmd_launch(
             close_after_profile=close_after_profile,
             skip_entitlement_check=skip_entitlement_check,
             episode=episode,
+            start=start,
         )
         return
 
@@ -1448,6 +1492,13 @@ Use --profile-highlight to verify the mapped index on TV.""",
         help="Seek to absolute position in seconds",
     )
     parser.add_argument(
+        "--start",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="Start playback at this position (seconds) when used with --play",
+    )
+    parser.add_argument(
         "--get-position",
         action="store_true",
         help="Get current playback position and duration as JSON",
@@ -1544,36 +1595,55 @@ async def cmd_seek(
     client: "WebOsClient",
     seconds: float,
     content_id: str | None = None,
+    episode: int | None = None,
 ) -> None:
     """Seek to an absolute position.
 
     Tries, in order of reliability for the Prime Video native app:
-      1. Re-launch Prime Video with startTime param (actually moves Prime's player)
+      1. Re-launch Prime Video with an ?autoplay=1&t=<pos> contentTarget deep
+         link (the same mechanism the play path uses — actually moves Prime's
+         player to <pos>)
       2. SSAP media.controls/seek  (LG built-in player / non-Prime fallback)
       3. Open the Prime Video detail page in the browser with ?autoplay=1&t=N
 
     NOTE: SSAP seek is tried *after* the re-launch for Prime, because Prime's
     player ignores SSAP seek yet the call can falsely report success — which
-    previously made the seek silently do nothing.
+    previously made the seek silently do nothing. The old {"startTime": N}
+    launch param is likewise ignored by Prime, so we use ?t=<pos> instead.
     """
     pos = max(0, int(seconds))
     print(f"Seeking to {pos}s ...")
 
-    # ── Method 1: Re-launch native app with startTime (Prime) ────────────────
-    # Amazon Prime Video on LG WebOS accepts {"contentId": …, "startTime": N}
-    # or {"contentTarget": …, "startTime": N} in its launch payload.
-    if content_id:
-        print(f"  Re-launching with startTime={pos} ...")
+    # For a series/season, resolve the specific episode's detail ID so the seek
+    # deep link targets the episode being watched — otherwise it would relaunch
+    # the series landing page instead of moving the episode's player.
+    seek_id = content_id
+    if content_id and episode is not None and episode >= 1:
+        try:
+            html = fetch_prime_detail_html(content_id)
+            if html:
+                resolved = resolve_episode_content_id(html, content_id, episode=episode)
+                if resolved and resolved != content_id:
+                    print(f"  Resolved episode {episode} → {resolved}")
+                    seek_id = resolved
+        except (OSError, ValueError) as exc:
+            print(f"  Warning: could not resolve episode {episode} ({exc})", file=sys.stderr)
+
+    # ── Method 1: Re-launch native app at ?t=<pos> (Prime) ───────────────────
+    # Amazon Prime Video on LG WebOS honours the ?t=<seconds> query param of the
+    # contentTarget deep link — the exact mechanism the normal play path uses
+    # (with t=0). The older {"startTime": N} launch param is ignored by Prime's
+    # player, which made the seek silently do nothing.
+    if seek_id:
+        target = _prime_target_with_start_offset(seek_id, pos)
+        print(f"  Re-launching at t={pos}s (contentTarget={target}) ...")
         try:
             if await close_app(client, PRIME_VIDEO_APP_ID):
                 await asyncio.sleep(1.5)
 
-            if _prime_target_uses_params(content_id):
-                launch_payload: dict = {"contentTarget": content_id, "startTime": pos}
-            else:
-                launch_payload = {"contentId": content_id, "startTime": pos}
-
-            result = await client.launch_app_with_params(PRIME_VIDEO_APP_ID, launch_payload)
+            result = await client.launch_app_with_params(
+                PRIME_VIDEO_APP_ID, {"contentTarget": target}
+            )
             if result.get("returnValue"):
                 print(json.dumps({"seeked_to": pos, "success": True, "method": "relaunch"}))
                 return
@@ -1593,10 +1663,10 @@ async def cmd_seek(
 
     # ── Method 3: Browser deeplink with ?autoplay=1&t=N ──────────────────────
     # Opens the Prime Video website in the LG browser; less seamless but reliable.
-    if content_id:
+    if seek_id:
         print(f"  Trying browser deeplink with t={pos} ...")
         try:
-            url = f"https://www.primevideo.com/detail/{content_id}?autoplay=1&t={pos}"
+            url = f"https://www.primevideo.com/detail/{seek_id}?autoplay=1&t={pos}"
             result = await client.launch_app_with_params(
                 PRIME_BROWSER_APP_ID,
                 {"target": url},
@@ -1658,8 +1728,11 @@ async def cmd_volume_set(client: "WebOsClient", level: int) -> None:
     try:
         result = await client.set_volume(level)
         if result.get("returnValue"):
-            vol_now = await client.get_volume()
-            print(json.dumps({"volume": vol_now, "muted": False}))
+            # set_volume succeeded → the TV will be at `level`. Reading the volume
+            # back immediately races on a just-woken TV (it can briefly still
+            # report the previous level, e.g. show 8 right after we set 13), so
+            # trust the requested value rather than a stale read-back.
+            print(json.dumps({"volume": level, "muted": False}))
             return
         print(f"  set_volume SSAP: {result}", file=sys.stderr)
     except Exception as exc:
@@ -2098,6 +2171,7 @@ async def main() -> None:
                 close_after_profile=args.close_after_profile,
                 skip_entitlement_check=args.skip_entitlement_check,
                 episode=args.episode,
+                start=int(args.start) if args.start else 0,
             )
         elif args.media_pause:
             await cmd_media_pause(client)
@@ -2124,7 +2198,7 @@ async def main() -> None:
         elif args.unmute:
             await cmd_set_mute(client, False)
         elif args.seek is not None:
-            await cmd_seek(client, args.seek, content_id=args.content_id)
+            await cmd_seek(client, args.seek, content_id=args.content_id, episode=args.episode)
         elif args.get_position:
             await cmd_get_position(client)
         elif args.apps:

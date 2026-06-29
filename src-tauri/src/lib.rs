@@ -1155,15 +1155,21 @@ async fn run_tv_volume_cmd(args: &[&str]) -> Result<VolumeState, String> {
 }
 
 /// Set the configured default TV volume when the feature is enabled.
-async fn apply_configured_tv_volume(cfg: &AppConfig, caller_holds_lock: bool) -> Result<(), String> {
+/// Returns the resulting volume state (the value we set), or `None` when the
+/// feature is disabled, so callers can surface it to the UI without an extra
+/// (racy) read against a just-woken TV.
+async fn apply_configured_tv_volume(
+    cfg: &AppConfig,
+    caller_holds_lock: bool,
+) -> Result<Option<VolumeState>, String> {
     if !cfg.apply_default_tv_volume {
-        return Ok(());
+        return Ok(None);
     }
     let level = cfg.default_tv_volume.clamp(0, 100);
     let level_str = level.to_string();
-    run_tv_volume_cmd_with_cfg(cfg, &["--volume-set", &level_str], caller_holds_lock)
-        .await?;
-    Ok(())
+    let state =
+        run_tv_volume_cmd_with_cfg(cfg, &["--volume-set", &level_str], caller_holds_lock).await?;
+    Ok(Some(state))
 }
 
 /// Get current volume level and mute state.
@@ -1252,8 +1258,13 @@ async fn get_tv_power() -> Result<TvPowerState, String> {
 }
 
 /// Power the TV on or off ("on" | "off").
+///
+/// On a successful power-on, returns the default volume that was applied (when
+/// the feature is enabled) so the UI can display it directly. Reading the volume
+/// back separately races a just-woken TV, which can briefly report its previous
+/// level and leave the controller showing a stale value.
 #[tauri::command]
-async fn tv_power(app: tauri::AppHandle, action: String) -> Result<(), String> {
+async fn tv_power(app: tauri::AppHandle, action: String) -> Result<Option<VolumeState>, String> {
     let _tv = tv_cmd_lock().lock().await;
     let cfg = load_config();
     let root = resolve_project_root(&cfg);
@@ -1308,10 +1319,15 @@ async fn tv_power(app: tauri::AppHandle, action: String) -> Result<(), String> {
     }
 
     if action == "on" {
-        let _ = apply_configured_tv_volume(&cfg, false).await;
+        // `tv_power` already holds `tv_cmd_lock` (acquired above), so the volume
+        // command must NOT re-acquire it — the tokio Mutex is not reentrant and
+        // doing so self-deadlocks, hanging tv_power and holding the lock forever
+        // (which then blocks all later volume / play / transport commands).
+        let applied = apply_configured_tv_volume(&cfg, true).await.ok().flatten();
+        return Ok(applied);
     }
 
-    Ok(())
+    Ok(None)
 }
 
 /// Run a short media-control lg-tv-connect.py command.
@@ -1413,6 +1429,7 @@ async fn play_on_tv(
     profile: i32,
     tv_ip: String,
     episode: Option<i32>,
+    start_seconds: Option<i32>,
 ) -> Result<String, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1446,6 +1463,13 @@ async fn play_on_tv(
     if let Some(ep) = episode {
         if ep >= 1 {
             command.arg("--episode").arg(ep.to_string());
+        }
+    }
+
+    // Start playback at a chosen position (seconds) via the autoplay ?t= deep link.
+    if let Some(start) = start_seconds {
+        if start >= 1 {
+            command.arg("--start").arg(start.to_string());
         }
     }
 
@@ -1499,8 +1523,9 @@ async fn play_on_tv(
 /// Seek the currently playing content to an absolute position.
 /// `content_id` is forwarded to Python so it can try re-launching the app
 /// at the desired position when the SSAP seek command is unsupported.
+/// `episode` lets the seek target a specific episode of a series.
 #[tauri::command]
-async fn seek_to(seconds: f64, content_id: Option<String>) -> Result<(), String> {
+async fn seek_to(seconds: f64, content_id: Option<String>, episode: Option<i32>) -> Result<(), String> {
     let _tv = tv_cmd_lock().lock().await;
     let cfg = load_config();
     let root = resolve_project_root(&cfg);
@@ -1520,6 +1545,12 @@ async fn seek_to(seconds: f64, content_id: Option<String>) -> Result<(), String>
 
     if let Some(ref id) = content_id {
         cmd.arg("--content-id").arg(id);
+    }
+
+    if let Some(ep) = episode {
+        if ep >= 1 {
+            cmd.arg("--episode").arg(ep.to_string());
+        }
     }
 
     let output = cmd
