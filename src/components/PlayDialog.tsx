@@ -5,8 +5,9 @@ import { isBookmarked } from "../bookmarks";
 import { PrimeTitle, PrimeEpisode, getAccessLabel, accessBadgeStyle, AppConfig } from "../types";
 import { ContextMenuItem } from "./ContextMenu";
 import { showMediaContextMenu } from "../contextMenuBus";
-import { BookmarkIcon, ExternalLinkIcon, PlayIcon } from "./BookmarkMenuIcons";
-import { openTmdbLookup, tmdbUrlForEpisode, tmdbUrlForTitle } from "../tmdb";
+import { BookmarkIcon, ExternalLinkIcon, LaptopIcon, PlayIcon, TrailerIcon } from "./BookmarkMenuIcons";
+import { playOnMac, playOnTv } from "../playback";
+import { openTmdbLookup, openTmdbTrailerForTitle, tmdbUrlForEpisode, tmdbUrlForTitle } from "../tmdb";
 
 interface PlayDialogProps {
   item: PrimeTitle;
@@ -31,6 +32,7 @@ interface PlayDialogProps {
 }
 
 type PlayState = "idle" | "playing" | "done" | "error";
+type MacPlayState = "idle" | "opening" | "done" | "error";
 
 export default function PlayDialog({
   item,
@@ -47,7 +49,10 @@ export default function PlayDialog({
   // Profile can be quickly overridden per play; IP always comes from settings.
   const [profile, setProfile] = useState(config.profile);
   const [playState, setPlayState] = useState<PlayState>("idle");
+  const [macPlayState, setMacPlayState] = useState<MacPlayState>("idle");
+  const [macError, setMacError] = useState<string | null>(null);
   const [log, setLog] = useState<string[]>([]);
+  const preferMac = config.default_playback_target === "mac";
   const logRef = useRef<HTMLDivElement>(null);
   const unlistenRef = useRef<(() => void) | null>(null);
 
@@ -107,9 +112,24 @@ export default function PlayDialog({
   const titleMenuItems = (): ContextMenuItem[] => {
     const items: ContextMenuItem[] = [
       {
+        label: "Play on TV",
+        icon: <PlayIcon />,
+        onClick: () => void handlePlayAt(episode),
+      },
+      {
+        label: "Play on Mac",
+        icon: <LaptopIcon />,
+        onClick: () => void handlePlayOnMacAt(episode),
+      },
+      {
         label: "Look up on TMDB",
         icon: <ExternalLinkIcon />,
         onClick: () => void openTmdbLookup(tmdbUrlForTitle(item)),
+      },
+      {
+        label: "Show trailer on TMDB",
+        icon: <TrailerIcon />,
+        onClick: () => void openTmdbTrailerForTitle(item),
       },
     ];
     if (onToggleBookmark) {
@@ -132,11 +152,19 @@ export default function PlayDialog({
     const bookmarked = bookmarkedIds ? isBookmarked(bookmarkedIds, item, ep) : false;
     const items: ContextMenuItem[] = [
       {
-        label: `Play episode ${epNum}`,
+        label: `Play episode ${epNum} on TV`,
         icon: <PlayIcon />,
         onClick: () => {
           setEpisode(idx + 1);
           void handlePlayAt(idx + 1);
+        },
+      },
+      {
+        label: `Play episode ${epNum} on Mac`,
+        icon: <LaptopIcon />,
+        onClick: () => {
+          setEpisode(idx + 1);
+          void handlePlayOnMacAt(idx + 1);
         },
       },
     ];
@@ -144,6 +172,11 @@ export default function PlayDialog({
       label: "Look up episode on TMDB",
       icon: <ExternalLinkIcon />,
       onClick: () => void openTmdbLookup(tmdbUrlForEpisode(item, ep, idx)),
+    });
+    items.push({
+      label: "Show trailer on TMDB",
+      icon: <TrailerIcon />,
+      onClick: () => void openTmdbTrailerForTitle(item),
     });
     if (onToggleBookmark) {
       items.push({
@@ -188,21 +221,17 @@ export default function PlayDialog({
 
   const handlePlayAt = async (epNum: number) => {
     setLog([]);
+    setMacError(null);
     setPlayState("playing");
     const useLaunchId = launchContentId?.trim() || null;
     const ep = useLaunchId ? null : isSeries ? epNum : null;
-    // For a TV episode, surface the episode's own runtime (if known) in the dock
-    // so the position bar has a correct end length instead of the series value.
     const epRow = hasEpisodeList ? episodes[epNum - 1] : null;
     const epRuntimeMin = epRow?.runtime_min ?? null;
     const playedItem = epRuntimeMin ? { ...item, runtime_min: epRuntimeMin } : item;
-    // ↓ Set nowPlaying in the dock IMMEDIATELY — don't wait for the TV to respond
     onStartPlaying(playedItem, useLaunchId ? epNum : ep);
     try {
-      await invoke("play_on_tv", {
-        contentId: useLaunchId ?? item.content_id,
-        profile,
-        tvIp: config.tv_ip,
+      await playOnTv(item, { tv_ip: config.tv_ip, profile }, {
+        contentId: useLaunchId,
         episode: ep,
       });
       setPlayState("done");
@@ -213,7 +242,25 @@ export default function PlayDialog({
     }
   };
 
-  const handlePlay = () => handlePlayAt(episode);
+  const handlePlayOnMacAt = async (epNum: number) => {
+    setMacError(null);
+    setMacPlayState("opening");
+    const useLaunchId = launchContentId?.trim() || null;
+    const ep = useLaunchId ? null : isSeries ? epNum : null;
+    try {
+      await playOnMac(item, {
+        contentId: useLaunchId,
+        episode: ep,
+      });
+      setMacPlayState("done");
+      onClose();
+    } catch (err) {
+      setMacError(String(err));
+      setMacPlayState("error");
+    }
+  };
+
+  const isBusy = playState === "playing" || macPlayState === "opening";
 
   // Keyboard: Escape closes
   useEffect(() => {
@@ -535,43 +582,66 @@ export default function PlayDialog({
               Could not connect. Check the TV is on and paired.
             </p>
           )}
+          {macPlayState === "error" && macError && (
+            <p className="text-center text-red-400 text-sm">{macError}</p>
+          )}
+          {macPlayState === "done" && (
+            <p className="text-center text-emerald-400 text-sm">
+              Opened in Prime Video — sign in if prompted.
+            </p>
+          )}
 
           {/* Action buttons */}
           <div className="flex gap-2">
             <button
-              onClick={handlePlay}
-              disabled={playState === "playing"}
-              className="flex-1 bg-[#00A8E1] hover:bg-[#0090c0] disabled:bg-zinc-600
-                         text-white text-sm font-semibold py-2 px-3 rounded-md
-                         flex items-center justify-center gap-2 transition-colors"
+              onClick={() => (preferMac ? handlePlayOnMacAt(episode) : handlePlayAt(episode))}
+              disabled={isBusy}
+              className={`flex-1 disabled:bg-zinc-600 text-white text-sm font-semibold py-2 px-3
+                         rounded-md flex items-center justify-center gap-2 transition-colors ${
+                preferMac
+                  ? "bg-violet-600 hover:bg-violet-500"
+                  : "bg-[#00A8E1] hover:bg-[#0090c0]"
+              }`}
             >
-              {playState === "playing" ? (
+              {isBusy && (preferMac ? macPlayState === "opening" : playState === "playing") ? (
                 <>
                   <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                   </svg>
-                  Connecting…
+                  {preferMac ? "Opening…" : "Connecting…"}
                 </>
               ) : (
                 <>
-                  <PlayIcon />
-                  {playState === "done" ? "Play Again"
-                    : playState === "error" ? "Retry"
-                    : selectedEpisode ? `Play ${selectedEpisode.title || `Episode ${selectedEpisode.sequence_number ?? episode}`}`
-                    : isSeries ? `Play Episode ${episode}`
-                    : "Play on TV"}
+                  {preferMac ? <LaptopIcon /> : <PlayIcon />}
+                  {preferMac ? "Play on Mac" : (
+                    playState === "done" ? "Play Again on TV"
+                    : playState === "error" ? "Retry on TV"
+                    : selectedEpisode ? `Play ${selectedEpisode.title || `Episode ${selectedEpisode.sequence_number ?? episode}`} on TV`
+                    : isSeries ? `Play Episode ${episode} on TV`
+                    : "Play on TV"
+                  )}
                 </>
               )}
             </button>
 
             <button
+              onClick={() => (preferMac ? handlePlayAt(episode) : handlePlayOnMacAt(episode))}
+              disabled={isBusy}
+              className="flex-1 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-40 text-white text-sm
+                         font-semibold py-2 px-3 rounded-md flex items-center justify-center gap-2 transition-colors"
+            >
+              {preferMac ? <PlayIcon /> : <LaptopIcon />}
+              {preferMac ? "Play on TV" : "Play on Mac"}
+            </button>
+
+            <button
               onClick={onClose}
-              disabled={playState === "playing"}
+              disabled={isBusy}
               className="px-4 py-2 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-40
                          text-white rounded-md transition-colors text-sm font-medium"
             >
-              {playState === "done" || playState === "error" ? "Close" : "Cancel"}
+              {playState === "done" || playState === "error" || macPlayState === "done" ? "Close" : "Cancel"}
             </button>
           </div>
         </div>

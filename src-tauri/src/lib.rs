@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use url::Url;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -29,6 +30,16 @@ pub struct AppConfig {
     /// Show titles with unknown / unresolved availability.
     #[serde(default = "default_true")]
     pub show_other: bool,
+    /// Detect Prime Video region from IP and clear cache when VPN region changes.
+    #[serde(default = "default_true")]
+    pub detect_vpn_region: bool,
+    /// Default playback target: "tv" or "mac".
+    #[serde(default = "default_playback_tv")]
+    pub default_playback_target: String,
+}
+
+fn default_playback_tv() -> String {
+    "tv".to_string()
 }
 
 fn default_ttl() -> u64 {
@@ -54,8 +65,104 @@ impl Default for AppConfig {
             show_channel: false,
             show_rent_buy: false,
             show_other: true,
+            detect_vpn_region: true,
+            default_playback_target: default_playback_tv(),
         }
     }
+}
+
+const PRIME_PLAYER_LABEL: &str = "prime-player";
+
+fn validate_prime_video_url(url: &str) -> Result<Url, String> {
+    let parsed = Url::parse(url.trim()).map_err(|e| format!("Invalid URL: {e}"))?;
+    let host = parsed.host_str().unwrap_or("");
+    if parsed.scheme() != "https" || host != "www.primevideo.com" {
+        return Err("Only https://www.primevideo.com URLs are allowed".to_string());
+    }
+    Ok(parsed)
+}
+
+async fn resolve_prime_play_url(
+    cfg: &AppConfig,
+    content_id: &str,
+    episode: Option<i32>,
+) -> Result<(String, String), String> {
+    let root = resolve_project_root(cfg);
+    let python = python_exe(&root);
+    let script = root
+        .join("amazon")
+        .join("prime-catalog.py")
+        .to_string_lossy()
+        .to_string();
+
+    let mut command = tokio::process::Command::new(&python);
+    command
+        .arg(&script)
+        .arg("--play-url")
+        .arg(content_id)
+        .arg("--json");
+    if let Some(ep) = episode {
+        if ep >= 1 {
+            command.arg("--episode").arg(ep.to_string());
+        }
+    }
+
+    let output = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run prime-catalog.py: {e}"))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(format!("prime-catalog.py --play-url failed:\n{err}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).map_err(|e| format!("Invalid play URL JSON: {e}"))?;
+    let url = value
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "play URL response missing url".to_string())?
+        .to_string();
+    let title = value
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok((url, title))
+}
+
+fn open_prime_player_window(app: &tauri::AppHandle, url: Url, title: &str) -> Result<(), String> {
+    let window_title = if title.trim().is_empty() {
+        "Prime Video".to_string()
+    } else {
+        format!("{title} — Prime Video")
+    };
+
+    if let Some(window) = app.get_webview_window(PRIME_PLAYER_LABEL) {
+        window
+            .navigate(url)
+            .map_err(|e| format!("Failed to navigate player: {e}"))?;
+        let _ = window.set_title(&window_title);
+        window
+            .show()
+            .map_err(|e| format!("Failed to show player: {e}"))?;
+        window
+            .set_focus()
+            .map_err(|e| format!("Failed to focus player: {e}"))?;
+        return Ok(());
+    }
+
+    WebviewWindowBuilder::new(app, PRIME_PLAYER_LABEL, WebviewUrl::External(url))
+        .title(window_title)
+        .inner_size(1280.0, 720.0)
+        .min_inner_size(640.0, 360.0)
+        .build()
+        .map_err(|e| format!("Failed to open Prime player window: {e}"))?;
+    Ok(())
 }
 
 fn config_path() -> PathBuf {
@@ -313,6 +420,97 @@ fn delete_cache_entry(key: &str) {
     let _ = std::fs::remove_file(path);
 }
 
+fn region_state_path() -> PathBuf {
+    cache_dir().join("region.txt")
+}
+
+fn read_stored_region() -> Option<String> {
+    let raw = std::fs::read_to_string(region_state_path()).ok()?;
+    let region = raw.trim().to_string();
+    if region.is_empty() {
+        None
+    } else {
+        Some(region)
+    }
+}
+
+fn write_stored_region(region: &str) -> Result<(), String> {
+    ensure_dir(&region_state_path())?;
+    std::fs::write(region_state_path(), region).map_err(|e| e.to_string())
+}
+
+/// Scrape Prime Video's detected storefront country from a lightweight page.
+fn detect_prime_region() -> Option<String> {
+    const MARKER: &str = "\"countryCode\":\"";
+    let response = ureq::get("https://www.primevideo.com/categories")
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
+        .set("Accept-Language", "en-GB,en;q=0.9")
+        .call()
+        .ok()?;
+    let html = response.into_string().ok()?;
+    let start = html.find(MARKER)? + MARKER.len();
+    let rest = &html[start..];
+    let end = rest.find('"')?;
+    let region = rest[..end].trim().to_string();
+    if region.is_empty() {
+        None
+    } else {
+        Some(region)
+    }
+}
+
+fn clear_catalog_cache_files() {
+    let dir = cache_dir();
+    if !dir.exists() {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// Detect Prime storefront region and wipe catalog/search cache when it changes
+/// (e.g. user switched VPN from Sweden to UK).
+fn sync_region_cache() -> String {
+    let detected = detect_prime_region();
+    let current = detected.clone().unwrap_or_else(|| "unknown".to_string());
+    let stored = read_stored_region();
+
+    if stored.as_deref() != Some(current.as_str()) {
+        clear_catalog_cache_files();
+        let _ = write_stored_region(&current);
+    }
+
+    current
+}
+
+fn catalog_cache_key(cfg: &AppConfig, collection: &str) -> String {
+    if cfg.detect_vpn_region {
+        let region = sync_region_cache();
+        format!("collection_{region}_{collection}")
+    } else {
+        format!("collection_{collection}")
+    }
+}
+
+fn search_cache_key(cfg: &AppConfig, query: &str) -> String {
+    if cfg.detect_vpn_region {
+        let region = sync_region_cache();
+        format!("search_{region}_{}", query.trim().to_lowercase())
+    } else {
+        format!("search_{}", query.trim().to_lowercase())
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Project root + Python discovery
 // ─────────────────────────────────────────────────────────────────────────────
@@ -360,8 +558,7 @@ fn python_exe(root: &PathBuf) -> String {
 // Tauri commands — external links
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[tauri::command]
-fn open_external_url(url: String) -> Result<(), String> {
+fn open_themoviedb_url(url: &str) -> Result<(), String> {
     let url = url.trim();
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("Only http(s) URLs are allowed".to_string());
@@ -383,6 +580,76 @@ fn open_external_url(url: String) -> Result<(), String> {
     {
         Err("Opening URLs is only supported on macOS".to_string())
     }
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    open_themoviedb_url(&url)
+}
+
+fn tmdb_search_id(query: &str, kind: &str) -> Result<Option<u32>, String> {
+    let path = if kind == "tv" { "search/tv" } else { "search/movie" };
+    let url = format!(
+        "https://www.themoviedb.org/{path}?query={}&language=en-US",
+        urlencoding::encode(query)
+    );
+    let response = ureq::get(&url)
+        .set("User-Agent", "PrimeRemoteControl/0.1")
+        .call()
+        .map_err(|e| format!("TMDB search failed: {e}"))?;
+    let html = response
+        .into_string()
+        .map_err(|e| format!("TMDB search read failed: {e}"))?;
+    let needle = if kind == "tv" { "/tv/" } else { "/movie/" };
+    let mut search_from = 0usize;
+    while let Some(rel) = html[search_from..].find(needle) {
+        let start = search_from + rel + needle.len();
+        let id: String = html[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if (1..=8).contains(&id.len()) {
+            if let Ok(parsed) = id.parse::<u32>() {
+                if parsed > 0 {
+                    return Ok(Some(parsed));
+                }
+            }
+        }
+        search_from = start;
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+fn open_tmdb_trailer(query: String, media_kind: String) -> Result<(), String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("Empty TMDB search query".to_string());
+    }
+
+    let kinds: Vec<&str> = match media_kind.as_str() {
+        "movie" => vec!["movie"],
+        "tv" => vec!["tv"],
+        _ => vec!["movie", "tv"],
+    };
+
+    for kind in kinds {
+        if let Some(id) = tmdb_search_id(query, kind)? {
+            let url = format!("https://www.themoviedb.org/{kind}/{id}/videos");
+            return open_themoviedb_url(&url);
+        }
+    }
+
+    let fallback_path = match media_kind.as_str() {
+        "tv" => "search/tv",
+        "movie" => "search/movie",
+        _ => "search",
+    };
+    let fallback = format!(
+        "https://www.themoviedb.org/{fallback_path}?query={}&language=en-US",
+        urlencoding::encode(query)
+    );
+    open_themoviedb_url(&fallback)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -473,14 +740,16 @@ async fn toggle_bookmark(
 /// Returns seconds since the collection cache was last written (None = no cache).
 #[tauri::command]
 async fn collection_cache_age(collection: String) -> Option<u64> {
-    let key = format!("collection_{collection}");
+    let cfg = load_config();
+    let key = catalog_cache_key(&cfg, &collection);
     cache_age_secs(&key)
 }
 
 /// Returns seconds since the search cache was last written (None = no cache).
 #[tauri::command]
 async fn search_cache_age(query: String) -> Option<u64> {
-    let key = format!("search_{}", query.trim().to_lowercase());
+    let cfg = load_config();
+    let key = search_cache_key(&cfg, &query);
     cache_age_secs(&key)
 }
 
@@ -494,6 +763,18 @@ async fn clear_all_cache() -> Result<(), String> {
     Ok(())
 }
 
+/// Return the Prime Video storefront region detected for the current IP (e.g. UK, SE).
+#[tauri::command]
+fn get_prime_region() -> String {
+    let cfg = load_config();
+    if !cfg.detect_vpn_region {
+        return "unknown".to_string();
+    }
+    detect_prime_region()
+        .or_else(read_stored_region)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tauri commands — catalog
 // ─────────────────────────────────────────────────────────────────────────────
@@ -503,7 +784,7 @@ async fn clear_all_cache() -> Result<(), String> {
 #[tauri::command]
 async fn load_catalog(collection: String, force_refresh: bool) -> Result<String, String> {
     let cfg = load_config();
-    let cache_key = format!("collection_{collection}");
+    let cache_key = catalog_cache_key(&cfg, &collection);
 
     // Try cache first
     if !force_refresh {
@@ -558,7 +839,7 @@ async fn load_catalog(collection: String, force_refresh: bool) -> Result<String,
 #[tauri::command]
 async fn search_catalog(query: String, force_refresh: bool) -> Result<String, String> {
     let cfg = load_config();
-    let cache_key = format!("search_{}", query.trim().to_lowercase());
+    let cache_key = search_cache_key(&cfg, &query);
     let search_ttl = 3600u64; // 1 hour
 
     if !force_refresh {
@@ -851,6 +1132,48 @@ async fn media_control(
 // Tauri commands — play
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Open Prime Video in an in-app browser window for Mac playback.
+#[tauri::command]
+async fn play_on_mac(
+    app: tauri::AppHandle,
+    content_id: String,
+    episode: Option<i32>,
+    title: Option<String>,
+) -> Result<(), String> {
+    let cfg = load_config();
+    let (url, resolved_title) = resolve_prime_play_url(&cfg, &content_id, episode).await?;
+    let parsed = validate_prime_video_url(&url)?;
+    let display_title = title
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or(resolved_title);
+    open_prime_player_window(&app, parsed, &display_title)
+}
+
+/// Clear saved Amazon/Prime login cookies from the in-app player window.
+#[tauri::command]
+async fn clear_prime_login(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(PRIME_PLAYER_LABEL) {
+        window
+            .clear_all_browsing_data()
+            .map_err(|e| format!("Failed to clear Prime login: {e}"))?;
+        return Ok(());
+    }
+
+    let url = validate_prime_video_url("https://www.primevideo.com/")?;
+    let window = WebviewWindowBuilder::new(&app, PRIME_PLAYER_LABEL, WebviewUrl::External(url))
+        .title("Prime Video")
+        .visible(false)
+        .build()
+        .map_err(|e| format!("Failed to open player for cookie clear: {e}"))?;
+    window
+        .clear_all_browsing_data()
+        .map_err(|e| format!("Failed to clear Prime login: {e}"))?;
+    window
+        .close()
+        .map_err(|e| format!("Failed to close temporary player: {e}"))?;
+    Ok(())
+}
+
 /// Send a title to the LG TV for playback. Streams progress via "play-progress" events.
 #[tauri::command]
 async fn play_on_tv(
@@ -1100,6 +1423,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             open_external_url,
+            open_tmdb_trailer,
             get_config,
             save_config,
             get_bookmarks,
@@ -1108,10 +1432,13 @@ pub fn run() {
             toggle_bookmark,
             load_catalog,
             search_catalog,
+            play_on_mac,
+            clear_prime_login,
             play_on_tv,
             collection_cache_age,
             search_cache_age,
             clear_all_cache,
+            get_prime_region,
             prefetch_images,
             list_cached_images,
             get_image_server_port,

@@ -63,7 +63,13 @@ export interface AppConfig {
   show_rent_buy: boolean;
   /** Show titles with unknown/unresolved availability (grey). */
   show_other: boolean;
+  /** Detect VPN/region changes and refresh catalog cache automatically. */
+  detect_vpn_region: boolean;
+  /** Default play target: TV or Mac in-app Prime window. */
+  default_playback_target: PlaybackTarget;
 }
+
+export type PlaybackTarget = "tv" | "mac";
 
 export const DEFAULT_CONFIG: AppConfig = {
   tv_ip: "192.168.0.79",
@@ -74,6 +80,8 @@ export const DEFAULT_CONFIG: AppConfig = {
   show_channel: false,
   show_rent_buy: false,
   show_other: true,
+  detect_vpn_region: true,
+  default_playback_target: "tv",
 };
 
 export type EntityTypeFilter = "all" | "Movie" | "TV Show";

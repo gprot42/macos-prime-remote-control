@@ -23,6 +23,7 @@ import {
   isTvBookmark,
   resolveEpisodePlayId,
 } from "./bookmarks";
+import { playOnMac } from "./playback";
 import CatalogGroupRow from "./components/CatalogGroup";
 import ContextMenu, { ContextMenuItem } from "./components/ContextMenu";
 import PlayDialog from "./components/PlayDialog";
@@ -78,6 +79,7 @@ export default function App() {
   const [error, setError]           = useState<string | null>(null);
   const [isStale, setIsStale]       = useState(false);
   const [cacheAgeSecs, setCacheAge] = useState<number | null>(null);
+  const [primeRegion, setPrimeRegion] = useState<string | null>(null);
 
   // Collection / bookmarks view
   const [viewMode, setViewMode] = useState<ViewMode>("catalog");
@@ -171,6 +173,16 @@ export default function App() {
       .then((cfg) => setConfig(cfg))
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!config.detect_vpn_region) {
+      setPrimeRegion(null);
+      return;
+    }
+    invoke<string>("get_prime_region")
+      .then((region) => setPrimeRegion(region !== "unknown" ? region : null))
+      .catch(() => {});
+  }, [config.detect_vpn_region]);
 
   // ── Bookmarks load ──────────────────────────────────────────────────────────
   const reloadBookmarks = useCallback(() => {
@@ -298,6 +310,14 @@ export default function App() {
     [bookmarks, playEpisodeBookmark]
   );
 
+  const handlePlayOnMac = useCallback(async (item: PrimeTitle) => {
+    try {
+      await playOnMac(item);
+    } catch (err) {
+      setError(String(err));
+    }
+  }, []);
+
   const bookmarkedIds = useMemo(
     () => new Set(bookmarks.map((b) => b.content_id)),
     [bookmarks]
@@ -349,6 +369,14 @@ export default function App() {
         setAllItems(data);
         setIsStale(stale);
         setLoadState("done");
+
+        if (config.detect_vpn_region) {
+          invoke<string>("get_prime_region")
+            .then((region) => setPrimeRegion(region !== "unknown" ? region : null))
+            .catch(() => {});
+        } else {
+          setPrimeRegion(null);
+        }
 
         invoke<number | null>("collection_cache_age", { collection: slug })
           .then((age) => setCacheAge(age ?? null))
@@ -575,6 +603,14 @@ export default function App() {
                   </span>
                 )}
               </button>
+            )}
+
+            {config.detect_vpn_region && primeRegion && showCatalogData && !searchQuery && (
+              <div className="hidden sm:flex items-center gap-1.5 text-[11px] px-2.5 py-1
+                              rounded-full border bg-zinc-800/60 border-zinc-700 text-zinc-400">
+                <span className="text-zinc-500">Region</span>
+                <span className="font-medium text-zinc-300">{primeRegion}</span>
+              </div>
             )}
 
             {cacheAgeSecs !== null && showCatalogData && !searchQuery && (
@@ -823,6 +859,7 @@ export default function App() {
             key={group.label}
             group={group}
             onPlay={handleOpenTitle}
+            onPlayOnMac={handlePlayOnMac}
             imageCache={imageCache}
             imgPort={imgPort}
             bookmarkedIds={bookmarkedIds}

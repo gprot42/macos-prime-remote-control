@@ -2,12 +2,13 @@ import { useEffect, useState } from "react";
 import { PrimeTitle, getAccessLabel, accessBadgeStyle } from "../types";
 import { ContextMenuItem } from "./ContextMenu";
 import { showMediaContextMenu } from "../contextMenuBus";
-import { BookmarkIcon, ExternalLinkIcon, PlayIcon } from "./BookmarkMenuIcons";
-import { openTmdbLookup, tmdbUrlForTitle } from "../tmdb";
+import { BookmarkIcon, ExternalLinkIcon, LaptopIcon, PlayIcon, TrailerIcon } from "./BookmarkMenuIcons";
+import { openTmdbLookup, openTmdbTrailerForTitle, tmdbUrlForTitle } from "../tmdb";
 
 interface TitleCardProps {
   item: PrimeTitle;
   onPlay: (item: PrimeTitle) => void;
+  onPlayOnMac?: (item: PrimeTitle) => void;
   cachedImageSrc?: string;
   isBookmarked?: boolean;
   onToggleBookmark?: (item: PrimeTitle) => void;
@@ -16,6 +17,7 @@ interface TitleCardProps {
 export default function TitleCard({
   item,
   onPlay,
+  onPlayOnMac,
   cachedImageSrc,
   isBookmarked = false,
   onToggleBookmark,
@@ -46,7 +48,19 @@ export default function TitleCard({
       icon: <ExternalLinkIcon />,
       onClick: () => void openTmdbLookup(tmdbUrlForTitle(item)),
     },
+    {
+      label: "Show trailer on TMDB",
+      icon: <TrailerIcon />,
+      onClick: () => void openTmdbTrailerForTitle(item),
+    },
   ];
+  if (onPlayOnMac) {
+    menuItems.splice(1, 0, {
+      label: "Play on Mac",
+      icon: <LaptopIcon />,
+      onClick: () => onPlayOnMac(item),
+    });
+  }
   if (onToggleBookmark) {
     menuItems.push({
       label: isBookmarked ? "Remove bookmark" : "Bookmark",

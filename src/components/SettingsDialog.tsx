@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   AppConfig,
   AccessCategory,
+  PlaybackTarget,
   CATEGORY_COLORS,
   CATEGORY_TEXT,
   CATEGORY_BORDER,
@@ -65,9 +66,14 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
   const [showChannel, setShowChannel] = useState(config.show_channel ?? false);
   const [showRentBuy, setShowRentBuy] = useState(config.show_rent_buy ?? false);
   const [showOther, setShowOther] = useState(config.show_other ?? true);
+  const [detectVpnRegion, setDetectVpnRegion] = useState(config.detect_vpn_region ?? true);
+  const [playbackTarget, setPlaybackTarget] = useState<PlaybackTarget>(
+    config.default_playback_target ?? "tv",
+  );
 
   const [saving, setSaving] = useState(false);
   const [clearing, setClearing] = useState(false);
+  const [clearingPrime, setClearingPrime] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [clearMsg, setClearMsg] = useState<string | null>(null);
 
@@ -93,6 +99,8 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
       show_channel: showChannel,
       show_rent_buy: showRentBuy,
       show_other: showOther,
+      detect_vpn_region: detectVpnRegion,
+      default_playback_target: playbackTarget,
     };
     try {
       await invoke("save_config", { cfg: newCfg });
@@ -101,6 +109,19 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
       setError(String(err));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleClearPrimeLogin = async () => {
+    setClearingPrime(true);
+    setClearMsg(null);
+    try {
+      await invoke("clear_prime_login");
+      setClearMsg("Prime login cleared. Sign in again in the player window on next play.");
+    } catch (err) {
+      setClearMsg(`Error: ${err}`);
+    } finally {
+      setClearingPrime(false);
     }
   };
 
@@ -269,8 +290,60 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
                   ))}
                 </select>
                 <p className="text-xs text-zinc-500 mt-1.5">
-                  How long to keep catalog data before re-downloading from Prime Video
+                  How long to keep catalog data before re-downloading from Prime Video.
                 </p>
+              </div>
+
+              <div>
+                <label className="block text-sm text-zinc-300 mb-1.5">Default playback</label>
+                <select
+                  value={playbackTarget}
+                  onChange={(e) => setPlaybackTarget(e.target.value as PlaybackTarget)}
+                  className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
+                             text-white focus:outline-none focus:border-emerald-500 transition-colors"
+                >
+                  <option value="tv">LG TV</option>
+                  <option value="mac">Mac (in-app Prime Video)</option>
+                </select>
+                <p className="text-xs text-zinc-500 mt-1.5">
+                  Mac playback opens Prime Video in a separate window. Sign in with your Amazon
+                  account the first time you play.
+                </p>
+              </div>
+
+              <label className="flex items-start gap-3 cursor-pointer group">
+                <input
+                  type="checkbox"
+                  checked={detectVpnRegion}
+                  onChange={(e) => setDetectVpnRegion(e.target.checked)}
+                  className="mt-1 w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-emerald-500
+                             focus:ring-emerald-500 focus:ring-offset-zinc-900"
+                />
+                <div>
+                  <p className="text-sm text-zinc-300 group-hover:text-white transition-colors">
+                    Detect VPN region changes
+                  </p>
+                  <p className="text-xs text-zinc-500 mt-0.5 leading-relaxed">
+                    When enabled, the app detects your Prime Video region from your IP,
+                    shows it in the header, and clears cached catalog data when the region
+                    changes. Turn off to keep one shared cache regardless of VPN.
+                  </p>
+                </div>
+              </label>
+
+              <div className="flex items-center justify-between pt-1">
+                <div>
+                  <p className="text-sm text-zinc-300">Clear Prime login</p>
+                  <p className="text-xs text-zinc-500">Sign out of Amazon in the in-app player window</p>
+                </div>
+                <button
+                  onClick={handleClearPrimeLogin}
+                  disabled={clearingPrime}
+                  className="shrink-0 px-4 py-2 bg-zinc-700 hover:bg-red-800 text-zinc-300
+                             hover:text-white text-xs rounded-xl transition-colors disabled:opacity-40"
+                >
+                  {clearingPrime ? "Clearing…" : "Clear login"}
+                </button>
               </div>
 
               <div className="flex items-center justify-between pt-1">

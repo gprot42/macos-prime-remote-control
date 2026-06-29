@@ -106,3 +106,15 @@ export async function openExternalUrl(url: string): Promise<void> {
 export async function openTmdbLookup(url: string): Promise<void> {
   await openExternalUrl(url);
 }
+
+/** Open the TMDB Videos tab for the best-matching film or series. */
+export async function openTmdbTrailerForTitle(item: PrimeTitle): Promise<void> {
+  const kind = tmdbKind(item.entity_type);
+  const mediaKind = kind === "multi" ? "auto" : kind;
+  const query = buildTmdbQuery(item.title, { year: item.year, kind });
+  try {
+    await invoke("open_tmdb_trailer", { query, mediaKind });
+  } catch {
+    await openTmdbLookup(tmdbUrlForTitle(item));
+  }
+}

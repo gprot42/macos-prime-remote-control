@@ -5,6 +5,7 @@ import TitleCard from "./TitleCard";
 interface CatalogGroupProps {
   group: CatalogGroupType;
   onPlay: (item: PrimeTitle) => void;
+  onPlayOnMac?: (item: PrimeTitle) => void;
   imageCache: Set<string>;
   imgPort: number;
   bookmarkedIds?: Set<string>;
@@ -14,6 +15,7 @@ interface CatalogGroupProps {
 export default function CatalogGroupRow({
   group,
   onPlay,
+  onPlayOnMac,
   imageCache,
   imgPort,
   bookmarkedIds,
@@ -71,6 +73,7 @@ export default function CatalogGroupRow({
                 key={item.content_id}
                 item={item}
                 onPlay={onPlay}
+                onPlayOnMac={onPlayOnMac}
                 cachedImageSrc={cachedSrc}
                 isBookmarked={bookmarkedIds?.has(item.content_id)}
                 onToggleBookmark={onToggleBookmark}

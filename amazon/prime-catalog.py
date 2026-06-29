@@ -38,9 +38,13 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from amazon.prime_entitlement import (
+    detail_url,
     entitlement_from_search_cues,
+    fetch_detail_html,
     lookup_entitlement,
     parse_entitlement,
+    playback_launch_target_from_html,
+    resolve_episode_content_id,
 )
 
 BASE_URL = "https://www.primevideo.com"
@@ -118,7 +122,7 @@ class PrimeTitle:
 def fetch_html(url: str, *, timeout: float = 20.0) -> str:
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"},
+        headers={"User-Agent": USER_AGENT, "Accept-Language": "en-GB,en;q=0.9"},
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -578,6 +582,45 @@ def parse_catalog_slug(slug: str) -> tuple[str, str]:
     if slug.startswith("genre/"):
         return "genre", slug.removeprefix("genre/").strip("/")
     return "collection", slug
+
+
+def resolve_play_url(content_id: str, *, episode: int | None = None) -> dict[str, str]:
+    """Return a Prime Video web URL suitable for in-browser playback on Mac."""
+    content_id = content_id.strip()
+    if not content_id:
+        raise ValueError("content_id is required")
+
+    html = fetch_detail_html(content_id)
+    play_id = content_id
+    if episode is not None and episode >= 1:
+        play_id = resolve_episode_content_id(html, content_id, episode=episode)
+        if play_id != content_id:
+            html = fetch_detail_html(play_id)
+
+    target = playback_launch_target_from_html(html, play_id)
+    if target:
+        if target.startswith("http"):
+            url = target
+        elif target.startswith("/"):
+            url = f"{BASE_URL}{target}"
+        else:
+            url = f"{BASE_URL}/{target}"
+    else:
+        url = detail_url(play_id)
+
+    title = ""
+    for blob in parse_json_blobs(html):
+        for entity in walk_entities(blob):
+            link = entity.get("link") if isinstance(entity.get("link"), dict) else {}
+            cid = content_id_from_link(link.get("url"))
+            if cid == play_id:
+                if name := entity.get("displayTitle") or entity.get("title"):
+                    title = str(name).strip()
+                    break
+        if title:
+            break
+
+    return {"url": url, "content_id": play_id, "title": title}
 
 
 def list_genres() -> list[tuple[str, str]]:
@@ -1046,6 +1089,11 @@ Known collections (region-dependent): newandupcoming, IncludedwithPrime, TopRate
         metavar="URL_OR_ID",
         help="Look up one title from a Prime Video URL or detail ID",
     )
+    group.add_argument(
+        "--play-url",
+        metavar="CONTENT_ID",
+        help="Resolve a Prime Video web playback URL for Mac/browser",
+    )
     parser.add_argument(
         "--resolve-asin",
         action="store_true",
@@ -1077,6 +1125,12 @@ Known collections (region-dependent): newandupcoming, IncludedwithPrime, TopRate
         help="Print column headers above the table",
     )
     parser.add_argument("--json", action="store_true", help="Output JSON")
+    parser.add_argument(
+        "--episode",
+        type=int,
+        metavar="N",
+        help="Episode number for --play-url on TV seasons/series (1-based)",
+    )
     parser.add_argument("--limit", type=int, metavar="N", help="Limit results")
     parser.add_argument(
         "--launch-cmd",
@@ -1105,6 +1159,10 @@ def main() -> None:
         if args.list_genres:
             for slug, label in list_genres():
                 print(f"{slug}\t{label}")
+            return
+        if args.play_url:
+            result = resolve_play_url(args.play_url, episode=args.episode)
+            print(json.dumps(result, indent=2 if args.json else None))
             return
         if args.search:
             items = search_prime(args.search)
