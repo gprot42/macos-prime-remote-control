@@ -302,21 +302,38 @@ export default function App() {
 
   const playEpisodeBookmark = useCallback(
     async (bookmark: Bookmark): Promise<boolean> => {
+      const episodeNum = bookmark.play_episode ?? null;
+      const seriesId = bookmark.source_item?.content_id ?? null;
       const episodeId = resolveEpisodePlayId(bookmark);
-      if (!episodeId) return false;
+
+      // Prefer the proven play path: launch the series content_id with an
+      // explicit episode number, which the resolver maps to the right episode.
+      // Fall back to the episode's own detail ID only when we lack the series
+      // reference or episode number.
+      let contentId: string;
+      let episode: number | null;
+      if (seriesId && episodeNum && episodeNum >= 1) {
+        contentId = seriesId;
+        episode = episodeNum;
+      } else if (episodeId) {
+        contentId = episodeId;
+        episode = null;
+      } else {
+        return false;
+      }
 
       setSelectedItem(null);
       setSelectedEpisode(null);
       setNowPlaying(bookmark.item);
-      setNPEpisode(bookmark.play_episode ?? null);
+      setNPEpisode(episodeNum);
       setPlaybackState("playing");
 
       try {
         await invoke("play_on_tv", {
-          contentId: episodeId,
+          contentId,
           profile: config.profile,
           tvIp: config.tv_ip,
-          episode: null,
+          episode,
         });
         return true;
       } catch (err) {

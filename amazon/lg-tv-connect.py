@@ -356,9 +356,12 @@ def resolve_prime_launch_ids(
 
         title_type = title_type_for_content_id(page_html, content_id)
         episodes = list_episodes_from_html(page_html, season_content_id=content_id)
+        # When the requested content_id is itself an episode page, launch it
+        # directly. The page also lists its sibling episodes, so re-deriving an
+        # episode here (with no explicit number) would wrongly default to E1.
         use_episode = (
             episode is not None
-            or prefer_episode
+            or (prefer_episode and title_type != "episode")
             or title_type in {"season", "series"}
         )
         selected_episode = None
