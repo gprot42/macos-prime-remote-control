@@ -21,7 +21,10 @@ import argparse
 import asyncio
 import json
 import os
+import platform
 import re
+import socket
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -135,6 +138,8 @@ def _print_connect_troubleshooting(ip: str) -> None:
     print("  Check:", file=sys.stderr)
     print("    • TV is on (not deep standby) and on the same Wi‑Fi", file=sys.stderr)
     print("    • Settings → General → LG Connect Apps → On", file=sys.stderr)
+    print("    • For remote power-on: enable Mobile TV On / Wake on LAN on the TV", file=sys.stderr)
+    print("    • If fully off, set the TV MAC in app Settings for Wake-on-LAN", file=sys.stderr)
     print(f"    • IP is correct (try: ./lg-tv-probe  or  LG_TV_IP=<ip> ./play)", file=sys.stderr)
     print(
         f"    • Test: python amazon/lg-tv-connect.py {ip} --info",
@@ -1409,6 +1414,32 @@ Use --profile-highlight to verify the mapped index on TV.""",
         action="store_true",
         help="Unmute the TV",
     )
+    # ── Power ─────────────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--power-off",
+        action="store_true",
+        help="Power off the TV (requires network connection)",
+    )
+    parser.add_argument(
+        "--power-state",
+        action="store_true",
+        help="Print TV power state as JSON {on, state}",
+    )
+    parser.add_argument(
+        "--power-on",
+        action="store_true",
+        help="Power on the TV (optional --tv-mac for Wake-on-LAN when fully off)",
+    )
+    parser.add_argument(
+        "--tv-mac",
+        metavar="MAC",
+        help="TV MAC address for Wake-on-LAN (e.g. AA:BB:CC:DD:EE:FF)",
+    )
+    parser.add_argument(
+        "--get-mac",
+        action="store_true",
+        help="Print TV MAC from the local ARP table as JSON (TV should be on)",
+    )
     # ── Seek / position ───────────────────────────────────────────────────────
     parser.add_argument(
         "--seek",
@@ -1694,6 +1725,152 @@ async def cmd_media_toggle(client: "WebOsClient") -> None:
     print("  Sent PLAY (toggle).")
 
 
+_MAC_RE = re.compile(
+    r"\b([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})\b",
+)
+
+
+def normalize_mac(mac: str) -> str:
+    """Normalize a MAC to AA:BB:CC:DD:EE:FF uppercase."""
+    parts = re.split(r"[:-]", mac.strip())
+    if len(parts) != 6:
+        raise ValueError(f"Invalid MAC address: {mac!r}")
+    return ":".join(p.zfill(2) for p in parts).upper()
+
+
+def discover_tv_mac(ip: str) -> str | None:
+    """Resolve the TV MAC from the local ARP/neighbor table (TV must be reachable)."""
+    if platform.system() == "Darwin":
+        ping = ["ping", "-c", "1", "-W", "1000", ip]
+        arp_cmd = ["arp", "-n", ip]
+    else:
+        ping = ["ping", "-c", "1", "-W", "1", ip]
+        arp_cmd = ["ip", "neigh", "show", ip]
+
+    subprocess.run(ping, capture_output=True, text=True)
+    result = subprocess.run(arp_cmd, capture_output=True, text=True)
+    output = (result.stdout or "") + (result.stderr or "")
+    match = _MAC_RE.search(output)
+    if not match:
+        return None
+    try:
+        return normalize_mac(match.group(1))
+    except ValueError:
+        return None
+
+
+def send_wol(mac: str, broadcast: str = "255.255.255.255") -> None:
+    """Send a Wake-on-LAN magic packet to the TV."""
+    cleaned = re.sub(r"[^0-9a-fA-F]", "", mac)
+    if len(cleaned) != 12:
+        raise ValueError(f"Invalid MAC address: {mac!r}")
+    mac_bytes = bytes.fromhex(cleaned)
+    packet = b"\xff" * 6 + mac_bytes * 16
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(packet, (broadcast, 9))
+
+
+def _power_state_is_on(state: dict | None) -> bool:
+    if not state:
+        return False
+    return state.get("state") not in {
+        None,
+        "Power Off",
+        "Suspend",
+        "Active Standby",
+    }
+
+
+async def cmd_power_state(client: "WebOsClient") -> None:
+    """Print TV power state as JSON."""
+    state = await client.get_power_state()
+    if isinstance(state, dict):
+        await client.set_power_state(state)
+    print(json.dumps({
+        "on": _power_state_is_on(state if isinstance(state, dict) else None),
+        "state": state,
+    }))
+
+
+async def cmd_power_off(client: "WebOsClient") -> None:
+    """Power off the TV (requires an active network connection)."""
+    from aiowebostv import endpoints as ep
+
+    print("Powering off TV...")
+    state_before = await client.get_power_state()
+    print(f"  Power state before: {state_before}", file=sys.stderr)
+
+    if isinstance(state_before, dict):
+        await client.set_power_state(state_before)
+
+    if not _power_state_is_on(state_before if isinstance(state_before, dict) else None):
+        print("  TV already off.", file=sys.stderr)
+        print(json.dumps({"ok": True, "action": "power_off", "already_off": True}))
+        return
+
+    # Always send turnOff — aiowebostv.power_off() can skip if is_on is stale.
+    await client.command("request", ep.POWER_OFF)
+    print("  Sent system/turnOff.", file=sys.stderr)
+    await asyncio.sleep(1.0)
+    try:
+        state_after = await client.get_power_state()
+    except Exception:
+        state_after = {"state": "unknown"}
+    print(json.dumps({
+        "ok": True,
+        "action": "power_off",
+        "state_before": state_before,
+        "state_after": state_after,
+    }))
+
+
+async def cmd_power_on(ip: str, tv_mac: str | None = None) -> None:
+    """Wake the TV (WoL optional) and turn it on via SSAP."""
+    from aiowebostv import endpoints as ep
+
+    if not tv_mac:
+        tv_mac = discover_tv_mac(ip)
+        if tv_mac:
+            print(f"  Discovered TV MAC {tv_mac} from ARP table.", file=sys.stderr)
+
+    if tv_mac:
+        print(f"  Sending Wake-on-LAN to {tv_mac}...", file=sys.stderr)
+        try:
+            send_wol(tv_mac)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(2)
+        await asyncio.sleep(8.0)
+
+    client = await connect(ip)
+    try:
+        print("Powering on TV...")
+        state = await client.get_power_state()
+        print(f"  Power state: {state}", file=sys.stderr)
+
+        if not client.tv_state.is_on:
+            result = await client.power_on()
+            print(f"  system/turnOn: {result}", file=sys.stderr)
+            await asyncio.sleep(2.0)
+            state = await client.get_power_state()
+        elif not client.tv_state.is_screen_on:
+            result = await client.request(ep.TURN_ON_SCREEN)
+            print(f"  turnOnScreen: {result}", file=sys.stderr)
+            await asyncio.sleep(1.0)
+            state = await client.get_power_state()
+
+        print(json.dumps({
+            "ok": True,
+            "action": "power_on",
+            "state": state,
+            "wol_sent": bool(tv_mac),
+            "mac": tv_mac,
+        }))
+    finally:
+        await client.disconnect()
+
+
 async def main() -> None:
     args = parse_args()
 
@@ -1763,6 +1940,15 @@ async def main() -> None:
                 f"(picker {saved[0][0]}, index {entry.index})",
                 file=sys.stderr,
             )
+
+    if args.get_mac:
+        mac = discover_tv_mac(args.ip)
+        print(json.dumps({"mac": mac}))
+        return
+
+    if args.power_on:
+        await cmd_power_on(args.ip, tv_mac=args.tv_mac)
+        return
 
     client = await connect(args.ip)
     try:
@@ -1837,6 +2023,10 @@ async def main() -> None:
             await cmd_media_toggle(client)
         elif args.media_stop:
             await cmd_media_stop(client)
+        elif args.power_off:
+            await cmd_power_off(client)
+        elif args.power_state:
+            await cmd_power_state(client)
         elif args.volume_get:
             await cmd_volume_get(client)
         elif args.volume_set is not None:

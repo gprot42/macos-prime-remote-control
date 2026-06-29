@@ -153,7 +153,7 @@ export default function TitleCard({
               {item.runtime_str && (
                 <span className="text-[10px] text-zinc-500">{item.runtime_str}</span>
               )}
-              {label !== "-" && (
+              {label !== "-" && label !== "Prime" && (
                 <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ml-auto ${badgeStyle}`}>
                   {label}
                 </span>

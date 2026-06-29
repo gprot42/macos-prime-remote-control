@@ -193,23 +193,49 @@ export default function TVRemote({
   onPlaybackStateChange, onDismissPlaying,
 }: TVRemoteProps) {
 
-  // ── Volume ──────────────────────────────────────────────────────────────
-  const [vol, setVol]       = useState<VolumeState>({ volume: null, muted: false });
-  const [slider, setSlider] = useState(50);
-  const [volError, setVE]   = useState(false);
-  const volDebounce         = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // ── TV power + volume ─────────────────────────────────────────────────────
+  const [tvOn, setTvOn]       = useState<boolean | null>(null);
+  const tvOnRef               = useRef<boolean | null>(null);
+  const [vol, setVol]         = useState<VolumeState>({ volume: null, muted: false });
+  const [slider, setSlider]   = useState(50);
+  const [volError, setVE]     = useState(false);
+  const volDebounce           = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const setTvOnState = useCallback((on: boolean | null) => {
+    tvOnRef.current = on;
+    setTvOn(on);
+  }, []);
+
+  const refreshTvPower = useCallback(async () => {
+    try {
+      const ps = await invoke<{ on: boolean }>("get_tv_power");
+      setTvOnState(ps.on);
+      return ps.on;
+    } catch {
+      setTvOnState(false);
+      return false;
+    }
+  }, [setTvOnState]);
 
   const fetchVolume = useCallback(async () => {
+    if (tvOnRef.current === false) return;
     setVE(false);
     try {
       const s = await invoke<VolumeState>("get_tv_volume");
       setVol(s); setSlider(s.volume ?? 50);
-    } catch { setVE(true); }
+      setVE(false);
+    } catch {
+      if (tvOnRef.current === true) setVE(true);
+      else setVE(false);
+    }
   }, []);
 
-  useEffect(() => { fetchVolume(); }, [fetchVolume]);
+  useEffect(() => {
+    refreshTvPower().then((on) => { if (on) fetchVolume(); });
+  }, [refreshTvPower, fetchVolume]);
 
   const handleVolSlider = (v: number) => {
+    if (!tvOnRef.current) return;
     setSlider(v);
     setVol(p => ({ ...p, volume: v, muted: false }));
     if (volDebounce.current) clearTimeout(volDebounce.current);
@@ -217,17 +243,23 @@ export default function TVRemote({
       try {
         const s = await invoke<VolumeState>("set_tv_volume", { level: v });
         setVol(s); setSlider(s.volume ?? v);
-      } catch { /* silent */ }
+        setVE(false);
+      } catch { setVE(true); }
     }, 180);
   };
 
   const handleMute = async () => {
+    if (!tvOnRef.current) return;
     const m = !vol.muted;
     setVol(p => ({ ...p, muted: m }));
     try {
       const s = await invoke<VolumeState>("set_tv_mute", { muted: m });
       setVol(s); setSlider(s.volume ?? slider);
-    } catch { setVol(p => ({ ...p, muted: !m })); }
+      setVE(false);
+    } catch {
+      setVol(p => ({ ...p, muted: !m }));
+      setVE(true);
+    }
   };
 
   // ── Position tracking ───────────────────────────────────────────────────
@@ -338,6 +370,32 @@ export default function TVRemote({
     setTimeMode(mode);
     setTimeInput(formatTime(displayPos));
     setEditingTime(true);
+  };
+
+  // ── Power toggle ──────────────────────────────────────────────────────────
+  const [powerBusy, setPowerBusy] = useState(false);
+  const [powerErr, setPowerErr] = useState<string | null>(null);
+
+  const togglePower = async () => {
+    const turningOff = tvOn === true;
+    setPowerBusy(true);
+    setPowerErr(null);
+    try {
+      await invoke("tv_power", { action: turningOff ? "off" : "on" });
+      if (turningOff) {
+        setTvOnState(false);
+        setVE(false);
+        onDismissPlaying();
+      } else {
+        setTvOnState(true);
+        await fetchVolume();
+      }
+    } catch (err) {
+      setPowerErr(String(err).replace(/^Error:\s*/, "").slice(0, 60));
+      await refreshTvPower();
+    } finally {
+      setPowerBusy(false);
+    }
   };
 
   // ── Transport ─────────────────────────────────────────────────────────────
@@ -540,8 +598,46 @@ export default function TVRemote({
 
         <div className="w-px h-9 bg-zinc-700/60 shrink-0" />
 
-        {/* ── VOLUME ────────────────────────────────────────────────────── */}
-        <div className="relative flex flex-col items-center justify-center shrink-0 w-10 h-full">
+        {/* ── POWER (single toggle: green=on, red=off) ──────────────────── */}
+        <div className="flex flex-col items-center shrink-0">
+          <button
+            onClick={togglePower}
+            disabled={powerBusy || tvOn === null}
+            title={
+              powerErr ?? (
+                tvOn === true ? "TV is on — click to power off"
+                : tvOn === false ? "TV is off — click to power on"
+                : "Checking TV…"
+              )
+            }
+            className={`w-9 h-9 flex items-center justify-center rounded-xl border transition-colors
+                        disabled:opacity-40 shrink-0 ${
+              tvOn === true
+                ? "bg-emerald-900/50 border-emerald-600 text-emerald-300 hover:bg-emerald-800/60"
+                : tvOn === false
+                  ? "bg-red-900/40 border-red-700/70 text-red-300 hover:bg-red-900/60"
+                  : "bg-zinc-800/80 border-zinc-700/60 text-zinc-400"
+            }`}
+          >
+            {powerBusy ? (
+              <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+              </svg>
+            ) : (
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5.636 5.636a9 9 0 1012.728 0M12 3v9"/>
+              </svg>
+            )}
+          </button>
+        </div>
+
+        <div className="w-px h-9 bg-zinc-700/60 shrink-0" />
+
+        {/* ── VOLUME (only active when TV is on) ─────────────────────────── */}
+        <div className={`relative flex flex-col items-center justify-center shrink-0 w-10 h-full ${
+          tvOn === false ? "opacity-40 pointer-events-none" : ""
+        }`}>
 
           {/* Vertical slider pops above dock */}
           <div className="absolute bottom-full mb-1 flex flex-col items-center gap-1 pb-1.5
@@ -555,22 +651,23 @@ export default function TVRemote({
             </span>
           </div>
 
-          {/* Mute button */}
-          <button onClick={handleMute} title={vol.muted ? "Unmute" : "Mute"}
+          {/* Mute button — click also retries volume sync when TV is on */}
+          <button
+            onClick={() => { if (volError) fetchVolume(); else handleMute(); }}
+            title={
+              tvOn === false ? "TV is off"
+              : volError ? "Retry volume sync"
+              : vol.muted ? "Unmute" : "Mute"
+            }
             className={`p-1.5 rounded-lg transition-colors ${
               vol.muted
                 ? "text-red-400 bg-red-900/40 hover:bg-red-900/60"
-                : "text-zinc-400 hover:text-white hover:bg-zinc-700/60"
+                : volError
+                  ? "text-orange-400 bg-orange-900/30 hover:bg-orange-900/50"
+                  : "text-zinc-400 hover:text-white hover:bg-zinc-700/60"
             }`}>
             <SpeakerIcon level={dispVol} muted={vol.muted} size={18} />
           </button>
-
-          {volError && (
-            <button onClick={fetchVolume}
-              className="text-[9px] text-red-400 hover:text-red-300 underline leading-none mt-0.5">
-              retry
-            </button>
-          )}
         </div>
 
       </div>

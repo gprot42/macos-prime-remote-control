@@ -36,6 +36,9 @@ pub struct AppConfig {
     /// Default playback target: "tv" or "mac".
     #[serde(default = "default_playback_tv")]
     pub default_playback_target: String,
+    /// Optional TV MAC for Wake-on-LAN when powering on from deep standby.
+    #[serde(default)]
+    pub tv_mac: String,
 }
 
 fn default_playback_tv() -> String {
@@ -67,6 +70,7 @@ impl Default for AppConfig {
             show_other: true,
             detect_vpn_region: true,
             default_playback_target: default_playback_tv(),
+            tv_mac: String::new(),
         }
     }
 }
@@ -666,6 +670,73 @@ async fn save_config(cfg: AppConfig) -> Result<(), String> {
     save_config_to_disk(&cfg)
 }
 
+/// Look up the TV MAC via ARP and persist it when found.
+async fn autofill_tv_mac(cfg: &mut AppConfig) -> Result<bool, String> {
+    let ip = cfg.tv_ip.trim();
+    if ip.is_empty() {
+        return Ok(false);
+    }
+    let Some(mac) = run_get_mac_cmd(ip).await? else {
+        return Ok(false);
+    };
+    let current = cfg.tv_mac.trim();
+    if !current.is_empty() && current.eq_ignore_ascii_case(&mac) {
+        return Ok(false);
+    }
+    cfg.tv_mac = mac;
+    save_config_to_disk(cfg)?;
+    Ok(true)
+}
+
+async fn run_get_mac_cmd(ip: &str) -> Result<Option<String>, String> {
+    let cfg = load_config();
+    let root = resolve_project_root(&cfg);
+    let python = python_exe(&root);
+    let script = root
+        .join("amazon")
+        .join("lg-tv-connect.py")
+        .to_string_lossy()
+        .to_string();
+
+    let output = tokio::process::Command::new(&python)
+        .arg(&script)
+        .arg(ip)
+        .arg("--get-mac")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run lg-tv-connect.py: {e}"))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(format!("TV MAC lookup failed: {err}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let json_line = stdout
+        .lines()
+        .filter(|l| l.trim_start().starts_with('{'))
+        .last()
+        .unwrap_or("");
+    if json_line.is_empty() {
+        return Ok(None);
+    }
+    let val: serde_json::Value =
+        serde_json::from_str(json_line).map_err(|e| e.to_string())?;
+    Ok(val["mac"].as_str().map(|s| s.to_string()))
+}
+
+/// Discover the TV MAC from ARP (TV should be on) and save it to config.
+#[tauri::command]
+async fn discover_tv_mac(app: tauri::AppHandle) -> Result<AppConfig, String> {
+    let mut cfg = load_config();
+    if autofill_tv_mac(&mut cfg).await? {
+        let _ = app.emit("config-updated", cfg.clone());
+    }
+    Ok(cfg)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tauri commands — bookmarks
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1041,8 +1112,15 @@ async fn run_tv_volume_cmd(args: &[&str]) -> Result<VolumeState, String> {
 
 /// Get current volume level and mute state.
 #[tauri::command]
-async fn get_tv_volume() -> Result<VolumeState, String> {
-    run_tv_volume_cmd(&["--volume-get"]).await
+async fn get_tv_volume(app: tauri::AppHandle) -> Result<VolumeState, String> {
+    let result = run_tv_volume_cmd(&["--volume-get"]).await;
+    if result.is_ok() {
+        let mut cfg = load_config();
+        if autofill_tv_mac(&mut cfg).await.unwrap_or(false) {
+            let _ = app.emit("config-updated", cfg);
+        }
+    }
+    result
 }
 
 /// Set absolute volume level (0–100).
@@ -1067,6 +1145,111 @@ async fn volume_step(direction: String, steps: i32) -> Result<VolumeState, Strin
 async fn set_tv_mute(muted: bool) -> Result<VolumeState, String> {
     let flag = if muted { "--mute" } else { "--unmute" };
     run_tv_volume_cmd(&[flag]).await
+}
+
+#[derive(Serialize)]
+struct TvPowerState {
+    on: bool,
+}
+
+/// Query whether the TV is powered on (requires network connection).
+#[tauri::command]
+async fn get_tv_power() -> Result<TvPowerState, String> {
+    let cfg = load_config();
+    let root = resolve_project_root(&cfg);
+    let python = python_exe(&root);
+    let script = root
+        .join("amazon")
+        .join("lg-tv-connect.py")
+        .to_string_lossy()
+        .to_string();
+
+    let output = tokio::process::Command::new(&python)
+        .arg(&script)
+        .arg(&cfg.tv_ip)
+        .arg("--power-state")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run lg-tv-connect.py: {e}"))?;
+
+    if !output.status.success() {
+        return Ok(TvPowerState { on: false });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let json_line = stdout
+        .lines()
+        .filter(|l| l.trim_start().starts_with('{'))
+        .last()
+        .unwrap_or("");
+    if json_line.is_empty() {
+        return Ok(TvPowerState { on: false });
+    }
+    let val: serde_json::Value =
+        serde_json::from_str(json_line).map_err(|e| e.to_string())?;
+    Ok(TvPowerState {
+        on: val["on"].as_bool().unwrap_or(false),
+    })
+}
+
+/// Power the TV on or off ("on" | "off").
+#[tauri::command]
+async fn tv_power(app: tauri::AppHandle, action: String) -> Result<(), String> {
+    let cfg = load_config();
+    let root = resolve_project_root(&cfg);
+    let python = python_exe(&root);
+    let script = root
+        .join("amazon")
+        .join("lg-tv-connect.py")
+        .to_string_lossy()
+        .to_string();
+
+    let flag = match action.as_str() {
+        "off" => "--power-off",
+        "on" => "--power-on",
+        other => return Err(format!("Unknown power action: {other}")),
+    };
+
+    let mut cmd = tokio::process::Command::new(&python);
+    cmd.arg(&script).arg(&cfg.tv_ip).arg(flag);
+    if action == "on" && !cfg.tv_mac.trim().is_empty() {
+        cmd.arg("--tv-mac").arg(cfg.tv_mac.trim());
+    }
+
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run lg-tv-connect.py: {e}"))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        let out = String::from_utf8_lossy(&output.stdout).to_string();
+        let detail = if err.trim().is_empty() { out } else { err };
+        return Err(format!("TV power command failed: {detail}"));
+    }
+
+    let mut cfg = load_config();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if let Some(json_line) = stdout.lines().filter(|l| l.trim_start().starts_with('{')).last() {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_line) {
+            if let Some(mac) = val["mac"].as_str() {
+                if !mac.is_empty() && cfg.tv_mac.trim().is_empty() {
+                    cfg.tv_mac = mac.to_string();
+                    let _ = save_config_to_disk(&cfg);
+                    let _ = app.emit("config-updated", cfg.clone());
+                }
+            }
+        }
+    }
+    if autofill_tv_mac(&mut cfg).await.unwrap_or(false) {
+        let _ = app.emit("config-updated", cfg);
+    }
+
+    Ok(())
 }
 
 /// Send a media control command to the TV (pause / play / toggle).
@@ -1426,6 +1609,7 @@ pub fn run() {
             open_tmdb_trailer,
             get_config,
             save_config,
+            discover_tv_mac,
             get_bookmarks,
             add_bookmark,
             remove_bookmark,
@@ -1443,6 +1627,8 @@ pub fn run() {
             list_cached_images,
             get_image_server_port,
             media_control,
+            tv_power,
+            get_tv_power,
             get_tv_volume,
             set_tv_volume,
             volume_step,

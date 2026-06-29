@@ -67,6 +67,8 @@ export interface AppConfig {
   detect_vpn_region: boolean;
   /** Default play target: TV or Mac in-app Prime window. */
   default_playback_target: PlaybackTarget;
+  /** Optional MAC for Wake-on-LAN power-on (e.g. AA:BB:CC:DD:EE:FF). */
+  tv_mac?: string;
 }
 
 export type PlaybackTarget = "tv" | "mac";
@@ -82,6 +84,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   show_other: true,
   detect_vpn_region: true,
   default_playback_target: "tv",
+  tv_mac: "",
 };
 
 export type EntityTypeFilter = "all" | "Movie" | "TV Show";

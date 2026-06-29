@@ -170,8 +170,21 @@ export default function App() {
   // ── Config load ─────────────────────────────────────────────────────────────
   useEffect(() => {
     invoke<AppConfig>("get_config")
+      .then((cfg) => {
+        setConfig(cfg);
+        return invoke<AppConfig>("discover_tv_mac");
+      })
       .then((cfg) => setConfig(cfg))
       .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<AppConfig>("config-updated", (event) => {
+      setConfig(event.payload);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
   }, []);
 
   useEffect(() => {

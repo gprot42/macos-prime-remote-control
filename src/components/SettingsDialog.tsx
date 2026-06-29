@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   AppConfig,
@@ -59,7 +59,13 @@ interface SettingsDialogProps {
 
 export default function SettingsDialog({ config, onClose, onSaved }: SettingsDialogProps) {
   const [tvIp, setTvIp] = useState(config.tv_ip);
+  const [tvMac, setTvMac] = useState(config.tv_mac ?? "");
+  const [macDetecting, setMacDetecting] = useState(false);
   const [profile, setProfile] = useState(config.profile);
+
+  useEffect(() => {
+    setTvMac(config.tv_mac ?? "");
+  }, [config.tv_mac]);
   const [projectRoot, setProjectRoot] = useState(config.project_root);
   const [cacheTtl, setCacheTtl] = useState(config.cache_ttl_secs ?? 21600);
   const [showPrime, setShowPrime] = useState(config.show_prime ?? true);
@@ -92,6 +98,7 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
     setError(null);
     const newCfg: AppConfig = {
       tv_ip: tvIp,
+      tv_mac: config.tv_mac ?? tvMac.trim(),
       profile,
       project_root: projectRoot,
       cache_ttl_secs: cacheTtl,
@@ -187,6 +194,42 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
                 />
                 <p className="text-xs text-zinc-500 mt-1.5">
                   Run <code className="text-zinc-400 bg-zinc-800 px-1 rounded">./lg-tv-probe</code> to find your TV's IP
+                </p>
+              </div>
+              <div>
+                <label className="block text-sm text-zinc-300 mb-1.5">TV MAC Address</label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    readOnly
+                    value={tvMac || (macDetecting ? "Detecting…" : "Not detected yet")}
+                    className="flex-1 bg-zinc-800/70 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
+                               text-zinc-300 font-mono cursor-default"
+                  />
+                  <button
+                    type="button"
+                    disabled={macDetecting}
+                    onClick={async () => {
+                      setMacDetecting(true);
+                      try {
+                        const cfg = await invoke<AppConfig>("discover_tv_mac");
+                        setTvMac(cfg.tv_mac ?? "");
+                        onSaved(cfg);
+                      } catch {
+                        /* ignore */
+                      } finally {
+                        setMacDetecting(false);
+                      }
+                    }}
+                    className="shrink-0 px-3 py-2.5 text-xs font-medium rounded-xl border border-zinc-700
+                               text-zinc-300 hover:text-white hover:bg-zinc-700 transition-colors
+                               disabled:opacity-40"
+                  >
+                    Refresh
+                  </button>
+                </div>
+                <p className="text-xs text-zinc-500 mt-1.5">
+                  Detected automatically when the TV is on (used for Wake-on-LAN power-on).
                 </p>
               </div>
               <div>
