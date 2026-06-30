@@ -607,16 +607,17 @@ export default function TVRemote({
   const [transportErr, setTransportErr] = useState<string | null>(null);
 
   const handleTransport = useCallback(async (action: TransportAction) => {
-    // Pause acts as a toggle: if already paused, resume instead.
-    const effective = action === "pause" && playbackState === "paused" ? "play" : action;
-    setPbBusy(effective);
+    // Each button maps to a literal action — pause pauses, play resumes, stop
+    // stops. (No play/pause toggle: there are dedicated Play and Pause buttons,
+    // and toggling off a possibly-stale playbackState made Pause send "play".)
+    setPbBusy(action);
     setTransportErr(null);
     try {
-      await invoke("media_control", { action: effective });
+      await invoke("media_control", { action });
       // Command succeeded — TV is clearly reachable; reset any stale unreachable state.
       setTvOnState(true);
-      if (effective === "pause") onPlaybackStateChange("paused");
-      else if (effective === "play") onPlaybackStateChange("playing");
+      if (action === "pause") onPlaybackStateChange("paused");
+      else if (action === "play") onPlaybackStateChange("playing");
       else { onPlaybackStateChange("paused"); onDismissPlaying(); }
     } catch (err) {
       const msg = String(err).replace(/^Error:\s*/, "");
@@ -629,7 +630,7 @@ export default function TVRemote({
     } finally {
       setPbBusy(null);
     }
-  }, [playbackState, onPlaybackStateChange, onDismissPlaying, setTvOnState]);
+  }, [onPlaybackStateChange, onDismissPlaying, setTvOnState]);
 
   const volPct    = vol.muted ? 0 : slider;
   const dispVol   = vol.muted ? 0 : (vol.volume ?? slider);
