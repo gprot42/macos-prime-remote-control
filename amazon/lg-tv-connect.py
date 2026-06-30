@@ -301,6 +301,15 @@ def _append_launch_id(candidates: list[str], seen: set[str], value: str | None) 
     candidates.append(value)
 
 
+def _is_autoplay_target(target: str) -> bool:
+    """True when `target` is a deep link that itself starts playback (autoplay=1).
+
+    A bare GTI/ASIN/contentId only opens the title page, so playback there still
+    needs a Watch/Resume keypress.
+    """
+    return isinstance(target, str) and "autoplay=" in target
+
+
 def _prime_target_uses_params(target: str) -> bool:
     return (
         target.startswith("/detail/")
@@ -543,10 +552,11 @@ async def launch_prime_content_candidates(
             client, launch_id, cold_start=cold_start
         )
         _check_launch_result(result)
-        # A Prime content deep link (contentId / GTI / contentTarget) auto-plays
-        # on the TV. Report autoplay=True so start_playback never sends an extra
-        # key — doing so would land on the playing video and pause it.
-        return launch_id, True
+        # Only an explicit autoplay deep link (autoplay=1) starts playback on its
+        # own. A bare GTI/ASIN/contentId merely opens the title page — and for a
+        # title with a saved position it shows "Resume" but does NOT auto-play —
+        # so in that case start_playback must still press the Watch/Resume button.
+        return launch_id, _is_autoplay_target(launch_id)
 
     last_id = candidates[-1]
     for idx, launch_id in enumerate(candidates):
@@ -558,8 +568,9 @@ async def launch_prime_content_candidates(
         last_id = launch_id
         if idx < len(candidates) - 1:
             await asyncio.sleep(4.0)
-    # As above: the deep link auto-plays, so suppress any follow-up keypress.
-    return last_id, True
+    # As above: only an autoplay=1 deep link starts on its own; otherwise the
+    # title page needs a Watch/Resume keypress.
+    return last_id, _is_autoplay_target(last_id)
 
 
 async def enter_profile_pin(
@@ -795,6 +806,56 @@ async def _focus_prime_watch_button(
         print("  Watch area focused (no ENTER). Check the TV highlight.")
 
 
+_MEDIA_INFO_ENDPOINTS = (
+    ("ssap://com.webos.service.media.player/getInfo", {}),
+    ("ssap://com.webos.service.cepswm.media.player/getInfo", {}),
+    ("ssap://media.infoAction.getInfoPerApp", {"id": "amazon"}),
+)
+
+
+async def _playback_position(client: "WebOsClient") -> float | None:
+    """Best-effort current playback position (seconds) from the TV, or None.
+
+    Availability is WebOS/app-version dependent, so callers must treat ``None``
+    as *unknown*, not as "definitely not playing".
+    """
+    for uri, payload in _MEDIA_INFO_ENDPOINTS:
+        try:
+            result = await client.request(uri, payload)
+        except Exception:
+            continue
+        if not result.get("returnValue"):
+            continue
+        pos = (
+            result.get("currentTime")
+            or result.get("position")
+            or result.get("mediaCurrentTime")
+        )
+        if pos is not None:
+            try:
+                return float(pos)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+async def _wait_until_playing(client: "WebOsClient", timeout: float) -> bool:
+    """Poll the TV up to ``timeout`` seconds; return True once playback starts.
+
+    Distinguishes a freshly-launched episode that auto-played (the media player
+    is already up) from one that landed on its detail page showing "Resume"
+    (which still needs a keypress to start).
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + max(0.0, timeout)
+    while True:
+        if await _playback_position(client) is not None:
+            return True
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(1.0)
+
+
 async def start_playback(
     client: "WebOsClient",
     *,
@@ -833,7 +894,23 @@ async def start_playback(
         print("  Launched with autoplay=1; letting the player start on its own (no extra keys).")
         return
 
-    if delay > 0:
+    if resolved_method in ("watch", "enter") and not play_highlight:
+        # A bare GTI/contentId launch lands in one of two states we can't predict
+        # up front: a fresh episode auto-plays (player already up), while one with
+        # a saved position shows its Resume detail page and waits for a keypress.
+        # Probe the TV during the page-load wait — if it is already playing, an
+        # ENTER here would toggle it to PAUSE ("plays for a few seconds then
+        # pauses"), so only press the button when playback has NOT started.
+        probe = delay if delay > 0 else DEFAULT_PLAY_DELAY
+        print(
+            f"  Waiting up to {probe:.1f}s for the title page / autoplay, "
+            "then starting playback only if needed ..."
+        )
+        if await _wait_until_playing(client, probe):
+            print("  Playback already started after launch; no extra keys needed.")
+            return
+        print("  Not playing yet — pressing the Watch/Resume button.")
+    elif delay > 0:
         detail = f" ({note})" if note else ""
         print(
             f"  Waiting {delay:.1f}s for title page, then starting playback "

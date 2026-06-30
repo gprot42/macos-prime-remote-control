@@ -1741,6 +1741,44 @@ async fn discover_lg_tv_ip() -> Option<String> {
     None
 }
 
+/// Flush the stale ARP/neighbor entry and any REJECT host route the kernel keeps
+/// for `ip`. After a failed ARP resolution macOS blackholes the host — the
+/// classic "visible via mDNS but no unicast" state — and never retries until the
+/// entry is cleared. Removing it forces a fresh resolution on the next packet.
+///
+/// This needs root, so (like the `sudo arp -d` / `sudo route delete` steps in
+/// `scripts/fix-tv-connection.sh`) we run it through a single osascript
+/// "administrator privileges" prompt, which shows the native macOS password
+/// dialog. This is the Mac-side repair the standalone script performs and is
+/// usually what actually restores the connection.
+#[cfg(target_os = "macos")]
+async fn flush_tv_neighbor(ip: &str) -> Result<(), String> {
+    // Validate before interpolating into a shell string (defense in depth —
+    // `ip` comes from config/mDNS, never raw user input).
+    if ip.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err(format!("invalid IP: {ip}"));
+    }
+    let inner = format!(
+        "/usr/sbin/arp -d {ip} 2>/dev/null; /sbin/route -n delete {ip} 2>/dev/null; exit 0"
+    );
+    let script = format!("do shell script \"{inner}\" with administrator privileges");
+    let out = tokio::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .await
+        .map_err(|e| format!("osascript failed: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if err.is_empty() {
+            "authorization cancelled".to_string()
+        } else {
+            err
+        })
+    }
+}
+
 /// Parse "08:27:A8:6C:B6:72" / "08-27-..." into 6 bytes.
 fn parse_mac(mac: &str) -> Option<[u8; 6]> {
     let parts: Vec<&str> = mac.split(|c| c == ':' || c == '-').collect();
@@ -1912,6 +1950,42 @@ async fn repair_tv_connection(
         note!("TV is visible but not answering control requests (Wi-Fi isolation / roamed AP).");
     } else {
         note!("TV not found via mDNS — it may be powered off or on another network/band.");
+    }
+
+    // Step 1.5 — clear a stale neighbor / REJECT host route on the Mac. After a
+    // failed ARP, macOS blackholes the TV ("visible but unreachable"); flushing
+    // it lets the next packet re-resolve. This is the Mac-side repair that the
+    // standalone scripts/fix-tv-connection.sh performs via sudo, and is usually
+    // what actually restores a TV that mDNS can see but control requests can't
+    // reach — the previous native flow skipped it entirely.
+    #[cfg(target_os = "macos")]
+    if !ip.is_empty() {
+        note!("Clearing the stale network route to the TV (may prompt for your password)…");
+        match flush_tv_neighbor(&ip).await {
+            Ok(()) => {
+                note!("Cleared the stale route. Re-checking the connection…");
+                // Re-trigger ARP resolution with a few quick probes, then re-test.
+                for _ in 0..3 {
+                    let _ = tokio::process::Command::new("ping")
+                        .args(["-c", "1", "-t", "1", &ip])
+                        .output()
+                        .await;
+                }
+                if tv_control_reachable(&ip).await {
+                    note!("TV is now reachable at {ip}.");
+                    return Ok(TvRepairReport {
+                        reachable: true,
+                        ip,
+                        ip_changed,
+                        discovered,
+                        wifi_restarted: false,
+                        steps,
+                        advice: None,
+                    });
+                }
+            }
+            Err(e) => note!("Could not clear the stale route ({e}). Continuing…"),
+        }
     }
 
     // Step 2 — Wake-on-LAN (wakes a TV in network standby).
