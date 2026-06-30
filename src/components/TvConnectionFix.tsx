@@ -98,7 +98,7 @@ export default function TvConnectionFix({
             Fix connection
           </button>
 
-          {status === "done" && !reachable && (
+          {status !== "running" && (
             <button
               type="button"
               disabled={running}
