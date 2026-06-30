@@ -1855,6 +1855,24 @@ struct TvRepairReport {
     advice: Option<String>,
 }
 
+/// Scan the local network for an LG TV via mDNS/Bonjour and return its IP.
+/// Updates and saves the config when the discovered IP differs from the saved one.
+#[tauri::command]
+async fn scan_for_tv(app: tauri::AppHandle) -> Result<String, String> {
+    match discover_lg_tv_ip().await {
+        Some(ip) => {
+            let mut cfg = load_config();
+            if cfg.tv_ip.trim() != ip.as_str() {
+                cfg.tv_ip = ip.clone();
+                let _ = save_config_to_disk(&cfg);
+                let _ = app.emit("config-updated", cfg);
+            }
+            Ok(ip)
+        }
+        None => Err("No LG TV found on the network via mDNS/Bonjour".to_string()),
+    }
+}
+
 /// Quick connectivity check used by the UI to re-test after a repair or to
 /// decide whether to offer the "Fix connection" flow.
 #[tauri::command]
@@ -2148,6 +2166,7 @@ pub fn run() {
             get_playback_position,
             list_episodes,
             check_tv_reachable,
+            scan_for_tv,
             repair_tv_connection,
         ])
         .run(tauri::generate_context!())

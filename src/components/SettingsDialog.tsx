@@ -61,6 +61,8 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
   const [tvIp, setTvIp] = useState(config.tv_ip);
   const [tvMac, setTvMac] = useState(config.tv_mac ?? "");
   const [macDetecting, setMacDetecting] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [scanMsg, setScanMsg] = useState<string | null>(null);
   const [profile, setProfile] = useState(config.profile);
 
   useEffect(() => {
@@ -190,16 +192,56 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
             <div className="space-y-3">
               <div>
                 <label className="block text-sm text-zinc-300 mb-1.5">TV IP Address</label>
-                <input
-                  type="text"
-                  value={tvIp}
-                  onChange={(e) => setTvIp(e.target.value)}
-                  className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
-                             text-white font-mono focus:outline-none focus:border-emerald-500 transition-colors"
-                  placeholder="192.168.0.79"
-                />
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={tvIp}
+                    onChange={(e) => { setTvIp(e.target.value); setScanMsg(null); }}
+                    className="flex-1 bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
+                               text-white font-mono focus:outline-none focus:border-emerald-500 transition-colors"
+                    placeholder="192.168.0.79"
+                  />
+                  <button
+                    type="button"
+                    disabled={scanning}
+                    onClick={async () => {
+                      setScanning(true);
+                      setScanMsg(null);
+                      try {
+                        const ip = await invoke<string>("scan_for_tv");
+                        setTvIp(ip);
+                        setScanMsg(`Found: ${ip}`);
+                      } catch (err) {
+                        setScanMsg(`Not found: ${String(err).replace(/^Error:\s*/, "")}`);
+                      } finally {
+                        setScanning(false);
+                      }
+                    }}
+                    className="shrink-0 px-3 py-2.5 text-xs font-medium rounded-xl border border-zinc-700
+                               text-zinc-300 hover:text-white hover:bg-zinc-700 transition-colors
+                               disabled:opacity-40 flex items-center gap-1.5"
+                  >
+                    {scanning ? (
+                      <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                      </svg>
+                    ) : (
+                      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round"
+                          d="M8.288 15.038a5.25 5.25 0 017.424 0M5.106 11.856c3.807-3.808 9.98-3.808 13.788 0M1.924 8.674c5.565-5.565 14.587-5.565 20.152 0M12 20.25h.008v.008H12v-.008z"/>
+                      </svg>
+                    )}
+                    {scanning ? "Scanning…" : "Scan"}
+                  </button>
+                </div>
+                {scanMsg && (
+                  <p className={`text-xs mt-1.5 ${scanMsg.startsWith("Found") ? "text-emerald-400" : "text-red-400"}`}>
+                    {scanMsg}
+                  </p>
+                )}
                 <p className="text-xs text-zinc-500 mt-1.5">
-                  Run <code className="text-zinc-400 bg-zinc-800 px-1 rounded">./lg-tv-probe</code> to find your TV's IP
+                  Scan uses mDNS/Bonjour to find your LG TV on the network automatically.
                 </p>
               </div>
               <div>
