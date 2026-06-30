@@ -15,7 +15,7 @@ import { useState, useEffect, useCallback, useRef, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { PrimeTitle } from "../types";
-import { isTvUnreachableMessage } from "../playback";
+import { isTvUnreachableMessage, repairTvConnection } from "../playback";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface VolumeState { volume: number | null; muted: boolean; }
@@ -146,6 +146,34 @@ const TransportBar = memo(function TransportBar({
         </span>
       )}
     </div>
+  );
+});
+
+// Compact "Fix" button shown next to the dock's "TV unreachable" label.
+const QuickFixButton = memo(function QuickFixButton({
+  fixing,
+  onClick,
+}: {
+  fixing: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={fixing}
+      onClick={onClick}
+      title="Re-detect the TV and wake it (Wake-on-LAN)"
+      className="shrink-0 flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-semibold
+                 bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white transition-colors"
+    >
+      {fixing ? (
+        <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+        </svg>
+      ) : null}
+      Fix
+    </button>
   );
 });
 
@@ -379,6 +407,23 @@ export default function TVRemote({
       unlisten?.();
     };
   }, [setTvOnState]);
+
+  // Quick, non-disruptive connection fix from the dock: re-discover the TV's IP
+  // via mDNS and send Wake-on-LAN. (The disruptive Wi-Fi reset lives in the
+  // play dialog's fuller repair UI.)
+  const [fixingTv, setFixingTv] = useState(false);
+  const handleQuickFix = useCallback(async () => {
+    setFixingTv(true);
+    try {
+      const r = await repairTvConnection(false);
+      setTvOnState(r.reachable);
+      if (r.reachable) fetchVolume();
+    } catch {
+      /* leave indicator as-is */
+    } finally {
+      setFixingTv(false);
+    }
+  }, [setTvOnState, fetchVolume]);
 
   const handleVolSlider = (v: number) => {
     if (!tvOnRef.current) return;
@@ -635,6 +680,7 @@ export default function TVRemote({
                     {tvOn !== false && episode != null ? ` · Episode ${episode}` : ""}
                     {tvOn !== false && episode == null && nowPlaying.year ? ` · ${nowPlaying.year}` : ""}
                   </span>
+                  {tvOn === false && <QuickFixButton fixing={fixingTv} onClick={handleQuickFix} />}
                 </div>
               </>
             ) : tvOn === false ? (
@@ -642,8 +688,9 @@ export default function TVRemote({
                 <span className="w-2 h-2 rounded-full shrink-0 bg-red-500" />
                 <div className="flex flex-col gap-0.5 min-w-0">
                   <p className="text-sm text-red-400 font-semibold leading-tight">TV unreachable</p>
-                  <p className="text-xs text-red-400/70">Power it on, then press the power button</p>
+                  <p className="text-xs text-red-400/70">Power it on, or try a quick fix</p>
                 </div>
+                <QuickFixButton fixing={fixingTv} onClick={handleQuickFix} />
               </div>
             ) : (
               <div className="flex flex-col gap-0.5">

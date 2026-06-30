@@ -7,6 +7,7 @@ import { ContextMenuItem } from "./ContextMenu";
 import { showMediaContextMenu } from "../contextMenuBus";
 import { BookmarkIcon, ExternalLinkIcon, LaptopIcon, PlayIcon, TrailerIcon } from "./BookmarkMenuIcons";
 import { playOnMac, playOnTv, isTvUnreachableMessage } from "../playback";
+import TvConnectionFix from "./TvConnectionFix";
 import { openTmdbLookup, openTmdbTrailerForTitle, tmdbUrlForEpisode, tmdbUrlForTitle } from "../tmdb";
 
 interface PlayDialogProps {
@@ -625,19 +626,24 @@ export default function PlayDialog({
           )}
           {playState === "error" && (
             tvUnreachable ? (
-              <div className="flex items-start gap-2.5 rounded-xl border border-red-700/60 bg-red-950/50 px-4 py-3">
-                <svg className="w-5 h-5 text-red-400 shrink-0 mt-0.5" fill="none" stroke="currentColor"
-                  strokeWidth={1.8} viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round"
-                    d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
-                </svg>
-                <div className="min-w-0">
-                  <p className="text-red-300 text-sm font-semibold">TV unreachable</p>
-                  <p className="text-red-400/80 text-xs mt-0.5 leading-relaxed">
-                    {config.tv_ip} isn't responding. Make sure the TV is powered on
-                    (not in standby) and on the same network, then try again.
-                  </p>
+              <div className="rounded-xl border border-red-700/60 bg-red-950/50 px-4 py-3 space-y-3">
+                <div className="flex items-start gap-2.5">
+                  <svg className="w-5 h-5 text-red-400 shrink-0 mt-0.5" fill="none" stroke="currentColor"
+                    strokeWidth={1.8} viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round"
+                      d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                  </svg>
+                  <div className="min-w-0">
+                    <p className="text-red-300 text-sm font-semibold">TV unreachable</p>
+                    <p className="text-red-400/80 text-xs mt-0.5 leading-relaxed">
+                      {config.tv_ip} isn't responding. The TV may be powered on but
+                      isolated on Wi-Fi, or it changed address. Try the automatic fix:
+                    </p>
+                  </div>
                 </div>
+                <TvConnectionFix
+                  onResolved={(ok) => { if (ok) setPlayState("idle"); }}
+                />
               </div>
             ) : (
               <p className="text-center text-red-400 text-sm">

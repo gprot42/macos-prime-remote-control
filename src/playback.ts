@@ -19,6 +19,31 @@ export function isTvUnreachableMessage(text: string): boolean {
   return TV_UNREACHABLE_PATTERNS.some((re) => re.test(text));
 }
 
+export interface TvRepairReport {
+  reachable: boolean;
+  ip: string;
+  ip_changed: boolean;
+  discovered: boolean;
+  wifi_restarted: boolean;
+  steps: string[];
+  advice: string | null;
+}
+
+/**
+ * Ask the backend to try to restore TV connectivity from the Mac side.
+ * Non-disruptive steps (mDNS re-discovery + Wake-on-LAN) always run; pass
+ * restartWifi=true to also power-cycle the Mac's Wi-Fi. Progress streams via
+ * "repair-progress" events.
+ */
+export async function repairTvConnection(restartWifi: boolean): Promise<TvRepairReport> {
+  return await invoke<TvRepairReport>("repair_tv_connection", { restartWifi });
+}
+
+/** Quick check whether the TV's control port is reachable right now. */
+export async function checkTvReachable(): Promise<boolean> {
+  return await invoke<boolean>("check_tv_reachable");
+}
+
 export async function playOnMac(
   item: PrimeTitle,
   options?: { episode?: number | null; contentId?: string | null },

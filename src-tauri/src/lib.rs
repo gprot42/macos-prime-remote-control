@@ -1669,6 +1669,330 @@ async fn list_episodes(content_id: String) -> Result<String, String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Tauri commands — TV connection diagnosis & repair (macOS)
+//
+// The most common "TV unreachable" failure is a Wi-Fi layer-2 problem: the TV
+// is powered on and visible via mDNS/Bonjour (multicast), but the Mac can't
+// exchange unicast packets with it (it roamed to another radio/AP, client
+// isolation, or a stale neighbor/reject route). These helpers let the app
+// detect that and offer a one-click fix without dropping to a terminal.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Can we open the WebOS control port (3000/3001) on `ip` within `timeout`?
+/// This is the connectivity check that actually matters for playback.
+async fn tcp_port_open(ip: &str, port: u16, timeout: Duration) -> bool {
+    let Ok(addr) = format!("{ip}:{port}").parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    matches!(
+        tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await,
+        Ok(Ok(_))
+    )
+}
+
+async fn tv_control_reachable(ip: &str) -> bool {
+    let t = Duration::from_secs(3);
+    tcp_port_open(ip, 3000, t).await || tcp_port_open(ip, 3001, t).await
+}
+
+/// Discover the LG TV's current IPv4 via mDNS/Bonjour (handles DHCP changes and
+/// the "visible but unreachable" case). macOS resolves `lgwebostv.local` for us.
+#[cfg(target_os = "macos")]
+async fn discover_lg_tv_ip() -> Option<String> {
+    // 1) Directory-service cache — fast and reliable for *.local names.
+    if let Ok(out) = tokio::process::Command::new("dscacheutil")
+        .args(["-q", "host", "-a", "name", "lgwebostv.local"])
+        .output()
+        .await
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            if let Some(rest) = line.trim().strip_prefix("ip_address:") {
+                let ip = rest.trim();
+                if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+    // 2) Fall back to mDNS name resolution via ping (prints the resolved IP even
+    //    when the host doesn't answer ICMP).
+    if let Ok(out) = tokio::process::Command::new("ping")
+        .args(["-c", "1", "-t", "1", "lgwebostv.local"])
+        .output()
+        .await
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        // e.g. "PING lgwebostv.local (192.168.0.79): 56 data bytes"
+        if let Some(start) = text.find('(') {
+            if let Some(end) = text[start + 1..].find(')') {
+                let ip = &text[start + 1..start + 1 + end];
+                if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn discover_lg_tv_ip() -> Option<String> {
+    None
+}
+
+/// Parse "08:27:A8:6C:B6:72" / "08-27-..." into 6 bytes.
+fn parse_mac(mac: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = mac.split(|c| c == ':' || c == '-').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut bytes = [0u8; 6];
+    for (i, p) in parts.iter().enumerate() {
+        bytes[i] = u8::from_str_radix(p.trim(), 16).ok()?;
+    }
+    Some(bytes)
+}
+
+/// Send a Wake-on-LAN magic packet to `mac` (broadcast UDP, ports 9 and 7).
+/// Wakes an LG TV that supports network standby ("Mobile TV On").
+fn send_wake_on_lan(mac: &str) -> Result<(), String> {
+    let bytes = parse_mac(mac).ok_or_else(|| format!("Invalid TV MAC: {mac}"))?;
+    let mut packet = vec![0xFFu8; 6];
+    for _ in 0..16 {
+        packet.extend_from_slice(&bytes);
+    }
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")
+        .map_err(|e| format!("WoL socket bind failed: {e}"))?;
+    socket
+        .set_broadcast(true)
+        .map_err(|e| format!("WoL broadcast enable failed: {e}"))?;
+    let mut sent = false;
+    for port in [9u16, 7] {
+        if socket
+            .send_to(&packet, (std::net::Ipv4Addr::BROADCAST, port))
+            .is_ok()
+        {
+            sent = true;
+        }
+    }
+    if sent {
+        Ok(())
+    } else {
+        Err("Could not send Wake-on-LAN packet".to_string())
+    }
+}
+
+/// Find the Wi-Fi hardware port's device name (usually en0).
+#[cfg(target_os = "macos")]
+async fn wifi_interface() -> String {
+    if let Ok(out) = tokio::process::Command::new("networksetup")
+        .arg("-listallhardwareports")
+        .output()
+        .await
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut wifi = false;
+        for line in text.lines() {
+            if line.contains("Wi-Fi") || line.contains("AirPort") {
+                wifi = true;
+            } else if wifi {
+                if let Some(dev) = line.trim().strip_prefix("Device:") {
+                    return dev.trim().to_string();
+                }
+            }
+        }
+    }
+    "en0".to_string()
+}
+
+#[derive(Serialize)]
+struct TvRepairReport {
+    reachable: bool,
+    ip: String,
+    ip_changed: bool,
+    discovered: bool,
+    wifi_restarted: bool,
+    steps: Vec<String>,
+    advice: Option<String>,
+}
+
+/// Quick connectivity check used by the UI to re-test after a repair or to
+/// decide whether to offer the "Fix connection" flow.
+#[tauri::command]
+async fn check_tv_reachable() -> Result<bool, String> {
+    let cfg = load_config();
+    if cfg.tv_ip.trim().is_empty() {
+        return Ok(false);
+    }
+    Ok(tv_control_reachable(cfg.tv_ip.trim()).await)
+}
+
+/// Attempt to automatically restore TV connectivity from the Mac side.
+///
+/// Non-disruptive steps always run: re-discover the TV's current IP via mDNS
+/// (updating the saved IP when DHCP moved it) and send Wake-on-LAN. When
+/// `restart_wifi` is true it also power-cycles the Mac's Wi-Fi to force a fresh
+/// association and clear a stale neighbor/reject route. Progress is streamed via
+/// "repair-progress" events; the final report says whether the TV is reachable
+/// and, if not, what must be changed on the TV/router.
+#[tauri::command]
+async fn repair_tv_connection(
+    app: tauri::AppHandle,
+    restart_wifi: bool,
+) -> Result<TvRepairReport, String> {
+    let _tv = tv_cmd_lock().lock().await;
+    let mut cfg = load_config();
+    let mut steps: Vec<String> = Vec::new();
+    let emit = |msg: &str| {
+        let _ = app.emit("repair-progress", format!("{msg}\n"));
+    };
+
+    let mut ip = cfg.tv_ip.trim().to_string();
+    let mut ip_changed = false;
+    let mut discovered = false;
+
+    macro_rules! note {
+        ($($arg:tt)*) => {{
+            let line = format!($($arg)*);
+            emit(&line);
+            steps.push(line);
+        }};
+    }
+
+    note!("Checking the configured TV address ({})…", if ip.is_empty() { "<none>" } else { &ip });
+
+    // Already reachable? Nothing to do.
+    if !ip.is_empty() && tv_control_reachable(&ip).await {
+        note!("TV is reachable. No repair needed.");
+        return Ok(TvRepairReport {
+            reachable: true,
+            ip,
+            ip_changed: false,
+            discovered: false,
+            wifi_restarted: false,
+            steps,
+            advice: None,
+        });
+    }
+
+    // Step 1 — re-discover the TV on the network via mDNS.
+    note!("Looking for the TV on the network (mDNS)…");
+    if let Some(found) = discover_lg_tv_ip().await {
+        discovered = true;
+        if !ip.is_empty() && found != ip {
+            note!("TV moved to a new address: {found} (was {ip}). Updating settings.");
+            cfg.tv_ip = found.clone();
+            let _ = save_config_to_disk(&cfg);
+            let _ = app.emit("config-updated", cfg.clone());
+            ip = found;
+            ip_changed = true;
+        } else {
+            if ip.is_empty() {
+                ip = found.clone();
+                cfg.tv_ip = found.clone();
+                let _ = save_config_to_disk(&cfg);
+                let _ = app.emit("config-updated", cfg.clone());
+                ip_changed = true;
+            }
+            note!("TV is visible via mDNS at {ip}.");
+        }
+        if tv_control_reachable(&ip).await {
+            note!("TV is now reachable at {ip}.");
+            return Ok(TvRepairReport {
+                reachable: true,
+                ip,
+                ip_changed,
+                discovered,
+                wifi_restarted: false,
+                steps,
+                advice: None,
+            });
+        }
+        note!("TV is visible but not answering control requests (Wi-Fi isolation / roamed AP).");
+    } else {
+        note!("TV not found via mDNS — it may be powered off or on another network/band.");
+    }
+
+    // Step 2 — Wake-on-LAN (wakes a TV in network standby).
+    if !cfg.tv_mac.trim().is_empty() {
+        match send_wake_on_lan(cfg.tv_mac.trim()) {
+            Ok(()) => note!("Sent Wake-on-LAN to {}.", cfg.tv_mac.trim()),
+            Err(e) => note!("Wake-on-LAN failed: {e}"),
+        }
+    } else {
+        note!("No TV MAC saved — skipping Wake-on-LAN.");
+    }
+
+    // Step 3 — optional Wi-Fi power-cycle to force a fresh association and clear
+    // a stale neighbor/reject route on the Mac.
+    let mut wifi_restarted = false;
+    #[cfg(target_os = "macos")]
+    if restart_wifi {
+        let iface = wifi_interface().await;
+        note!("Restarting Wi-Fi ({iface}) to force a fresh connection…");
+        let _ = tokio::process::Command::new("networksetup")
+            .args(["-setairportpower", &iface, "off"])
+            .output()
+            .await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = tokio::process::Command::new("networksetup")
+            .args(["-setairportpower", &iface, "on"])
+            .output()
+            .await;
+        // Give the network a few seconds to come back.
+        for _ in 0..15 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if !ip.is_empty() && tv_control_reachable(&ip).await {
+                break;
+            }
+        }
+        wifi_restarted = true;
+        note!("Wi-Fi reconnected.");
+
+        // The TV may have re-announced a different IP after we rejoined.
+        if let Some(found) = discover_lg_tv_ip().await {
+            if !found.is_empty() && found != ip {
+                note!("TV re-appeared at {found}. Updating settings.");
+                cfg.tv_ip = found.clone();
+                let _ = save_config_to_disk(&cfg);
+                let _ = app.emit("config-updated", cfg.clone());
+                ip = found;
+                ip_changed = true;
+            }
+        }
+    }
+    let _ = restart_wifi; // referenced on non-macOS to avoid unused warning
+
+    // Final re-test.
+    let reachable = !ip.is_empty() && tv_control_reachable(&ip).await;
+    let advice = if reachable {
+        note!("TV is now reachable at {ip}.");
+        None
+    } else {
+        note!("Still unable to reach the TV.");
+        Some(
+            if restart_wifi {
+                "The TV is online but isolated from this Mac on Wi-Fi. On the TV, reconnect its Wi-Fi or reboot it; if you use a mesh/extender or guest network, disable client isolation or put the TV and Mac on the same network. Wiring the TV via Ethernet also fixes this."
+            } else {
+                "Try the Wi-Fi reset below. If it still fails, reconnect the TV's Wi-Fi or reboot the TV — it's online but isolated from this Mac on the network."
+            }
+            .to_string(),
+        )
+    };
+
+    Ok(TvRepairReport {
+        reachable,
+        ip,
+        ip_changed,
+        discovered,
+        wifi_restarted,
+        steps,
+        advice,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // App entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1749,6 +2073,8 @@ pub fn run() {
             seek_to,
             get_playback_position,
             list_episodes,
+            check_tv_reachable,
+            repair_tv_connection,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
