@@ -1,6 +1,24 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { PrimeTitle } from "./types";
 
+// Markers emitted by lg-tv-connect.py / the Rust commands when the TV can't be
+// reached (off, in standby, wrong IP, or off the network). Used to surface a
+// clear "TV unreachable" state instead of a vague failure.
+const TV_UNREACHABLE_PATTERNS = [
+  /could not reach tv/i,
+  /host is down/i,
+  /timed out connecting/i,
+  /timed out after \d+s/i,
+  /may be off or unreachable/i,
+  /cannot connect to host/i,
+  /could not connect/i,
+];
+
+/** True when a log/error line indicates the TV is unreachable (not a content error). */
+export function isTvUnreachableMessage(text: string): boolean {
+  return TV_UNREACHABLE_PATTERNS.some((re) => re.test(text));
+}
+
 export async function playOnMac(
   item: PrimeTitle,
   options?: { episode?: number | null; contentId?: string | null },

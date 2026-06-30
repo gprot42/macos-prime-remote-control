@@ -13,7 +13,9 @@
  */
 import { useState, useEffect, useCallback, useRef, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { PrimeTitle } from "../types";
+import { isTvUnreachableMessage } from "../playback";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface VolumeState { volume: number | null; muted: boolean; }
@@ -354,6 +356,30 @@ export default function TVRemote({
     refreshTvPower().then((on) => { if (on) fetchVolume(); });
   }, [refreshTvPower, fetchVolume]);
 
+  // Keep the power indicator in sync with what playback actually observes:
+  // a play attempt that can't reach the TV flips us to "off/unreachable", and a
+  // successful launch confirms the TV is back. Avoids a stale green icon when
+  // the TV drops mid-session (it's only polled once at startup).
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let active = true;
+    listen<string>("play-progress", (event) => {
+      const line = event.payload ?? "";
+      if (isTvUnreachableMessage(line)) {
+        setTvOnState(false);
+      } else if (/(^|\n)\s*done\.?\s*$/i.test(line)) {
+        setTvOnState(true);
+      }
+    }).then((fn) => {
+      if (active) unlisten = fn;
+      else fn();
+    });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [setTvOnState]);
+
   const handleVolSlider = (v: number) => {
     if (!tvOnRef.current) return;
     setSlider(v);
@@ -596,17 +622,29 @@ export default function TVRemote({
                 </p>
                 <div className="flex items-center gap-1.5 mt-0.5">
                   <span className={`w-2 h-2 rounded-full shrink-0 ${
-                    playbackState === "playing"
-                      ? "bg-emerald-400 animate-pulse"
-                      : "bg-zinc-500"
+                    tvOn === false
+                      ? "bg-red-500"
+                      : playbackState === "playing"
+                        ? "bg-emerald-400 animate-pulse"
+                        : "bg-zinc-500"
                   }`} />
-                  <span className="text-xs text-zinc-400 truncate">
-                    {playbackState === "playing" ? "Playing on TV" : "Paused"}
-                    {episode != null ? ` · Episode ${episode}` : ""}
-                    {episode == null && nowPlaying.year ? ` · ${nowPlaying.year}` : ""}
+                  <span className={`text-xs truncate ${tvOn === false ? "text-red-400 font-medium" : "text-zinc-400"}`}>
+                    {tvOn === false
+                      ? "TV unreachable"
+                      : playbackState === "playing" ? "Playing on TV" : "Paused"}
+                    {tvOn !== false && episode != null ? ` · Episode ${episode}` : ""}
+                    {tvOn !== false && episode == null && nowPlaying.year ? ` · ${nowPlaying.year}` : ""}
                   </span>
                 </div>
               </>
+            ) : tvOn === false ? (
+              <div className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full shrink-0 bg-red-500" />
+                <div className="flex flex-col gap-0.5 min-w-0">
+                  <p className="text-sm text-red-400 font-semibold leading-tight">TV unreachable</p>
+                  <p className="text-xs text-red-400/70">Power it on, then press the power button</p>
+                </div>
+              </div>
             ) : (
               <div className="flex flex-col gap-0.5">
                 <p className="text-sm text-zinc-500 font-medium">Nothing playing</p>
