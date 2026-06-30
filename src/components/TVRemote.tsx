@@ -540,19 +540,21 @@ export default function TVRemote({
       setTransportErr("TV is off");
       return;
     }
-    setPbBusy(action);
+    // Pause acts as a toggle: if already paused, resume instead.
+    const effective = action === "pause" && playbackState === "paused" ? "play" : action;
+    setPbBusy(effective);
     setTransportErr(null);
     try {
-      await invoke("media_control", { action });
-      if (action === "pause") onPlaybackStateChange("paused");
-      else if (action === "play") onPlaybackStateChange("playing");
+      await invoke("media_control", { action: effective });
+      if (effective === "pause") onPlaybackStateChange("paused");
+      else if (effective === "play") onPlaybackStateChange("playing");
       else { onPlaybackStateChange("paused"); onDismissPlaying(); }
     } catch (err) {
       setTransportErr(String(err).replace(/^Error:\s*/, "").slice(0, 60));
     } finally {
       setPbBusy(null);
     }
-  }, [tvOn, onPlaybackStateChange, onDismissPlaying]);
+  }, [tvOn, playbackState, onPlaybackStateChange, onDismissPlaying]);
 
   const volPct    = vol.muted ? 0 : slider;
   const dispVol   = vol.muted ? 0 : (vol.volume ?? slider);
