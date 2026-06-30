@@ -937,6 +937,11 @@ async def start_playback(
         if not play_highlight:
             await client.button("ENTER")
             print("  Sent ENTER after focus navigation.")
+            # Safety: if the episode was already auto-playing, ENTER toggled it
+            # to PAUSE. Send PLAY immediately to recover.
+            await asyncio.sleep(PLAY_KEY_DELAY)
+            await client.button("PLAY")
+            print("  Sent PLAY to ensure playback is running.")
     elif resolved_method == "enter":
         # The Prime detail page focuses its primary Watch/Resume button by
         # default, so ENTER resumes immediately. The UP/DOWN/LEFT focus dance is
@@ -952,7 +957,13 @@ async def start_playback(
             )
         else:
             await client.button("ENTER")
-            print(f"  Sent ENTER on focused Watch/Resume button{note_detail}.")
+            # Safety: if the episode was already auto-playing (e.g. the GTI deep
+            # link started it after profile selection), ENTER toggles it to PAUSE.
+            # Send PLAY immediately to recover — if ENTER correctly started a
+            # paused video instead, PLAY is a no-op on LG WebOS.
+            await asyncio.sleep(PLAY_KEY_DELAY)
+            await client.button("PLAY")
+            print(f"  Sent ENTER+PLAY on Watch/Resume button{note_detail}.")
     else:
         raise ValueError(f"unknown play method: {resolved_method}")
 
