@@ -163,7 +163,7 @@ const QuickFixButton = memo(function QuickFixButton({
       disabled={fixing}
       onClick={onClick}
       title="Re-detect the TV and wake it (Wake-on-LAN)"
-      className="shrink-0 flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-semibold
+      className="ml-auto shrink-0 flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-semibold
                  bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white transition-colors"
     >
       {fixing ? (
