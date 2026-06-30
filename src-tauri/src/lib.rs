@@ -5,12 +5,66 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::{timeout, Duration};
 use url::Url;
 
 /// Serialize LG TV network commands — the TV accepts one WebSocket client at a time.
 fn tv_cmd_lock() -> &'static AsyncMutex<()> {
     static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| AsyncMutex::new(()))
+}
+
+/// Upper bound for short TV commands (power, transport, seek, position, MAC).
+/// A stalled command must never outlive this, or it would hold `tv_cmd_lock`
+/// and silently block every later TV command (including playback).
+const TV_CMD_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Upper bound for a full play launch. The Python flow includes profile-picker
+/// and title-page waits (~20-30s), so this is generous — but still bounded so a
+/// hung launch can't wedge the shared lock forever.
+const TV_PLAY_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Run a `lg-tv-connect.py` subprocess to completion, capturing its output, but
+/// never block forever: if it exceeds `limit` the child is killed and an error
+/// is returned. This guarantees the shared TV command lock is always released
+/// even when the TV is off, unreachable, or its WebSocket stalls mid-command.
+async fn run_tv_command(
+    mut command: tokio::process::Command,
+    limit: Duration,
+) -> Result<std::process::Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Failed to run lg-tv-connect.py: {e}"))?;
+
+    match timeout(limit, child.wait()).await {
+        Ok(status) => {
+            let status = status.map_err(|e| format!("Process error: {e}"))?;
+            // Output from these commands is a single small JSON/text line, well
+            // under the OS pipe buffer, so reading after exit cannot deadlock.
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            if let Some(mut out) = child.stdout.take() {
+                let _ = out.read_to_end(&mut stdout).await;
+            }
+            if let Some(mut err) = child.stderr.take() {
+                let _ = err.read_to_end(&mut stderr).await;
+            }
+            Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
+        }
+        Err(_) => {
+            // Kill the stalled child so the lock is freed for the next command.
+            let _ = child.kill().await;
+            Err(format!(
+                "TV command timed out after {}s — the TV may be off or unreachable.",
+                limit.as_secs()
+            ))
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -727,15 +781,9 @@ async fn run_get_mac_cmd(ip: &str) -> Result<Option<String>, String> {
         .to_string_lossy()
         .to_string();
 
-    let output = tokio::process::Command::new(&python)
-        .arg(&script)
-        .arg(ip)
-        .arg("--get-mac")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run lg-tv-connect.py: {e}"))?;
+    let mut cmd = tokio::process::Command::new(&python);
+    cmd.arg(&script).arg(ip).arg("--get-mac");
+    let output = run_tv_command(cmd, TV_CMD_TIMEOUT).await?;
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr).to_string();
@@ -1117,12 +1165,7 @@ async fn run_tv_volume_cmd_with_cfg(
         cmd.arg(a);
     }
 
-    let output = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run lg-tv-connect.py: {e}"))?;
+    let output = run_tv_command(cmd, TV_CMD_TIMEOUT).await?;
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr).to_string();
@@ -1227,15 +1270,9 @@ async fn get_tv_power() -> Result<TvPowerState, String> {
         .to_string_lossy()
         .to_string();
 
-    let output = tokio::process::Command::new(&python)
-        .arg(&script)
-        .arg(&cfg.tv_ip)
-        .arg("--power-state")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run lg-tv-connect.py: {e}"))?;
+    let mut cmd = tokio::process::Command::new(&python);
+    cmd.arg(&script).arg(&cfg.tv_ip).arg("--power-state");
+    let output = run_tv_command(cmd, TV_CMD_TIMEOUT).await?;
 
     if !output.status.success() {
         return Ok(TvPowerState { on: false });
@@ -1287,12 +1324,7 @@ async fn tv_power(app: tauri::AppHandle, action: String) -> Result<Option<Volume
         cmd.arg("--tv-mac").arg(cfg.tv_mac.trim());
     }
 
-    let output = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run lg-tv-connect.py: {e}"))?;
+    let output = run_tv_command(cmd, TV_CMD_TIMEOUT).await?;
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr).to_string();
@@ -1342,16 +1374,9 @@ async fn run_tv_media_cmd(flag: &str) -> Result<(), String> {
         .to_string_lossy()
         .to_string();
 
-    let output = tokio::process::Command::new(&python)
-        .current_dir(&root)
-        .arg(&script)
-        .arg(&cfg.tv_ip)
-        .arg(flag)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run lg-tv-connect.py: {e}"))?;
+    let mut cmd = tokio::process::Command::new(&python);
+    cmd.current_dir(&root).arg(&script).arg(&cfg.tv_ip).arg(flag);
+    let output = run_tv_command(cmd, TV_CMD_TIMEOUT).await?;
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr).to_string();
@@ -1433,6 +1458,9 @@ async fn play_on_tv(
 ) -> Result<String, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    // Emit before taking the lock so the UI shows immediate feedback even when
+    // another TV command is still in flight ahead of this one.
+    let _ = app.emit("play-progress", "Preparing to play...\n".to_string());
     let _tv = tv_cmd_lock().lock().await;
     let cfg = load_config();
     let root = resolve_project_root(&cfg);
@@ -1497,10 +1525,23 @@ async fn play_on_tv(
         }
     });
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| format!("Process error: {e}"))?;
+    let status = match timeout(TV_PLAY_TIMEOUT, child.wait()).await {
+        Ok(res) => res.map_err(|e| format!("Process error: {e}"))?,
+        Err(_) => {
+            // Stalled launch — kill it so the shared TV lock is released and
+            // future plays aren't blocked forever.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            let msg = format!(
+                "Playback timed out after {}s — the TV may be off or unreachable.",
+                TV_PLAY_TIMEOUT.as_secs()
+            );
+            let _ = app.emit("play-progress", format!("{msg}\n"));
+            return Err(msg);
+        }
+    };
 
     let _ = stdout_task.await;
     let _ = stderr_task.await;
@@ -1553,12 +1594,7 @@ async fn seek_to(seconds: f64, content_id: Option<String>, episode: Option<i32>)
         }
     }
 
-    let output = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run lg-tv-connect.py: {e}"))?;
+    let output = run_tv_command(cmd, TV_CMD_TIMEOUT).await?;
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr).to_string();
@@ -1581,15 +1617,9 @@ async fn get_playback_position() -> Result<serde_json::Value, String> {
         .to_string_lossy()
         .to_string();
 
-    let output = tokio::process::Command::new(&python)
-        .arg(&script)
-        .arg(&cfg.tv_ip)
-        .arg("--get-position")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run lg-tv-connect.py: {e}"))?;
+    let mut cmd = tokio::process::Command::new(&python);
+    cmd.arg(&script).arg(&cfg.tv_ip).arg("--get-position");
+    let output = run_tv_command(cmd, TV_CMD_TIMEOUT).await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let json_line = stdout
@@ -1615,17 +1645,13 @@ async fn list_episodes(content_id: String) -> Result<String, String> {
         .to_string_lossy()
         .to_string();
 
-    let output = tokio::process::Command::new(&python)
-        .arg(&script)
+    let mut cmd = tokio::process::Command::new(&python);
+    cmd.arg(&script)
         .arg(&cfg.tv_ip)
         .arg("--list-episodes")
         .arg("--content-id")
-        .arg(&content_id)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run lg-tv-connect.py: {e}"))?;
+        .arg(&content_id);
+    let output = run_tv_command(cmd, TV_CMD_TIMEOUT).await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let json_line = stdout
