@@ -100,3 +100,27 @@ The circular-arrow button reloads from cache; **Refresh** always fetches live da
 ```
 
 Requires Node.js, Rust, and Python 3.
+
+## Troubleshooting
+
+### "TV unreachable" / playback won't start
+
+If the app shows **TV unreachable** (the remote bar turns red) or a play fails
+to connect, the Mac can't reach the LG TV over the network. A common, confusing
+case is when the TV is **on and visible** (it shows up in Bonjour/your router)
+but still unreachable — because discovery uses multicast while control uses
+unicast, which Wi-Fi client isolation or band/AP separation can block.
+
+Run the repair script:
+
+```bash
+scripts/fix-tv-connection.sh                 # diagnose + Mac-side repairs
+scripts/fix-tv-connection.sh --restart-wifi  # also power-cycle Wi-Fi
+```
+
+It re-discovers the TV's current IP via mDNS (and offers to update the config if
+DHCP moved it), clears the stale ARP/reject route, sends Wake-on-LAN, and
+re-tests — then tells you exactly what to change on the TV or router if needed.
+
+See [docs/troubleshooting-tv-connection.md](docs/troubleshooting-tv-connection.md)
+for the full diagnosis, manual commands, and fixes.
