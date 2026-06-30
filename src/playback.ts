@@ -12,6 +12,9 @@ const TV_UNREACHABLE_PATTERNS = [
   /may be off or unreachable/i,
   /cannot connect to host/i,
   /could not connect/i,
+  /no route to host/i,
+  /connection refused/i,
+  /network is unreachable/i,
 ];
 
 /** True when a log/error line indicates the TV is unreachable (not a content error). */

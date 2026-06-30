@@ -621,11 +621,17 @@ export default function TVRemote({
       else if (effective === "play") onPlaybackStateChange("playing");
       else { onPlaybackStateChange("paused"); onDismissPlaying(); }
     } catch (err) {
-      setTransportErr(String(err).replace(/^Error:\s*/, "").slice(0, 60));
+      const msg = String(err).replace(/^Error:\s*/, "");
+      if (isTvUnreachableMessage(msg)) {
+        setTvOnState(false);
+        setTransportErr("TV unreachable");
+      } else {
+        setTransportErr(msg.slice(0, 60));
+      }
     } finally {
       setPbBusy(null);
     }
-  }, [tvOn, playbackState, onPlaybackStateChange, onDismissPlaying]);
+  }, [tvOn, playbackState, onPlaybackStateChange, onDismissPlaying, setTvOnState]);
 
   const volPct    = vol.muted ? 0 : slider;
   const dispVol   = vol.muted ? 0 : (vol.volume ?? slider);
