@@ -99,7 +99,7 @@ const TransportBar = memo(function TransportBar({
 
   return (
     <div className={`flex flex-col items-center gap-0.5 shrink-0 ${
-      tvOn === false ? "opacity-40 pointer-events-none" : ""
+      tvOn === false ? "opacity-40" : ""
     }`}>
       <div className="flex items-center gap-1.5">
         <TransportButton
@@ -607,16 +607,14 @@ export default function TVRemote({
   const [transportErr, setTransportErr] = useState<string | null>(null);
 
   const handleTransport = useCallback(async (action: TransportAction) => {
-    if (tvOn === false) {
-      setTransportErr("TV is off");
-      return;
-    }
     // Pause acts as a toggle: if already paused, resume instead.
     const effective = action === "pause" && playbackState === "paused" ? "play" : action;
     setPbBusy(effective);
     setTransportErr(null);
     try {
       await invoke("media_control", { action: effective });
+      // Command succeeded — TV is clearly reachable; reset any stale unreachable state.
+      setTvOnState(true);
       if (effective === "pause") onPlaybackStateChange("paused");
       else if (effective === "play") onPlaybackStateChange("playing");
       else { onPlaybackStateChange("paused"); onDismissPlaying(); }
@@ -631,7 +629,7 @@ export default function TVRemote({
     } finally {
       setPbBusy(null);
     }
-  }, [tvOn, playbackState, onPlaybackStateChange, onDismissPlaying, setTvOnState]);
+  }, [playbackState, onPlaybackStateChange, onDismissPlaying, setTvOnState]);
 
   const volPct    = vol.muted ? 0 : slider;
   const dispVol   = vol.muted ? 0 : (vol.volume ?? slider);
