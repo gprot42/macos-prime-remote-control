@@ -60,10 +60,14 @@ function safeId(id: string) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-function parseResult(raw: string): { data: PrimeTitle[]; stale: boolean } {
+function parseResult(raw: string): { data: PrimeTitle[]; stale: boolean; staleReason?: string } {
   if (raw.startsWith("__STALE__")) {
-    try { return { data: JSON.parse(raw.slice(9)), stale: true }; }
-    catch { return { data: [], stale: true }; }
+    const rest = raw.slice(9);
+    const sep = rest.indexOf("\u0000");
+    const reason = sep >= 0 ? rest.slice(0, sep) : undefined;
+    const jsonStr = sep >= 0 ? rest.slice(sep + 1) : rest;
+    try { return { data: JSON.parse(jsonStr), stale: true, staleReason: reason }; }
+    catch { return { data: [], stale: true, staleReason: reason }; }
   }
   try { return { data: JSON.parse(raw), stale: false }; }
   catch { return { data: [], stale: false }; }
@@ -78,6 +82,7 @@ export default function App() {
   const [loadState, setLoadState]   = useState<LoadState>("idle");
   const [error, setError]           = useState<string | null>(null);
   const [isStale, setIsStale]       = useState(false);
+  const [staleReason, setStaleReason] = useState<string | null>(null);
   const [cacheAgeSecs, setCacheAge] = useState<number | null>(null);
   const [primeRegion, setPrimeRegion] = useState<string | null>(null);
   const [publicIp, setPublicIp] = useState<{ ip: string; country: string } | null>(null);
@@ -421,6 +426,7 @@ export default function App() {
       setLoadState("loading");
       setError(null);
       setIsStale(false);
+      setStaleReason(null);
       setSearchQuery("");
       if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
 
@@ -437,9 +443,10 @@ export default function App() {
           collection: slug,
           forceRefresh,
         });
-        const { data, stale } = parseResult(raw);
+        const { data, stale, staleReason: reason } = parseResult(raw);
         setAllItems(data);
         setIsStale(stale);
+        setStaleReason(stale ? reason ?? null : null);
         setLoadState("done");
 
         if (config.detect_vpn_region) {
@@ -505,6 +512,7 @@ export default function App() {
       setSearching(true);
       setError(null);
       setIsStale(false);
+      setStaleReason(null);
 
       invoke<number | null>("search_cache_age", { query: q.trim() })
         .then((age) => setCacheAge(age ?? null))
@@ -515,9 +523,10 @@ export default function App() {
           query: q.trim(),
           forceRefresh: false,
         });
-        const { data, stale } = parseResult(raw);
+        const { data, stale, staleReason: reason } = parseResult(raw);
         setAllItems(data);
         setIsStale(stale);
+        setStaleReason(stale ? reason ?? null : null);
         setLoadState("done");
 
         // Prefetch images for search results too
@@ -543,14 +552,17 @@ export default function App() {
       setSearching(true);
       setError(null);
       setIsStale(false);
+      setStaleReason(null);
       setCacheAge(null);
       try {
         const raw = await invoke<string>("search_catalog", {
           query: searchQuery.trim(),
           forceRefresh: true,
         });
-        const { data } = parseResult(raw);
+        const { data, stale, staleReason: reason } = parseResult(raw);
         setAllItems(data);
+        setIsStale(stale);
+        setStaleReason(stale ? reason ?? null : null);
         setLoadState("done");
       } catch (err) {
         setError(String(err));
@@ -930,7 +942,8 @@ export default function App() {
                 />
               </svg>
               <p className="text-orange-300 text-xs">
-                Showing stale cached data — live fetch failed.{" "}
+                Showing stale cached data — live fetch failed
+                {staleReason ? <>: <span className="text-orange-200">{staleReason}</span></> : "."}{" "}
                 <button onClick={handleHardRefresh} className="underline hover:text-orange-200">
                   Try again
                 </button>

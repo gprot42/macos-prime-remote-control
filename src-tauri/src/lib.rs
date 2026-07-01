@@ -493,6 +493,21 @@ fn write_cache(key: &str, json_str: &str) -> Result<(), String> {
     std::fs::write(&path, serialized).map_err(|e| e.to_string())
 }
 
+/// Pull out the last non-empty line of a subprocess's stderr, so a stale-fallback
+/// banner can show a concrete reason (e.g. "login required", timeout, network
+/// error) instead of a generic message that never changes across retries.
+fn last_error_line(stderr: &str) -> String {
+    stderr
+        .lines()
+        .rev()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("live fetch failed")
+        .chars()
+        .take(200)
+        .collect()
+}
+
 /// Return seconds since the cache entry was written, or None if no cache.
 fn cache_age_secs(key: &str) -> Option<u64> {
     let path = cache_path(key);
@@ -1032,12 +1047,12 @@ async fn load_catalog(collection: String, force_refresh: bool) -> Result<String,
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr).to_string();
-        // On failure, try stale cache as fallback
+        // On failure, try stale cache as fallback — but still surface the real
+        // error reason (last non-empty stderr line) so the UI isn't silently
+        // stuck showing the same generic banner on every retry.
         if let Some(stale) = read_cache(&cache_key, 30 * 24 * 3600) {
-            return Ok(format!(
-                "__STALE__{}",
-                stale
-            ));
+            let reason = last_error_line(&err);
+            return Ok(format!("__STALE__{reason}\u{0}{stale}"));
         }
         return Err(format!("prime-catalog.py failed:\n{err}"));
     }
@@ -1087,7 +1102,8 @@ async fn search_catalog(query: String, force_refresh: bool) -> Result<String, St
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr).to_string();
         if let Some(stale) = read_cache(&cache_key, 7 * 24 * 3600) {
-            return Ok(format!("__STALE__{stale}"));
+            let reason = last_error_line(&err);
+            return Ok(format!("__STALE__{reason}\u{0}{stale}"));
         }
         return Err(format!("prime-catalog.py search failed:\n{err}"));
     }
