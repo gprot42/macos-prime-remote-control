@@ -28,6 +28,8 @@ interface TVRemoteProps {
   cachedImageSrc?: string;
   /** Configured default TV volume (0–100), used before the TV reports its level. */
   defaultTvVolume?: number;
+  /** Position (seconds) playback was launched at, e.g. via the "Start at" field. */
+  initialPositionSeconds?: number | null;
   onPlaybackStateChange: (s: PlaybackState) => void;
   onDismissPlaying: () => void;
 }
@@ -339,7 +341,7 @@ function VerticalSlider({ value, muted, onChange }: {
 // ─── Main component ───────────────────────────────────────────────────────────
 export default function TVRemote({
   nowPlaying, episode, playbackState, cachedImageSrc,
-  defaultTvVolume = 13,
+  defaultTvVolume = 13, initialPositionSeconds = null,
   onPlaybackStateChange, onDismissPlaying,
 }: TVRemoteProps) {
 
@@ -478,10 +480,13 @@ export default function TVRemote({
   const displayPos     = seekPreview ?? pos;   // show preview during drag
   const knownDuration  = totalSecs !== null;
 
-  // Reset when a new title starts
+  // Reset when a new title starts — anchor to the requested start position
+  // (e.g. "Start at" in the play dialog) instead of always 0, so the dock
+  // accurately reflects where playback actually began.
   useEffect(() => {
-    playRef.current = { pos: 0, time: Date.now() };
-    setPos(0); setSeekPreview(null);
+    const start = initialPositionSeconds ?? 0;
+    playRef.current = { pos: start, time: Date.now() };
+    setPos(start); setSeekPreview(null);
     isDraggingRef.current = false;
   }, [nowPlaying?.content_id]); // eslint-disable-line
 

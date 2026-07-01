@@ -28,7 +28,7 @@ interface PlayDialogProps {
   ) => void;
   onClose: () => void;
   onOpenSettings: () => void;
-  onStartPlaying: (item: PrimeTitle, episode: number | null) => void;
+  onStartPlaying: (item: PrimeTitle, episode: number | null, startSeconds?: number | null) => void;
   onPlayed: (item: PrimeTitle) => void;
 }
 
@@ -267,12 +267,13 @@ export default function PlayDialog({
     const epRow = hasEpisodeList ? episodes[epNum - 1] : null;
     const epRuntimeMin = epRow?.runtime_min ?? null;
     const playedItem = epRuntimeMin ? { ...item, runtime_min: epRuntimeMin } : item;
-    onStartPlaying(playedItem, useLaunchId ? epNum : ep);
+    const startSeconds = parseTimeToSeconds(startAt);
+    onStartPlaying(playedItem, useLaunchId ? epNum : ep, startSeconds);
     try {
       await playOnTv(item, { tv_ip: config.tv_ip, profile }, {
         contentId: useLaunchId,
         episode: ep,
-        startSeconds: parseTimeToSeconds(startAt),
+        startSeconds,
       });
       setPlayState("done");
       onPlayed(item);

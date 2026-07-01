@@ -923,6 +923,74 @@ fn get_prime_region() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn public_ip_state_path() -> PathBuf {
+    cache_dir().join("public_ip.txt")
+}
+
+fn read_stored_public_ip() -> Option<(String, String)> {
+    let raw = std::fs::read_to_string(public_ip_state_path()).ok()?;
+    let mut parts = raw.trim().splitn(2, '|');
+    let ip = parts.next()?.to_string();
+    let country = parts.next().unwrap_or("").to_string();
+    if ip.is_empty() {
+        None
+    } else {
+        Some((ip, country))
+    }
+}
+
+fn write_stored_public_ip(ip: &str, country: &str) -> Result<(), String> {
+    ensure_dir(&public_ip_state_path())?;
+    std::fs::write(public_ip_state_path(), format!("{ip}|{country}")).map_err(|e| e.to_string())
+}
+
+/// Detect the outgoing (public) IP address and its country, as seen by an external
+/// service — i.e. what Prime Video / Amazon sees, which reflects the active VPN exit.
+fn detect_public_ip() -> Option<(String, String)> {
+    let response = ureq::get("https://ipinfo.io/json")
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
+        .timeout(std::time::Duration::from_secs(5))
+        .call()
+        .ok()?;
+    let body = response.into_string().ok()?;
+    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let ip = json.get("ip")?.as_str()?.to_string();
+    let country = json
+        .get("country")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    if ip.is_empty() {
+        None
+    } else {
+        Some((ip, country))
+    }
+}
+
+/// Return the outgoing public IP address and country (e.g. the VPN exit), so the
+/// user can confirm which network/location Prime Video sees them from.
+#[tauri::command]
+fn get_public_ip() -> serde_json::Value {
+    let cfg = load_config();
+    if !cfg.detect_vpn_region {
+        return serde_json::json!({ "ip": null, "country": null });
+    }
+    match detect_public_ip() {
+        Some((ip, country)) => {
+            let _ = write_stored_public_ip(&ip, &country);
+            serde_json::json!({ "ip": ip, "country": country })
+        }
+        None => match read_stored_public_ip() {
+            Some((ip, country)) => serde_json::json!({ "ip": ip, "country": country }),
+            None => serde_json::json!({ "ip": null, "country": null }),
+        },
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tauri commands — catalog
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2152,6 +2220,7 @@ pub fn run() {
             search_cache_age,
             clear_all_cache,
             get_prime_region,
+            get_public_ip,
             prefetch_images,
             list_cached_images,
             get_image_server_port,

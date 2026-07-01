@@ -80,6 +80,7 @@ export default function App() {
   const [isStale, setIsStale]       = useState(false);
   const [cacheAgeSecs, setCacheAge] = useState<number | null>(null);
   const [primeRegion, setPrimeRegion] = useState<string | null>(null);
+  const [publicIp, setPublicIp] = useState<{ ip: string; country: string } | null>(null);
 
   // Collection / bookmarks view
   const [viewMode, setViewMode] = useState<ViewMode>("catalog");
@@ -113,6 +114,7 @@ export default function App() {
   // Now-playing (drives the TVRemote bar)
   const [nowPlaying, setNowPlaying]         = useState<PrimeTitle | null>(null);
   const [nowPlayingEpisode, setNPEpisode]   = useState<number | null>(null);
+  const [nowPlayingStart, setNPStart]       = useState<number | null>(null);
   const [playbackState, setPlaybackState]   = useState<PlaybackState>("playing");
 
   const stopTvPlayback = useCallback(async () => {
@@ -124,6 +126,7 @@ export default function App() {
     setPlaybackState("paused");
     setNowPlaying(null);
     setNPEpisode(null);
+    setNPStart(null);
   }, []);
 
   // Escape stops TV playback when something is playing (same as the stop button).
@@ -224,10 +227,14 @@ export default function App() {
   useEffect(() => {
     if (!config.detect_vpn_region) {
       setPrimeRegion(null);
+      setPublicIp(null);
       return;
     }
     invoke<string>("get_prime_region")
       .then((region) => setPrimeRegion(region !== "unknown" ? region : null))
+      .catch(() => {});
+    invoke<{ ip: string | null; country: string | null }>("get_public_ip")
+      .then((info) => setPublicIp(info.ip ? { ip: info.ip, country: info.country ?? "" } : null))
       .catch(() => {});
   }, [config.detect_vpn_region]);
 
@@ -326,6 +333,7 @@ export default function App() {
       setSelectedEpisode(null);
       setNowPlaying(bookmark.item);
       setNPEpisode(episodeNum);
+      setNPStart(null);
       setPlaybackState("playing");
 
       try {
@@ -438,8 +446,12 @@ export default function App() {
           invoke<string>("get_prime_region")
             .then((region) => setPrimeRegion(region !== "unknown" ? region : null))
             .catch(() => {});
+          invoke<{ ip: string | null; country: string | null }>("get_public_ip")
+            .then((info) => setPublicIp(info.ip ? { ip: info.ip, country: info.country ?? "" } : null))
+            .catch(() => {});
         } else {
           setPrimeRegion(null);
+          setPublicIp(null);
         }
 
         invoke<number | null>("collection_cache_age", { collection: slug })
@@ -669,11 +681,34 @@ export default function App() {
               </button>
             )}
 
-            {config.detect_vpn_region && primeRegion && showCatalogData && !searchQuery && (
-              <div className="hidden sm:flex items-center gap-1.5 text-[11px] px-2.5 py-1
+            {config.detect_vpn_region && primeRegion && showCatalogData && (
+              <div
+                title={`Prime Video catalog region: ${primeRegion} (based on your current VPN/network exit location). Search results and availability are limited to this region's catalog.`}
+                className="hidden sm:flex items-center gap-1.5 text-[11px] px-2.5 py-1
                               rounded-full border bg-zinc-800/60 border-zinc-700 text-zinc-400">
+                <svg className="w-3 h-3 text-zinc-500" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round"
+                    d="M12 21c4.5-4.5 7-8.25 7-11.5A7 7 0 105 9.5C5 12.75 7.5 16.5 12 21z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 12a2.5 2.5 0 100-5 2.5 2.5 0 000 5z" />
+                </svg>
                 <span className="text-zinc-500">Region</span>
                 <span className="font-medium text-zinc-300">{primeRegion}</span>
+              </div>
+            )}
+
+            {config.detect_vpn_region && publicIp && (
+              <div
+                title={`Outgoing VPN IP address: ${publicIp.ip}${publicIp.country ? ` (${publicIp.country})` : ""}. This is the public address Prime Video sees your connection from.`}
+                className="hidden sm:flex items-center gap-1.5 text-[11px] px-2.5 py-1
+                              rounded-full border bg-zinc-800/60 border-zinc-700 text-zinc-400">
+                <svg className="w-3 h-3 text-zinc-500" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round"
+                    d="M9 3.75H6.912a2.25 2.25 0 00-2.15 1.588L2.35 13.177a2.25 2.25 0 00-.1.661V18a2.25 2.25 0 002.25 2.25h15a2.25 2.25 0 002.25-2.25v-4.162c0-.224-.034-.447-.1-.661L19.24 5.338a2.25 2.25 0 00-2.15-1.588H15M2.25 13.5h3.86a2.25 2.25 0 012.012 1.244l.256.512a2.25 2.25 0 002.013 1.244h3.218a2.25 2.25 0 002.013-1.244l.256-.512a2.25 2.25 0 012.013-1.244h3.859" />
+                </svg>
+                <span className="font-mono text-zinc-300">{publicIp.ip}</span>
+                {publicIp.country && (
+                  <span className="font-medium text-zinc-400">· {publicIp.country}</span>
+                )}
               </div>
             )}
 
@@ -690,10 +725,31 @@ export default function App() {
               </div>
             )}
 
-            {/* TV chip */}
-            <div className="hidden sm:flex items-center gap-1.5 bg-zinc-800/60 rounded-full px-3 py-1">
-              <div className="w-2 h-2 rounded-full bg-emerald-500" />
-              <span className="text-xs text-zinc-400 font-mono">{config.tv_ip}</span>
+            {/* TV chip (with outgoing VPN IP stacked underneath) */}
+            <div className="hidden sm:flex flex-col justify-center gap-0.5 bg-zinc-800/60 rounded-xl px-3 py-1">
+              <div title={`LG TV at ${config.tv_ip}`} className="flex items-center gap-1.5">
+                <svg className="w-3.5 h-3.5 text-zinc-400" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+                  <rect x="2.75" y="4.75" width="18.5" height="12.5" rx="1.75" strokeLinecap="round" strokeLinejoin="round" />
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M8.5 20.25h7M12 17.25v3" />
+                </svg>
+                <div className="w-2 h-2 rounded-full bg-emerald-500" />
+                <span className="text-xs text-zinc-400 font-mono">{config.tv_ip}</span>
+              </div>
+              {config.detect_vpn_region && publicIp && (
+                <div
+                  title={`Outgoing VPN IP address: ${publicIp.ip}${publicIp.country ? ` (${publicIp.country})` : ""}. This is the public address Prime Video sees your connection from.`}
+                  className="flex items-center gap-1.5"
+                >
+                  <svg className="w-3.5 h-3.5 text-zinc-500" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round"
+                      d="M9 3.75H6.912a2.25 2.25 0 00-2.15 1.588L2.35 13.177a2.25 2.25 0 00-.1.661V18a2.25 2.25 0 002.25 2.25h15a2.25 2.25 0 002.25-2.25v-4.162c0-.224-.034-.447-.1-.661L19.24 5.338a2.25 2.25 0 00-2.15-1.588H15M2.25 13.5h3.86a2.25 2.25 0 012.012 1.244l.256.512a2.25 2.25 0 002.013 1.244h3.218a2.25 2.25 0 002.013-1.244l.256-.512a2.25 2.25 0 012.013-1.244h3.859" />
+                  </svg>
+                  <span className="text-xs text-zinc-500 font-mono">{publicIp.ip}</span>
+                  {publicIp.country && (
+                    <span className="text-xs font-medium text-zinc-500">· {publicIp.country}</span>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* Soft reload */}
@@ -952,10 +1008,11 @@ export default function App() {
             setSelectedLaunchContentId(null);
             setShowSettings(true);
           }}
-          onStartPlaying={(item, episode) => {
+          onStartPlaying={(item, episode, startSeconds) => {
             // Show in the dock immediately — before the TV command completes
             setNowPlaying(item);
             setNPEpisode(episode);
+            setNPStart(startSeconds != null && startSeconds >= 1 ? startSeconds : null);
             setPlaybackState("playing");
           }}
           onPlayed={() => {
@@ -988,6 +1045,7 @@ export default function App() {
       <TVRemote
         nowPlaying={nowPlaying ?? selectedItem}
         episode={nowPlaying ? nowPlayingEpisode : null}
+        initialPositionSeconds={nowPlaying ? nowPlayingStart : null}
         defaultTvVolume={config.default_tv_volume ?? 13}
         playbackState={nowPlaying ? playbackState : "paused"}
         cachedImageSrc={(() => {
@@ -999,7 +1057,7 @@ export default function App() {
             : undefined;
         })()}
         onPlaybackStateChange={setPlaybackState}
-        onDismissPlaying={() => { setNowPlaying(null); setNPEpisode(null); }}
+        onDismissPlaying={() => { setNowPlaying(null); setNPEpisode(null); setNPStart(null); }}
       />
     </div>
   );
