@@ -24,7 +24,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import ssl
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -119,18 +121,26 @@ class PrimeTitle:
         return "-"
 
 
-def fetch_html(url: str, *, timeout: float = 20.0) -> str:
+def fetch_html(url: str, *, timeout: float = 20.0, retries: int = 3) -> str:
     req = urllib.request.Request(
         url,
         headers={"User-Agent": USER_AGENT, "Accept-Language": "en-GB,en;q=0.9"},
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"HTTP {exc.code} for {url}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Could not fetch {url}: {exc.reason}") from exc
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"HTTP {exc.code} for {url}") from exc
+        except (urllib.error.URLError, ssl.SSLError, ConnectionError, TimeoutError) as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            reason = getattr(exc, "reason", exc)
+            raise RuntimeError(f"Could not fetch {url}: {reason}") from exc
+    raise RuntimeError(f"Could not fetch {url}: {last_exc}")
 
 
 def parse_json_blobs(html: str) -> list[Any]:
@@ -362,7 +372,7 @@ class SwiftRequestParams:
     variant: str = "Desktop"
 
 
-def fetch_json(url: str, *, timeout: float = 20.0) -> Any:
+def fetch_json(url: str, *, timeout: float = 20.0, retries: int = 3) -> Any:
     req = urllib.request.Request(
         url,
         headers={
@@ -372,15 +382,23 @@ def fetch_json(url: str, *, timeout: float = 20.0) -> Any:
             "Accept-Language": "en-US,en;q=0.9",
         },
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8", errors="replace"))
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"HTTP {exc.code} for {url}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Could not fetch {url}: {exc.reason}") from exc
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid JSON from {url}") from exc
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"HTTP {exc.code} for {url}") from exc
+        except (urllib.error.URLError, ssl.SSLError, ConnectionError, TimeoutError) as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            reason = getattr(exc, "reason", exc)
+            raise RuntimeError(f"Could not fetch {url}: {reason}") from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Invalid JSON from {url}") from exc
+    raise RuntimeError(f"Could not fetch {url}: {last_exc}")
 
 
 def extract_swift_params(html: str) -> SwiftRequestParams | None:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import ssl
+import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -79,19 +81,28 @@ def fetch_detail_html(
     *,
     locale: str = "en-GB,en;q=0.9",
     timeout: float = 20.0,
+    retries: int = 3,
 ) -> str:
     url = detail_url(content_id)
     req = urllib.request.Request(
         url,
         headers={"User-Agent": USER_AGENT, "Accept-Language": locale},
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"HTTP {exc.code} for {url}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Could not fetch {url}: {exc.reason}") from exc
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"HTTP {exc.code} for {url}") from exc
+        except (urllib.error.URLError, ssl.SSLError, ConnectionError, TimeoutError) as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            reason = getattr(exc, "reason", exc)
+            raise RuntimeError(f"Could not fetch {url}: {reason}") from exc
+    raise RuntimeError(f"Could not fetch {url}: {last_exc}")
 
 
 def parse_json_blobs(html: str) -> list[object]:

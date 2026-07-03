@@ -708,22 +708,6 @@ export default function App() {
               </div>
             )}
 
-            {config.detect_vpn_region && publicIp && (
-              <div
-                title={`Outgoing VPN IP address: ${publicIp.ip}${publicIp.country ? ` (${publicIp.country})` : ""}. This is the public address Prime Video sees your connection from.`}
-                className="hidden sm:flex items-center gap-1.5 text-[11px] px-2.5 py-1
-                              rounded-full border bg-zinc-800/60 border-zinc-700 text-zinc-400">
-                <svg className="w-3 h-3 text-zinc-500" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round"
-                    d="M9 3.75H6.912a2.25 2.25 0 00-2.15 1.588L2.35 13.177a2.25 2.25 0 00-.1.661V18a2.25 2.25 0 002.25 2.25h15a2.25 2.25 0 002.25-2.25v-4.162c0-.224-.034-.447-.1-.661L19.24 5.338a2.25 2.25 0 00-2.15-1.588H15M2.25 13.5h3.86a2.25 2.25 0 012.012 1.244l.256.512a2.25 2.25 0 002.013 1.244h3.218a2.25 2.25 0 002.013-1.244l.256-.512a2.25 2.25 0 012.013-1.244h3.859" />
-                </svg>
-                <span className="font-mono text-zinc-300">{publicIp.ip}</span>
-                {publicIp.country && (
-                  <span className="font-medium text-zinc-400">· {publicIp.country}</span>
-                )}
-              </div>
-            )}
-
             {cacheAgeSecs !== null && showCatalogData && !searchQuery && (
               <div className={`hidden sm:flex items-center gap-1.5 text-[11px] px-2.5 py-1
                               rounded-full border ${isStale
