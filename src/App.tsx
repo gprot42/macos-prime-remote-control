@@ -576,10 +576,10 @@ export default function App() {
   };
 
   // ── Filtered groups ─────────────────────────────────────────────────────────
-  const sourceItems = useMemo<PrimeTitle[]>(
-    () => (viewMode === "bookmarks" ? bookmarks.map((b) => b.item) : allItems),
-    [viewMode, bookmarks, allItems]
-  );
+  const sourceItems = useMemo<PrimeTitle[]>(() => {
+    if (viewMode === "bookmarks") return bookmarks.map((b) => b.item);
+    return allItems;
+  }, [viewMode, bookmarks, allItems]);
 
   const filteredGroups = useMemo<CatalogGroup[]>(() => {
     const items = sourceItems.filter((item) => {
