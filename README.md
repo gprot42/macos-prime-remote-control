@@ -2,9 +2,15 @@
 
 A Mac app for browsing Prime Video and sending what you want to watch straight to your LG TV — with a remote control built in.
 
-## What it does
+## Features
 
-Browse Prime Video collections on your Mac, search for titles, and play them on your TV with one click. For TV shows, pick the episode you want. While something is playing, use the on-screen remote to pause, skip, adjust volume, and more.
+- **Browse Prime Video on your Mac** — Scroll collections like Included with Prime, New & Upcoming, Top Rated, and genre tabs (Action, Comedy, Horror, etc.), with Movies / TV Shows filters.
+- **Play to your LG TV in one click** — Send movies or TV episodes straight to the TV over the network; no need to navigate Prime on the TV remote.
+- **Built-in TV remote** — While something plays on the TV, use the docked remote bar for play/pause/stop, seek, and volume control.
+- **Search the catalog** — Find titles across Prime Video with debounced search and cached results for fast repeat lookups.
+- **Bookmarks** — Save movies, series, or individual episodes from the card UI or right-click menu; open them later from a dedicated Bookmarks view.
+- **Play on Mac or TV** — Choose TV playback (default) or open Prime Video in an in-app Mac window; set the default in Settings.
+- **VPN-aware regional caching** — Detects your Prime region (UK, US, etc.), caches catalog data per region, and auto-clears stale cache when your VPN region changes.
 
 By default, the catalog shows titles included with your Prime subscription. You can turn on channel add-ons and rent/buy titles in Settings if you want them.
 
@@ -17,6 +23,12 @@ By default, the catalog shows titles included with your Prime subscription. You 
 **Pick a title and send it to your TV**
 
 ![Choose an episode and play on your LG TV](docs/screengrab2.png)
+
+## Prerequisites
+
+Amazon Prime app installed on your LG TV and logged in.
+
+> **Note:** This does not require root access on your LG TV to run.
 
 ## Getting started
 
