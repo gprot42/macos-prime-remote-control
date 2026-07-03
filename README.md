@@ -94,10 +94,14 @@ The circular-arrow button reloads from cache; **Refresh** always fetches live da
 ## Building
 
 ```bash
-./build.sh              # release .app bundle (default)
+./build.sh              # release .app bundle + .dmg (default)
 ./build.sh --binary     # release binary only
 ./build.sh --frontend   # Vite/TypeScript only
 ```
+
+The DMG is written to `src-tauri/target/release/bundle/dmg/` and is suitable for
+GitHub Releases. Push a `v*` tag (for example `v0.2.0`) to trigger the release
+workflow in `.github/workflows/release.yml`.
 
 Requires Node.js, Rust, and Python 3.
 

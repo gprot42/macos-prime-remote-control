@@ -14,8 +14,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export LGTV_FUN_DIR="$SCRIPT_DIR"
 
 APP_NAME="Prime Remote Control"
-APP_BUNDLE="$SCRIPT_DIR/src-tauri/target/release/bundle/macos/${APP_NAME}.app"
+BUNDLE_DIR="$SCRIPT_DIR/src-tauri/target/release/bundle"
+APP_BUNDLE="$BUNDLE_DIR/macos/${APP_NAME}.app"
+DMG_DIR="$BUNDLE_DIR/dmg"
 BINARY="$SCRIPT_DIR/src-tauri/target/release/prime-remote-control"
+VERSION="$(node -p "require('$SCRIPT_DIR/package.json').version")"
+
+dmg_filename() {
+  local arch
+  case "$(uname -m)" in
+    arm64) arch="aarch64" ;;
+    x86_64) arch="x86_64" ;;
+    *) arch="$(uname -m)" ;;
+  esac
+  echo "${APP_NAME}_${VERSION}_${arch}.dmg"
+}
 
 usage() {
   sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
@@ -43,14 +56,29 @@ build_frontend() {
   (cd "$SCRIPT_DIR" && npm run build)
 }
 
+build_dmg() {
+  local dmg_path="$DMG_DIR/$(dmg_filename)"
+  local volicon="$SCRIPT_DIR/src-tauri/icons/icon.icns"
+  if [[ ! -f "$volicon" ]]; then
+    volicon=""
+  fi
+  echo "Creating distributable .dmg..." >&2
+  bash "$SCRIPT_DIR/scripts/create-dmg.sh" "$APP_BUNDLE" "$dmg_path" ${volicon:+"$volicon"} >&2
+  echo "$dmg_path"
+}
+
 build_release_bundle() {
   ensure_node_deps
   build_icons
   echo "Building release .app bundle..."
-  (cd "$SCRIPT_DIR" && npm run tauri build)
+  # Tauri's built-in DMG step fails on macOS 26+ (Finder statusbar AppleScript).
+  (cd "$SCRIPT_DIR" && npm run tauri build -- --bundles app)
+  local dmg_path
+  dmg_path="$(build_dmg)"
   echo ""
   echo "Done."
   echo "  App bundle: $APP_BUNDLE"
+  echo "  DMG:        $dmg_path"
   echo "Launch with: ./launch.sh"
 }
 
