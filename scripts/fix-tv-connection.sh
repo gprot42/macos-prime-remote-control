@@ -17,17 +17,22 @@
 #   1. Reads the TV IP/MAC from the app config.
 #   2. Re-discovers the TV's *current* IP via mDNS (handles DHCP changes) and
 #      offers to update the app config if it moved.
-#   3. Flushes the stale ARP entry / REJECT host route for the TV (sudo).
+#   3. Flushes the stale ARP entry / REJECT host route for the TV (needs root;
+#      opt in with --sudo — a Wi-Fi power-cycle clears the cache without root).
 #   4. Re-triggers ARP resolution.
 #   5. Optionally power-cycles the Mac's Wi-Fi to force a fresh association
 #      (--restart-wifi).
-#   6. Sends a Wake-on-LAN magic packet to the TV's MAC.
+#   6. Sends a Wake-on-LAN magic packet to the TV's MAC (opt-in with --wol).
 #   7. Re-tests reachability and prints clear next steps for anything that must
 #      be fixed on the TV or router.
 #
 # Usage:
 #   scripts/fix-tv-connection.sh [--ip <addr>] [--restart-wifi] [--yes]
-#                                [--no-sudo] [-h|--help]
+#                                [--wol] [--sudo] [--no-sudo] [-h|--help]
+#
+# Root is NOT required by default; the ARP/route flush is skipped unless you
+# pass --sudo. Restarting Wi-Fi (--restart-wifi) clears the neighbor cache too.
+# Wake-on-LAN is NOT sent by default; pass --wol to wake the TV.
 #
 set -uo pipefail
 
@@ -57,10 +62,11 @@ PY="python3"
 OVERRIDE_IP=""
 RESTART_WIFI=0
 ASSUME_YES=0
-USE_SUDO=1
+USE_SUDO=0
+SEND_WOL=0
 
 usage() {
-  sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,35p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -69,7 +75,10 @@ while [[ $# -gt 0 ]]; do
     --ip)            OVERRIDE_IP="${2:-}"; shift 2 ;;
     --restart-wifi)  RESTART_WIFI=1; shift ;;
     --yes|-y)        ASSUME_YES=1; shift ;;
+    --sudo)          USE_SUDO=1; shift ;;
     --no-sudo)       USE_SUDO=0; shift ;;
+    --wol)           SEND_WOL=1; shift ;;
+    --no-wol)        SEND_WOL=0; shift ;;
     -h|--help)       usage 0 ;;
     *) err "unknown option: $1"; usage 2 ;;
   esac
@@ -94,7 +103,7 @@ run_root() {
   elif [[ $USE_SUDO -eq 1 ]]; then
     sudo "$@"
   else
-    warn "skipping (needs root, --no-sudo set): $*"
+    warn "skipping (needs root; pass --sudo to enable): $*"
     return 1
   fi
 }
@@ -282,8 +291,11 @@ if [[ $RESTART_WIFI -eq 1 ]]; then
   ok "Wi-Fi back up"
 fi
 
-# 5) Wake-on-LAN
-if [[ -n "$CFG_MAC" ]]; then
+# 5) Wake-on-LAN (opt-in with --wol; the TV must not be woken without consent)
+if [[ $SEND_WOL -eq 0 ]]; then
+  step "Wake-on-LAN"
+  info "skipping WoL (pass --wol to send a magic packet and wake the TV)"
+elif [[ -n "$CFG_MAC" ]]; then
   step "Sending Wake-on-LAN to $CFG_MAC"
   send_wol "$CFG_MAC" && ok "WoL sent (wakes the TV if it supports network standby)" \
                        || warn "WoL send failed"
