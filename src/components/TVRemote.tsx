@@ -417,7 +417,7 @@ export default function TVRemote({
   const handleQuickFix = useCallback(async () => {
     setFixingTv(true);
     try {
-      const r = await repairTvConnection(true);
+      const r = await repairTvConnection(true, true);
       setTvOnState(r.reachable);
       if (r.reachable) fetchVolume();
     } catch {

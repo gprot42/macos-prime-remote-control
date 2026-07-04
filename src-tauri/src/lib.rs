@@ -1935,6 +1935,7 @@ struct TvRepairReport {
     ip_changed: bool,
     discovered: bool,
     wifi_restarted: bool,
+    wol_sent: bool,
     steps: Vec<String>,
     advice: Option<String>,
 }
@@ -1971,7 +1972,8 @@ async fn check_tv_reachable() -> Result<bool, String> {
 /// Attempt to automatically restore TV connectivity from the Mac side.
 ///
 /// Non-disruptive steps always run: re-discover the TV's current IP via mDNS
-/// (updating the saved IP when DHCP moved it) and send Wake-on-LAN. When
+/// (updating the saved IP when DHCP moved it) and, when `send_wol` is true, send
+/// Wake-on-LAN to wake a TV in network standby. When
 /// `restart_wifi` is true it also power-cycles the Mac's Wi-Fi to force a fresh
 /// association and clear a stale neighbor/reject route. Progress is streamed via
 /// "repair-progress" events; the final report says whether the TV is reachable
@@ -1980,6 +1982,7 @@ async fn check_tv_reachable() -> Result<bool, String> {
 async fn repair_tv_connection(
     app: tauri::AppHandle,
     restart_wifi: bool,
+    send_wol: bool,
 ) -> Result<TvRepairReport, String> {
     let _tv = tv_cmd_lock().lock().await;
     let mut cfg = load_config();
@@ -2011,6 +2014,7 @@ async fn repair_tv_connection(
             ip_changed: false,
             discovered: false,
             wifi_restarted: false,
+            wol_sent: false,
             steps,
             advice: None,
         });
@@ -2045,6 +2049,7 @@ async fn repair_tv_connection(
                 ip_changed,
                 discovered,
                 wifi_restarted: false,
+                wol_sent: false,
                 steps,
                 advice: None,
             });
@@ -2081,6 +2086,7 @@ async fn repair_tv_connection(
                         ip_changed,
                         discovered,
                         wifi_restarted: false,
+                        wol_sent: false,
                         steps,
                         advice: None,
                     });
@@ -2090,10 +2096,18 @@ async fn repair_tv_connection(
         }
     }
 
-    // Step 2 — Wake-on-LAN (wakes a TV in network standby).
-    if !cfg.tv_mac.trim().is_empty() {
+    // Step 2 — Wake-on-LAN (wakes a TV in network standby). Opt-in: only sent
+    // when the caller explicitly requested it, so the app never powers on the TV
+    // without consent (mirrors scripts/fix-tv-connection.sh --wol).
+    let mut wol_sent = false;
+    if !send_wol {
+        note!("Skipping Wake-on-LAN (not requested).");
+    } else if !cfg.tv_mac.trim().is_empty() {
         match send_wake_on_lan(cfg.tv_mac.trim()) {
-            Ok(()) => note!("Sent Wake-on-LAN to {}.", cfg.tv_mac.trim()),
+            Ok(()) => {
+                wol_sent = true;
+                note!("Sent Wake-on-LAN to {}.", cfg.tv_mac.trim());
+            }
             Err(e) => note!("Wake-on-LAN failed: {e}"),
         }
     } else {
@@ -2163,6 +2177,7 @@ async fn repair_tv_connection(
         ip_changed,
         discovered,
         wifi_restarted,
+        wol_sent,
         steps,
         advice,
     })

@@ -2,9 +2,9 @@
  * TvConnectionFix — guided "TV unreachable" repair.
  *
  * Shown when the app detects it can't reach the LG TV. Runs the backend
- * `repair_tv_connection` flow (re-discover the TV's IP via mDNS, Wake-on-LAN,
- * and optionally a Wi-Fi reset), streams progress, and reports the result with
- * clear next steps when a fix has to happen on the TV/router.
+ * `repair_tv_connection` flow (re-discover the TV's IP via mDNS, an optional
+ * Wake-on-LAN, and optionally a Wi-Fi reset), streams progress, and reports the
+ * result with clear next steps when a fix has to happen on the TV/router.
  */
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
@@ -24,6 +24,7 @@ export default function TvConnectionFix({
   const [log, setLog] = useState<string[]>([]);
   const [report, setReport] = useState<TvRepairReport | null>(null);
   const [triedWifi, setTriedWifi] = useState(false);
+  const [sendWol, setSendWol] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   // Stream backend progress lines.
@@ -50,7 +51,7 @@ export default function TvConnectionFix({
     setLog([]);
     if (restartWifi) setTriedWifi(true);
     try {
-      const r = await repairTvConnection(restartWifi);
+      const r = await repairTvConnection(restartWifi, sendWol);
       setReport(r);
       onResolved?.(r.reachable);
     } catch (err) {
@@ -60,6 +61,7 @@ export default function TvConnectionFix({
         ip_changed: false,
         discovered: false,
         wifi_restarted: restartWifi,
+        wol_sent: false,
         steps: [],
         advice: String(err),
       });
@@ -117,6 +119,20 @@ export default function TvConnectionFix({
             </button>
           )}
         </div>
+      )}
+
+      {/* Wake-on-LAN opt-in (off by default — only wakes the TV when asked) */}
+      {!reachable && (
+        <label className="flex items-center gap-2 text-xs text-zinc-400 select-none">
+          <input
+            type="checkbox"
+            checked={sendWol}
+            disabled={running}
+            onChange={(e) => setSendWol(e.target.checked)}
+            className="accent-sky-600"
+          />
+          Also wake the TV (Wake-on-LAN)
+        </label>
       )}
 
       {/* Streaming progress */}

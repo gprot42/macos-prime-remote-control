@@ -28,18 +28,26 @@ export interface TvRepairReport {
   ip_changed: boolean;
   discovered: boolean;
   wifi_restarted: boolean;
+  wol_sent: boolean;
   steps: string[];
   advice: string | null;
 }
 
 /**
  * Ask the backend to try to restore TV connectivity from the Mac side.
- * Non-disruptive steps (mDNS re-discovery + Wake-on-LAN) always run; pass
- * restartWifi=true to also power-cycle the Mac's Wi-Fi. Progress streams via
- * "repair-progress" events.
+ * The non-disruptive mDNS re-discovery always runs. Pass restartWifi=true to
+ * also power-cycle the Mac's Wi-Fi, and sendWol=true to send a Wake-on-LAN
+ * magic packet (opt-in, mirrors scripts/fix-tv-connection.sh --wol). Progress
+ * streams via "repair-progress" events.
  */
-export async function repairTvConnection(restartWifi: boolean): Promise<TvRepairReport> {
-  return await invoke<TvRepairReport>("repair_tv_connection", { restartWifi });
+export async function repairTvConnection(
+  restartWifi: boolean,
+  sendWol = false,
+): Promise<TvRepairReport> {
+  return await invoke<TvRepairReport>("repair_tv_connection", {
+    restartWifi,
+    sendWol,
+  });
 }
 
 /** Quick check whether the TV's control port is reachable right now. */
