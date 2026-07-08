@@ -209,43 +209,36 @@ function SpeakerIcon({ level, muted, size = 16 }: { level: number | null; muted:
 }
 
 // ─── Volume step buttons ─────────────────────────────────────────────────────
+// No busy/spinner lock: each press must apply immediately so double-tap down
+// (or up) works like a physical remote while the TV command is still in flight.
 const VolStepButton = memo(function VolStepButton({
   direction,
   disabled,
-  busy,
   onStep,
 }: {
   direction: "up" | "down";
   disabled: boolean;
-  busy: boolean;
   onStep: (direction: "up" | "down") => void;
 }) {
   return (
     <button
       type="button"
-      disabled={disabled || busy}
+      disabled={disabled}
       title={direction === "up" ? "Volume up" : "Volume down"}
       onPointerDown={(e) => {
-        if (e.button !== 0 || disabled || busy) return;
+        if (e.button !== 0 || disabled) return;
         e.preventDefault();
         e.stopPropagation();
         onStep(direction);
       }}
       className="w-7 h-6 flex items-center justify-center rounded-md
                  text-zinc-400 hover:text-white hover:bg-zinc-700/60
-                 disabled:opacity-40 transition-colors"
+                 disabled:opacity-40 transition-colors active:bg-zinc-600/70"
     >
-      {busy ? (
-        <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
-          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
-        </svg>
-      ) : (
-        <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round"
-                d={direction === "up" ? "M5 15l7-7 7 7" : "M19 9l-7 7-7-7"} />
-        </svg>
-      )}
+      <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round"
+              d={direction === "up" ? "M5 15l7-7 7 7" : "M19 9l-7 7-7-7"} />
+      </svg>
     </button>
   );
 });
@@ -309,9 +302,12 @@ export default function TVRemote({
   const [slider, setSlider]   = useState(defaultTvVolume);
   const [volError, setVE]     = useState(false);
   const [volOpen, setVolOpen] = useState(false);
-  const [volStepBusy, setVolStepBusy] = useState(false);
   const volDebounce           = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const volStepBusyRef        = useRef(false);
+  /** Accumulated ±steps not yet sent to the TV (up positive, down negative). */
+  const pendingVolStepsRef    = useRef(0);
+  const volFlushRunningRef    = useRef(false);
+  /** True while this app is actively changing volume (slider/mute) — skip remote poll. */
+  const volUserActiveRef      = useRef(false);
   const volAreaRef            = useRef<HTMLDivElement>(null);
 
   const setTvOnState = useCallback((on: boolean | null) => {
@@ -330,22 +326,62 @@ export default function TVRemote({
     }
   }, [setTvOnState]);
 
-  const fetchVolume = useCallback(async () => {
+  /** True when local UI is mid volume change — do not apply Magic Remote polls. */
+  const isVolLocallyBusy = useCallback(
+    () =>
+      pendingVolStepsRef.current !== 0
+      || volFlushRunningRef.current
+      || volUserActiveRef.current
+      || volDebounce.current !== null,
+    [],
+  );
+
+  const fetchVolume = useCallback(async (opts?: { quiet?: boolean }) => {
     if (tvOnRef.current === false) return;
-    setVE(false);
+    if (!opts?.quiet) setVE(false);
     try {
       const s = await invoke<VolumeState>("get_tv_volume");
-      setVol(s); setSlider(s.volume ?? defaultTvVolume);
+      // Drop stale reads if the user started adjusting while the request was in flight.
+      if (isVolLocallyBusy()) return;
+      setVol(s);
+      setSlider(s.volume ?? defaultTvVolume);
       setVE(false);
     } catch {
+      if (opts?.quiet) return;
       if (tvOnRef.current === true) setVE(true);
       else setVE(false);
     }
-  }, [defaultTvVolume]);
+  }, [defaultTvVolume, isVolLocallyBusy]);
 
   useEffect(() => {
     refreshTvPower().then((on) => { if (on) fetchVolume(); });
   }, [refreshTvPower, fetchVolume]);
+
+  // Poll TV volume so Magic Remote / physical remote changes update our bar.
+  // Faster while the volume popup is open; skips while this app is driving volume.
+  useEffect(() => {
+    if (tvOn !== true) return;
+    let cancelled = false;
+    let inFlight = false;
+
+    const poll = async () => {
+      if (cancelled || inFlight || isVolLocallyBusy()) return;
+      inFlight = true;
+      try {
+        await fetchVolume({ quiet: true });
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const intervalMs = volOpen ? 1500 : 2500;
+    const id = window.setInterval(poll, intervalMs);
+    void poll();
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [tvOn, volOpen, fetchVolume, isVolLocallyBusy]);
 
   // Keep the power indicator in sync with what playback actually observes:
   // a play attempt that can't reach the TV flips us to "off/unreachable", and a
@@ -418,32 +454,80 @@ export default function TVRemote({
     setSlider(v);
     setVol(p => ({ ...p, volume: v, muted: false }));
     if (volDebounce.current) clearTimeout(volDebounce.current);
+    volUserActiveRef.current = true;
     volDebounce.current = setTimeout(async () => {
       try {
         const s = await invoke<VolumeState>("set_tv_volume", { level: v });
         setVol(s); setSlider(s.volume ?? v);
         setVE(false);
-      } catch { setVE(true); }
+      } catch {
+        setVE(true);
+      } finally {
+        volDebounce.current = null;
+        volUserActiveRef.current = false;
+      }
     }, 180);
   };
 
-  const handleVolStep = useCallback(async (direction: "up" | "down") => {
-    if (!tvOnRef.current || volStepBusyRef.current) return;
-    volStepBusyRef.current = true;
-    setVolStepBusy(true);
-    if (volDebounce.current) clearTimeout(volDebounce.current);
+  // Flush queued volume steps to the TV. Coalesces rapid presses into one
+  // volume_step(N) call when possible so double-tap down does not wait on a spinner.
+  const flushVolSteps = useCallback(async () => {
+    if (volFlushRunningRef.current) return;
+    volFlushRunningRef.current = true;
     try {
-      const s = await invoke<VolumeState>("volume_step", { direction, steps: 1 });
-      setVol(s);
-      setSlider(s.volume ?? slider);
-      setVE(false);
-    } catch {
-      setVE(true);
+      while (pendingVolStepsRef.current !== 0) {
+        const queued = pendingVolStepsRef.current;
+        pendingVolStepsRef.current = 0;
+        const direction: "up" | "down" = queued > 0 ? "up" : "down";
+        const steps = Math.abs(queued);
+        try {
+          const s = await invoke<VolumeState>("volume_step", { direction, steps });
+          const stillPending = pendingVolStepsRef.current;
+          if (s.volume != null) {
+            // Keep optimistic presses that arrived during the round-trip.
+            const adjusted = Math.max(
+              0,
+              Math.min(100, Number(s.volume) + stillPending),
+            );
+            setVol({ volume: adjusted, muted: s.muted });
+            setSlider(adjusted);
+          } else if (stillPending === 0) {
+            setVol(s);
+          }
+          setVE(false);
+        } catch {
+          setVE(true);
+        }
+      }
     } finally {
-      volStepBusyRef.current = false;
-      setVolStepBusy(false);
+      volFlushRunningRef.current = false;
+      // Presses that landed after the while-check but before the flag cleared.
+      if (pendingVolStepsRef.current !== 0) {
+        void flushVolSteps();
+      }
     }
-  }, [slider]);
+  }, []);
+
+  const handleVolStep = useCallback((direction: "up" | "down") => {
+    if (!tvOnRef.current) return;
+    if (volDebounce.current) {
+      clearTimeout(volDebounce.current);
+      volDebounce.current = null;
+      volUserActiveRef.current = false;
+    }
+
+    const delta = direction === "up" ? 1 : -1;
+    pendingVolStepsRef.current += delta;
+
+    // Optimistic UI so the second press is never blocked by the first TV call.
+    setSlider((prev) => {
+      const next = Math.max(0, Math.min(100, prev + delta));
+      setVol((p) => ({ ...p, volume: next, muted: false }));
+      return next;
+    });
+    setVE(false);
+    void flushVolSteps();
+  }, [flushVolSteps]);
 
   // Close the volume popup when clicking outside it (or pressing Escape).
   useEffect(() => {
@@ -471,6 +555,7 @@ export default function TVRemote({
   const handleMute = async () => {
     if (!tvOnRef.current) return;
     const m = !vol.muted;
+    volUserActiveRef.current = true;
     setVol(p => ({ ...p, muted: m }));
     try {
       const s = await invoke<VolumeState>("set_tv_mute", { muted: m });
@@ -479,6 +564,8 @@ export default function TVRemote({
     } catch {
       setVol(p => ({ ...p, muted: !m }));
       setVE(true);
+    } finally {
+      volUserActiveRef.current = false;
     }
   };
 
@@ -736,21 +823,25 @@ export default function TVRemote({
   };
 
   // ── Subtitles ─────────────────────────────────────────────────────────────
+  // Button is session-local only: grey (off) at app start and on each new title.
+  // Blue only after a successful enable this session. Do not restore a saved
+  // "on" from config — that left the button blue while captions were off.
   const [subtitlesOn, setSubtitlesOn] = useState(false);
   const [subtitleBusy, setSubtitleBusy] = useState(false);
   const [subtitleErr, setSubtitleErr] = useState<string | null>(null);
+  // Sync guard — React state alone can miss a double-click before re-render.
+  const subtitleBusyRef = useRef(false);
 
   useEffect(() => {
-    // Subtitles are never auto-applied on new media. They stay off until the
-    // user explicitly clicks the subtitles button (the blue box).
     setSubtitlesOn(false);
     setSubtitleErr(null);
   }, [nowPlaying?.content_id, episode]);
 
   const toggleSubtitles = useCallback(async () => {
-    if (!seekEnabled || subtitleBusy) return;
+    if (!seekEnabled || subtitleBusyRef.current) return;
     const next = !subtitlesOn;
     const wasPlaying = playbackState === "playing";
+    subtitleBusyRef.current = true;
     setSubtitleBusy(true);
     setSubtitleErr(null);
     try {
@@ -758,13 +849,10 @@ export default function TVRemote({
       setSubtitlesOn(next);
       setTvOnState(true);
       if (wasPlaying) {
-        // The transport bar navigation for subtitles can pause Prime's player.
-        // Explicitly resume via the media path (in addition to the PLAYs the
-        // Python side sends) so that turning subs on/off does not leave playback paused.
+        // Python already resumes via SSAP play(). Avoid a second media "play"
+        // command immediately after — a remote PLAY while the captions UI is
+        // still closing can act like ENTER and flip On back to Off.
         onPlaybackStateChange("playing");
-        try {
-          await invoke("media_control", { action: "play" });
-        } catch {}
       }
     } catch (err) {
       const msg = String(err).replace(/^Error:\s*/, "");
@@ -775,9 +863,16 @@ export default function TVRemote({
         setSubtitleErr(msg.slice(0, 60));
       }
     } finally {
+      subtitleBusyRef.current = false;
       setSubtitleBusy(false);
     }
-  }, [seekEnabled, subtitleBusy, subtitlesOn, setTvOnState, playbackState, onPlaybackStateChange]);
+  }, [
+    seekEnabled,
+    subtitlesOn,
+    setTvOnState,
+    playbackState,
+    onPlaybackStateChange,
+  ]);
 
   // ── Transport ─────────────────────────────────────────────────────────────
   const [pbBusy, setPbBusy] = useState<TransportAction | null>(null);
@@ -1099,14 +1194,12 @@ export default function TVRemote({
               <VolStepButton
                 direction="up"
                 disabled={tvOn !== true}
-                busy={volStepBusy}
                 onStep={handleVolStep}
               />
               <VerticalSlider value={volPct} muted={vol.muted} onChange={handleVolSlider} />
               <VolStepButton
                 direction="down"
                 disabled={tvOn !== true}
-                busy={volStepBusy}
                 onStep={handleVolStep}
               />
               <span className={`text-[10px] font-bold tabular-nums leading-none mt-0.5 ${

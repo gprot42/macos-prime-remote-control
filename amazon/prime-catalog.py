@@ -666,11 +666,13 @@ def _merge_storefront_pages(
     slug: str,
     *,
     kind: str = "collection",
-    max_pages: int = 8,
+    max_pages: int = 5,
     full_carousels: bool = False,
     max_carousel_rounds: int = 10,
 ) -> tuple[list[PrimeTitle], str]:
-    """Fetch a collection or genre storefront across paginated ?page=N views."""
+    """Fetch a collection or genre storefront across paginated ?page=N views.
+    Pages are fetched concurrently for speed; results merged in page order.
+    """
     slug = slug.strip("/")
     source = f"{kind}:{slug}"
     seen: dict[str, PrimeTitle] = {}
@@ -678,9 +680,21 @@ def _merge_storefront_pages(
     last_html = ""
     completed_carousel_targets: set[str] = set()
 
-    for page in range(1, max_pages + 1):
-        url = _storefront_url(kind, slug, page=page)
+    def fetch_page(p: int) -> tuple[int, str]:
+        url = _storefront_url(kind, slug, page=p)
         html = fetch_html(url)
+        return p, html
+
+    pages_to_fetch = list(range(1, max_pages + 1))
+    page_htmls: dict[int, str] = {}
+    with ThreadPoolExecutor(max_workers=min(6, len(pages_to_fetch))) as pool:
+        for p, html in pool.map(fetch_page, pages_to_fetch):
+            page_htmls[p] = html
+
+    for page in pages_to_fetch:
+        html = page_htmls.get(page)
+        if not html:
+            continue
         last_html = html
         groups = extract_collection_groups(
             html,
@@ -723,6 +737,37 @@ def list_collection(
         full_carousels=full_carousels,
         max_carousel_rounds=max_carousel_rounds,
     )
+
+    # Titles from the dedicated "Included with Prime" storefront should be
+    # treated as Prime-included even if per-item entitlement cues were missing,
+    # incomplete, or reported false (unsigned cues can be inconsistent).
+    # Only skip forcing when we have explicit channel or transactional signals.
+    bare_lower = bare_slug.lower().replace("-", "").replace("_", "")
+    if bare_lower == "includedwithprime":
+        for item in items:
+            if (
+                item.included_with_channel is None
+                and not item.rent_from
+                and not item.buy_from
+            ):
+                item.included_with_prime = True
+    elif kind == "genre":
+        # For genre storefronts, the primary rows ("Movies", "TV shows", etc.)
+        # usually surface included-with-Prime titles; the "Explore: Rent..." ones
+        # carry explicit signals. Force True for primary containers (overriding
+        # ambiguous/unsigned cue values) so that selecting horror/fantasy etc
+        # groupings reliably shows titles.
+        for item in items:
+            cont = (item.container or "").lower()
+            if "rent" in cont or "buy" in cont or "explore" in cont or "subscription" in cont:
+                continue
+            if (
+                item.included_with_channel is None
+                and not item.rent_from
+                and not item.buy_from
+            ):
+                item.included_with_prime = True
+
     return merge_hero_banner_images(html, items)
 
 

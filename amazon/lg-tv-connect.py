@@ -98,37 +98,39 @@ DEFAULT_SUBTITLE_DELAY = 0.0
 # 0 = try without extra downs (bar may appear on first action).
 DEFAULT_SUBTITLE_FOCUS_DOWN = 1
 # Number of RIGHTs *after homing LEFT to the leftmost of the row*.
-# From screengrab.jpg: bar shows Cast, Start again (replay), Subtitles CC, volume/speaker.
-# The 3 options are Start again → Subtitles → Audio options. Use 1 (after homing) to select Subtitles.
-# The homing makes this count reliable from the first item regardless of prior focus.
+# From screengrab.jpg the pause-bar icon row is (left→right):
+#   Start again (replay) → Subtitles CC → Audio (speaker)
+# After LEFT-home to Start again: RIGHT×1 = Subtitles, RIGHT×2 = Audio.
+# Use 1. Values 2–3 open Audio options (common misconfig / pre-homing defaults).
 DEFAULT_SUBTITLE_FOCUS_RIGHT = 1
-# When the picker that opens is a *combined* Audio+Subtitles panel (common), these
-# move focus from the Audio side/column/tab over to Subtitles. 0 = skip (use if you
-# targeted a dedicated Subtitles button that already focuses the subs list directly).
-# From screengrab.jpg the bar has a dedicated "Subtitles CC" button so default 0.
-# Use 1 (LEFT) only if a combined panel opens focused on the Audio side.
+# When the picker that opens is a *combined* Audio+Subtitles panel, these move
+# focus from the Audio side/column/tab over to Subtitles. 0 = skip (default —
+# screengrab shows a dedicated Subtitles CC button that opens the subs list).
+# Use section_left=1 only if a combined panel opens focused on the Audio side.
 DEFAULT_SUBTITLE_SECTION_UP = 0
 DEFAULT_SUBTITLE_SECTION_LEFT = 0
-# Down-steps from the top of Prime's subtitle menu (0 = Off). Available tracks
-# vary per title; override with --subtitle-menu-down if the wrong row is picked.
-# Steps within the Subtitles list (0 = Off). Track order varies per title.
+# Down-steps from the top of Prime's Subtitles On/Off list (after UP-home).
+# Observed on device: first row is Off, second is On.
+#   0 = Off
+#   1 = On  (used when enabling any preferred language)
+# Override with --subtitle-menu-down if a title's list differs.
 SUBTITLE_LANGUAGE_DOWN: dict[str, int] = {
     "off": 0,
     "en-cc": 1,
     "en": 1,
-    "de": 2,
-    "fr": 3,
-    "es": 4,
-    "it": 5,
-    "pt": 6,
-    "nl": 7,
-    "sv": 8,
-    "no": 9,
-    "da": 10,
-    "fi": 11,
-    "pl": 12,
-    "ja": 13,
-    "ko": 14,
+    "de": 1,
+    "fr": 1,
+    "es": 1,
+    "it": 1,
+    "pt": 1,
+    "nl": 1,
+    "sv": 1,
+    "no": 1,
+    "da": 1,
+    "fi": 1,
+    "pl": 1,
+    "ja": 1,
+    "ko": 1,
 }
 PRIME_PLAY_METHODS = ("auto", "media", "watch", "enter")
 PRIME_PROFILE_TYPES = ("adult", "kid", "none")
@@ -1750,8 +1752,8 @@ Use --profile-highlight to verify the mapped index on TV.""",
         default=DEFAULT_SUBTITLE_FOCUS_RIGHT,
         metavar="N",
         help=(
-            "RIGHT presses *after homing LEFT to leftmost on the row* to reach Subtitles CC "
-            "(from screengrab.jpg: 1 for middle of Start again → Subtitles CC → Audio options). "
+            "RIGHT presses *after LEFT-home to Start again* to reach Subtitles CC "
+            "(screengrab.jpg: Start again → Subtitles CC → Audio; use 1 — 2/3 open Audio). "
             f"(-1 = default {DEFAULT_SUBTITLE_FOCUS_RIGHT})"
         ),
     )
@@ -1782,7 +1784,10 @@ Use --profile-highlight to verify the mapped index on TV.""",
         type=int,
         default=-1,
         metavar="N",
-        help="DOWN-key presses in the subtitle list (-1 = auto from language)",
+        help=(
+            "DOWN presses in the Subtitles column after UP-home "
+            "(-1 = auto: Off=0, On=1; override if list differs)"
+        ),
     )
     # ── Power ─────────────────────────────────────────────────────────────────
     parser.add_argument(
@@ -1889,11 +1894,13 @@ async def _send_button(client: "WebOsClient", name: str) -> bool:
 
 
 def _resolve_subtitle_menu_down(language: str, menu_down: int | None) -> int:
+    """DOWN presses inside the Subtitles column after UP-home (Off=0, On=1)."""
     if menu_down is not None and menu_down >= 0:
         return menu_down
     lang = (language or "en").strip().lower()
     if lang == "off":
-        return 0
+        return SUBTITLE_LANGUAGE_DOWN.get("off", 0)
+    # Enabling any language selects On (row 1). Track/language is a separate column.
     return SUBTITLE_LANGUAGE_DOWN.get(lang, SUBTITLE_LANGUAGE_DOWN.get("en", 1))
 
 
@@ -1925,25 +1932,43 @@ async def _focus_subtitles_section(
             await asyncio.sleep(SUBTITLE_KEY_DELAY)
 
 
+def _normalize_subtitle_focus_right(focus_right: int) -> int:
+    """Map focus-right to Subtitles CC after LEFT-home (see screengrab.jpg).
+
+    Bar order: Start again (0) → Subtitles CC (1) → Audio (2).
+    Legacy 2 (pre-homing default) and 3 (common overshoot) select Audio; coerce to 1.
+    """
+    if focus_right < 0:
+        return DEFAULT_SUBTITLE_FOCUS_RIGHT
+    # 2 was the old default before LEFT-homing; 3 is a frequent manual overshoot.
+    if focus_right in (2, 3):
+        print(
+            f"  Note: subtitle focus-right={focus_right} selects Audio on the "
+            "Start again / Subtitles / Audio row; using 1 (Subtitles CC).",
+            file=sys.stderr,
+        )
+        return DEFAULT_SUBTITLE_FOCUS_RIGHT
+    return focus_right
+
+
 async def _open_prime_subtitle_picker(
     client: "WebOsClient",
     *,
     focus_down: int,
     focus_right: int,
 ) -> bool:
-    """Navigate to and press the Subtitles button among the transport controls.
+    """Navigate to and press Subtitles CC on the pause-bar icon row.
 
-    From screengrab.jpg, the Prime bar has Cast | Start again | Subtitles CC | volume.
-    We send PAUSE to bring up the transport bar (required for reliable access
-    to the 3 options: Start again / Subtitles / Audio options). This briefly pauses playback.
-    We then DOWN to the row (default 1), LEFT-home (to leftmost), RIGHT x N (default 1 for Subtitles CC),
-    ENTER to open picker. After selecting the track/off (or using section_left to move from Audio column),
-    we robustly resume with SSAP play() + PLAY keys.
+    From screengrab.jpg the row is: Start again → Subtitles CC → Audio (speaker).
+    Cast sits above the scrubber and is not on this row.
+
+    Sequence: PAUSE (surface bar) → DOWN×N (focus icon row) → LEFT-home to
+    Start again → RIGHT×1 (Subtitles CC) → ENTER. Resume is handled by the caller.
     """
     await _send_button(client, "PAUSE")
     await asyncio.sleep(0.7)
 
-    right_steps = DEFAULT_SUBTITLE_FOCUS_RIGHT if focus_right < 0 else focus_right
+    right_steps = _normalize_subtitle_focus_right(focus_right)
     down_steps = max(0, focus_down)
 
     if down_steps:
@@ -1955,19 +1980,18 @@ async def _open_prime_subtitle_picker(
             await _send_button(client, "DOWN")
             await asyncio.sleep(SUBTITLE_KEY_DELAY)
 
-    # Home to the left end of the row so that RIGHT counts are from the first
-    # of the three options (Start again → Subtitles → Audio options). Extra
-    # LEFTs at the edge do nothing in most UIs.
+    # Home to Start again so RIGHT counts are absolute: 0=Start again, 1=Subtitles, 2=Audio.
+    # Extra LEFTs at the left edge are no-ops on this bar (no wrap).
     print(
-        "  Homing left to first item (Start again) ...",
+        "  Homing left to Start again ...",
         file=sys.stderr,
     )
-    for _ in range(5):
+    for _ in range(3):
         await _send_button(client, "LEFT")
         await asyncio.sleep(SUBTITLE_KEY_DELAY)
 
     print(
-        f"  Opening Subtitles: RIGHT×{right_steps} + ENTER ...",
+        f"  Opening Subtitles CC: RIGHT×{right_steps} + ENTER ...",
         file=sys.stderr,
     )
     for _ in range(right_steps):
@@ -1977,6 +2001,81 @@ async def _open_prime_subtitle_picker(
         return False
     await asyncio.sleep(0.75)
     return True
+
+
+async def _dismiss_subtitle_config_panel(client: "WebOsClient") -> None:
+    """Close the on-screen Subtitles and closed captions panel after a selection.
+
+    One BACK dismisses the overlay only. Do not send a second BACK / EXIT / STOP
+    (those leave the Prime player).
+    """
+    print(
+        "  Closing subtitle config panel (BACK once) ...",
+        file=sys.stderr,
+    )
+    await _send_button(client, "BACK")
+    # Let the overlay fully tear down before any resume keys — a PLAY key while
+    # On/Off is still focused is often treated like ENTER and flips the value back.
+    await asyncio.sleep(0.9)
+
+
+async def _resume_after_subtitles(client: "WebOsClient") -> None:
+    """Resume playback after subtitle menu navigation.
+
+    Prefer SSAP play() only. A remote PLAY key while the captions panel (or its
+    focus) is still dying can act as ENTER and toggle On→Off right after we set On.
+    """
+    try:
+        result = await client.play()
+        if not result.get("returnValue", True):
+            print("  SSAP play returned false", file=sys.stderr)
+        else:
+            print("  SSAP play to resume after subtitles.", file=sys.stderr)
+    except Exception as exc:
+        print(f"  media.controls/play during subs resume: {exc}", file=sys.stderr)
+        # Fallback only if SSAP failed — last resort remote key after extra settle.
+        await asyncio.sleep(0.5)
+        if await _send_button(client, "PLAY"):
+            print("  Sent PLAY key fallback to resume after subtitles.", file=sys.stderr)
+
+
+async def _select_subtitles_on_off(
+    client: "WebOsClient",
+    *,
+    enabled: bool,
+    steps_down: int,
+) -> None:
+    """Set the Subtitles column to On or Off inside the open captions panel.
+
+    Panel layout (screengrab): Subtitles | Languages | Sizes | Styles.
+    Rows after UP-home: Off (0), On (1).
+
+    Only one ENTER here (confirm). A second ENTER — or a later PLAY key while
+    focus is still on this control — toggles back (enable then immediately disable).
+    """
+    target = "On" if enabled else "Off"
+    print(
+        f"  Subtitles column → {target}: LEFT-home, UP-home, "
+        f"DOWN×{steps_down}, ENTER once ...",
+        file=sys.stderr,
+    )
+    # Leftmost column is Subtitles.
+    for _ in range(3):
+        await _send_button(client, "LEFT")
+        await asyncio.sleep(SUBTITLE_KEY_DELAY)
+
+    # Home to first row (Off). Only 2 UPs for a 2-row list (extra UPs may wrap).
+    for _ in range(2):
+        await _send_button(client, "UP")
+        await asyncio.sleep(SUBTITLE_KEY_DELAY)
+
+    for _ in range(max(0, steps_down)):
+        await _send_button(client, "DOWN")
+        await asyncio.sleep(SUBTITLE_KEY_DELAY)
+
+    # Confirm selection exactly once.
+    await _send_button(client, "ENTER")
+    await asyncio.sleep(0.75)
 
 
 async def apply_subtitles(
@@ -1991,10 +2090,11 @@ async def apply_subtitles(
     section_left: int = DEFAULT_SUBTITLE_SECTION_LEFT,
     menu_down: int | None = None,
 ) -> None:
-    """Open Prime's Audio & Subtitles picker and select Off or a language.
+    """Open Prime's subtitles picker, set On or Off, dismiss panel, resume.
 
     UP is only sent inside the open panel (not during playback — that opens cast).
-    Never sends BACK/EXIT (exits the player).
+    After selection, one BACK closes the overlay; resume uses SSAP play (not PLAY
+    key) so the choice is not immediately toggled back.
     """
     lang = (language or "en").strip().lower()
     if not enabled:
@@ -2014,17 +2114,7 @@ async def apply_subtitles(
         client, focus_down=focus_down, focus_right=focus_right
     ):
         print("  Warning: could not open subtitle picker.", file=sys.stderr)
-        # Robust resume (PAUSE was sent inside the picker attempt).
-        try:
-            await client.play()
-        except Exception:
-            pass
-        await asyncio.sleep(0.5)
-        await _send_button(client, "PLAY")
-        try:
-            await client.play()
-        except Exception:
-            pass
+        await _resume_after_subtitles(client)
         print(json.dumps({"subtitles": enabled, "language": lang if enabled else "off"}))
         return
 
@@ -2035,33 +2125,13 @@ async def apply_subtitles(
             client, section_up=section_up, section_left=section_left
         )
 
-    for _ in range(max(0, steps_down)):
-        await _send_button(client, "DOWN")
-        await asyncio.sleep(SUBTITLE_KEY_DELAY)
+    await _select_subtitles_on_off(
+        client, enabled=enabled, steps_down=steps_down
+    )
 
-    await _send_button(client, "ENTER")
-    await asyncio.sleep(0.8)
-
-    # Robust resume after menu navigation. We sent PAUSE to surface the bar
-    # (necessary for reliable subs selection). Now resume using the same
-    # pattern as cmd_media_resume: SSAP play() + PLAY key.
-    # Do this reliably so subs toggle does not leave media paused.
-    try:
-        result = await client.play()
-        if not result.get("returnValue", True):
-            print("  SSAP play returned false", file=sys.stderr)
-    except Exception as exc:
-        print(f"  media.controls/play during subs resume: {exc}", file=sys.stderr)
-    await asyncio.sleep(PLAY_KEY_DELAY)
-    if await _send_button(client, "PLAY"):
-        print("  Sent PLAY to resume after subtitles.", file=sys.stderr)
-
-    # Extra SSAP play as safety net (the key may have been interpreted by
-    # the still-visible transport bar).
-    try:
-        await client.play()
-    except Exception:
-        pass
+    # Close captions panel, then resume without a PLAY key that can re-hit the menu.
+    await _dismiss_subtitle_config_panel(client)
+    await _resume_after_subtitles(client)
 
     print(json.dumps({"subtitles": enabled, "language": lang if enabled else "off"}))
 

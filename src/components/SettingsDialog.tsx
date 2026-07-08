@@ -9,6 +9,7 @@ import {
   CATEGORY_COLORS,
   CATEGORY_TEXT,
   CATEGORY_BORDER,
+  migrateSubtitleFocusRight,
 } from "../types";
 
 const TTL_OPTIONS = [
@@ -87,9 +88,8 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
   const [subtitlesEnabled, setSubtitlesEnabled] = useState(config.subtitles_enabled ?? false);
   const [subtitleLanguage, setSubtitleLanguage] = useState(config.subtitle_language ?? "en");
   const [subtitleFocusDown, setSubtitleFocusDown] = useState(config.subtitle_focus_down ?? 1);
-  const loadedFocusRight = config.subtitle_focus_right;
   const [subtitleFocusRight, setSubtitleFocusRight] = useState(
-    loadedFocusRight === 2 ? 1 : (loadedFocusRight ?? 1)
+    migrateSubtitleFocusRight(config.subtitle_focus_right)
   );
   const [subtitleSectionUp, setSubtitleSectionUp] = useState(config.subtitle_section_up ?? 0);
   const [subtitleSectionLeft, setSubtitleSectionLeft] = useState(config.subtitle_section_left ?? 0);
@@ -134,9 +134,14 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
       default_tv_volume: Math.max(0, Math.min(100, defaultTvVolume)),
       apply_default_tv_volume: applyDefaultTvVolume,
       subtitles_enabled: subtitlesEnabled,
+      // Preserve last known TV captions state (not edited in this dialog).
+      subtitles_active: config.subtitles_active ?? false,
       subtitle_language: subtitleLanguage,
       subtitle_focus_down: Math.max(0, Math.min(5, subtitleFocusDown)),
-      subtitle_focus_right: Math.max(-1, Math.min(20, subtitleFocusRight)),
+      subtitle_focus_right: Math.max(
+        -1,
+        Math.min(20, migrateSubtitleFocusRight(subtitleFocusRight)),
+      ),
       subtitle_section_up: Math.max(0, Math.min(5, subtitleSectionUp)),
       subtitle_section_left: Math.max(0, Math.min(5, subtitleSectionLeft)),
       subtitle_menu_down: Math.max(-1, Math.min(30, subtitleMenuDown)),
@@ -370,9 +375,10 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
                       Enable subtitle controls
                     </p>
                     <p className="text-xs text-zinc-500 mt-0.5 leading-relaxed">
-                      Shows a blue subtitles button in the remote bar (only while media is
-                      playing on TV). Subtitles are off by default when playback starts.
-                      Click the button to turn them on or off on demand. No auto-apply.
+                      Shows a subtitles button in the remote bar (only while media is
+                      playing on TV). The button starts grey (off) each session/title;
+                      it turns blue after you enable captions. Click to turn on or off —
+                      no auto-apply when playback starts.
                     </p>
                   </div>
                 </label>
@@ -472,12 +478,13 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
                     </div>
                   </div>
                   <p className="text-xs text-zinc-500 leading-relaxed">
-                    The bar row has 3 options: Start again, Subtitles, Audio options.
-                    From screengrab.jpg: the Prime bar shows Cast, Start again, Subtitles CC, volume.
-                    We send PAUSE (to surface), LEFT-home to first, RIGHT×N (default 1 = Subtitles CC)
-                    + ENTER. Briefly pauses for menu; we resume after. Section left=0 (dedicated Subs CC button);
-                    set to 1 only if combined Audio+Subs panel opens focused on Audio. Menu down (-1=auto; 0=Off).
-                    Tune per your TV.
+                    Pause bar (left→right): Start again, Subtitles CC, Audio (speaker).
+                    Navigation: PAUSE → DOWN to the icon row → LEFT-home to Start again →
+                    RIGHT×N (default <strong>1</strong> = Subtitles CC) → ENTER.
+                    RIGHT×2 or 3 selects Audio instead — avoid those. Section left/up stay 0 for the
+                    dedicated Subtitles button; set only if a combined Audio+Subs panel opens on Audio.
+                    Menu down: -1=auto (Off=0, On=1 in the Subtitles column).
+                    Tune per your TV if a title uses a different list order.
                   </p>
                 </div>
               </div>

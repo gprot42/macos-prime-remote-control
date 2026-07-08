@@ -109,13 +109,16 @@ pub struct AppConfig {
     /// Show subtitle on/off controls (language configured here; toggled in the remote bar).
     #[serde(default = "default_false")]
     pub subtitles_enabled: bool,
+    /// Last known on-TV captions state (Prime recalls this across titles).
+    #[serde(default = "default_false")]
+    pub subtitles_active: bool,
     /// Preferred subtitle language code (e.g. "en", "sv").
     #[serde(default = "default_subtitle_language")]
     pub subtitle_language: String,
     /// DOWN-key presses to surface the transport row (Start again / Subtitles / Audio).
     #[serde(default = "default_subtitle_focus_down")]
     pub subtitle_focus_down: i32,
-    /// RIGHT presses after LEFT-homing to the left of the row (1 = Subtitles CC, per screengrab.jpg).
+    /// RIGHT presses after LEFT-homing to Start again (1 = Subtitles CC; 2/3 select Audio — see screengrab.jpg).
     #[serde(default = "default_subtitle_focus_right")]
     pub subtitle_focus_right: i32,
     /// UP presses inside the panel to select Subtitles instead of Audio.
@@ -190,6 +193,7 @@ impl Default for AppConfig {
             default_tv_volume: default_tv_volume(),
             apply_default_tv_volume: true,
             subtitles_enabled: false,
+            subtitles_active: false,
             subtitle_language: default_subtitle_language(),
             subtitle_focus_down: default_subtitle_focus_down(),
             subtitle_focus_right: default_subtitle_focus_right(),
@@ -298,15 +302,36 @@ fn config_path() -> PathBuf {
     home_dir().join(".config").join("prime-remote-control.json")
 }
 
+/// Normalize subtitle bar navigation after left-homing was added.
+///
+/// Prime's pause bar (see screengrab.jpg) is:
+///   Start again → Subtitles CC → Audio (speaker)
+/// After LEFT-homing to Start again, only RIGHT×1 selects Subtitles. Legacy
+/// configs used RIGHT×2 (pre-homing default) or 3+ (manual overshoot) and open
+/// Audio options instead — migrate those to 1.
+fn migrate_subtitle_focus_right(value: i32) -> i32 {
+    match value {
+        2 | 3 => 1,
+        n => n,
+    }
+}
+
 fn load_config() -> AppConfig {
     let path = config_path();
     if path.exists() {
         if let Ok(data) = std::fs::read_to_string(&path) {
             if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&data) {
-                if let Ok(cfg) = serde_json::from_value::<AppConfig>(raw.clone()) {
-                    let needs_save = raw.get("default_tv_volume").is_none()
+                if let Ok(mut cfg) = serde_json::from_value::<AppConfig>(raw.clone()) {
+                    let migrated_right = migrate_subtitle_focus_right(cfg.subtitle_focus_right);
+                    let right_migrated = migrated_right != cfg.subtitle_focus_right;
+                    if right_migrated {
+                        cfg.subtitle_focus_right = migrated_right;
+                    }
+                    let needs_save = right_migrated
+                        || raw.get("default_tv_volume").is_none()
                         || raw.get("apply_default_tv_volume").is_none()
                         || raw.get("subtitles_enabled").is_none()
+                        || raw.get("subtitles_active").is_none()
                         || raw.get("subtitle_language").is_none()
                         || raw.get("subtitle_focus_down").is_none()
                         || raw.get("subtitle_focus_right").is_none()
@@ -1580,11 +1605,14 @@ async fn run_tv_media_cmd(flag: &str) -> Result<(), String> {
 }
 
 fn append_subtitle_args(cmd: &mut tokio::process::Command, cfg: &AppConfig, language: &str) {
+    // Coerce legacy focus-right (2/3 → Audio) so TV commands hit Subtitles CC
+    // even if config on disk has not been re-saved since the LEFT-home change.
+    let focus_right = migrate_subtitle_focus_right(cfg.subtitle_focus_right).clamp(-1, 20);
     cmd.arg("--set-subtitles").arg(language);
     cmd.arg("--subtitle-focus-down")
         .arg(cfg.subtitle_focus_down.clamp(0, 5).to_string());
     cmd.arg("--subtitle-focus-right")
-        .arg(cfg.subtitle_focus_right.clamp(-1, 20).to_string());
+        .arg(focus_right.to_string());
     cmd.arg("--subtitle-section-up")
         .arg(cfg.subtitle_section_up.clamp(0, 5).to_string());
     cmd.arg("--subtitle-section-left")
@@ -1633,6 +1661,14 @@ async fn set_tv_subtitles(enabled: bool) -> Result<(), String> {
         let out = String::from_utf8_lossy(&output.stdout).to_string();
         let detail = if err.trim().is_empty() { out } else { err };
         return Err(format!("TV subtitle command failed: {detail}"));
+    }
+
+    // Remember last successful apply so the remote button stays in sync when
+    // Prime recalls the same caption preference on the next title/resume.
+    let mut cfg = load_config();
+    if cfg.subtitles_active != enabled {
+        cfg.subtitles_active = enabled;
+        let _ = save_config_to_disk(&cfg);
     }
     Ok(())
 }

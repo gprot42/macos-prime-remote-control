@@ -97,18 +97,38 @@ export interface AppConfig {
   apply_default_tv_volume?: boolean;
   /** Show subtitle controls in the remote bar (on/off toggled there). */
   subtitles_enabled?: boolean;
+  /**
+   * Last successful caption toggle from this app (diagnostic / future use).
+   * The remote button does not restore this on startup — it always starts off
+   * (grey) per session so it is not blue while TV captions are off.
+   */
+  subtitles_active?: boolean;
   /** Preferred subtitle language code (see SUBTITLE_LANGUAGES). */
   subtitle_language?: string;
   /** DOWN-key presses after pause to reach Prime's transport icon row. */
   subtitle_focus_down?: number;
-  /** RIGHT-key presses to reach the Audio & Subtitles button. */
+  /**
+   * RIGHT presses *after LEFT-homing* to Start again on the pause bar.
+   * From screengrab.jpg: Start again → Subtitles CC → Audio; use 1 for Subtitles.
+   * Values 2–3 are legacy (select Audio) and are migrated to 1.
+   */
   subtitle_focus_right?: number;
   /** UP presses inside the panel to select Subtitles instead of Audio. */
   subtitle_section_up?: number;
   /** LEFT presses inside the panel to reach the Subtitles column. */
   subtitle_section_left?: number;
-  /** DOWN-key presses in the subtitle menu (-1 = auto from language). */
+  /** DOWN-key presses in the Subtitles column (-1 = auto: Off=0, On=1). */
   subtitle_menu_down?: number;
+}
+
+/**
+ * Legacy focus-right values from before LEFT-homing. With the current bar
+ * (Start again → Subtitles CC → Audio), 2 and 3 open Audio instead of Subtitles.
+ */
+export function migrateSubtitleFocusRight(value: number | undefined): number {
+  if (value === undefined || value === null || Number.isNaN(value)) return 1;
+  if (value === 2 || value === 3) return 1;
+  return value;
 }
 
 export type PlaybackTarget = "tv" | "mac";
@@ -147,11 +167,14 @@ export const DEFAULT_CONFIG: AppConfig = {
   default_tv_volume: 13,
   apply_default_tv_volume: true,
   subtitles_enabled: false,
+  subtitles_active: false,
   subtitle_language: "en",
   subtitle_focus_down: 1,
+  // After LEFT-home: 1 = Subtitles CC (screengrab.jpg). 2/3 = Audio — do not use.
   subtitle_focus_right: 1,
   subtitle_section_up: 0,
-  subtitle_section_left: 0,  // 0 for dedicated "Subtitles CC" (see screengrab.jpg); 1 if combined panel starts on Audio
+  // 0 for dedicated Subtitles CC (screengrab.jpg); 1 only if combined panel starts on Audio
+  subtitle_section_left: 0,
   subtitle_menu_down: -1,
 };
 

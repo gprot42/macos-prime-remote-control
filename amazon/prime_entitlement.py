@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import ssl
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -497,12 +498,15 @@ def _start_seconds_from_playback_url(url: str | None) -> int | None:
 def resume_start_seconds_from_html(html: str, content_id: str) -> int | None:
     """Return the saved resume position (seconds) from a Prime detail page, if any."""
     content_id = content_id.strip()
+    print(f"[RESUME-SCRAPE] scanning for resume on {content_id} (html len={len(html)})", file=sys.stderr)
     for label in ("Resume", "Continue watching", "Continue Watching"):
-        seconds = _start_seconds_from_playback_url(
-            _playback_url_from_label(html, label)
-        )
+        url = _playback_url_from_label(html, label)
+        seconds = _start_seconds_from_playback_url(url)
         if seconds is not None:
+            print(f"[RESUME-SCRAPE] found via label '{label}': {seconds}s url_snip={str(url)[:120] if url else None}", file=sys.stderr)
             return seconds
+        elif url:
+            print(f"[RESUME-SCRAPE] label '{label}' had url but no usable t=: {str(url)[:120]}", file=sys.stderr)
     for pattern in (
         r'"timeOffsetInSeconds":(\d+)',
         r'"resumeTime":(\d+)',
@@ -516,7 +520,9 @@ def resume_start_seconds_from_html(html: str, content_id: str) -> int | None:
             except ValueError:
                 continue
             if seconds > 0:
+                print(f"[RESUME-SCRAPE] found via json pattern {pattern}: {seconds}s", file=sys.stderr)
                 return seconds
+    print("[RESUME-SCRAPE] no resume position found (unsigned page likely has none)", file=sys.stderr)
     return None
 
 
@@ -531,13 +537,29 @@ def playback_launch_target_from_html(html: str, content_id: str) -> str | None:
     for label in ("Watch now", "Resume", "Continue watching", "Continue Watching"):
         playback_url = _playback_url_from_label(html, label)
         if playback_url and "autoplay=1" in playback_url:
+            # Strip any t= the page-provided URL carries. For natural resume play
+            # we do not want to force a position from the (often public/unsigned)
+            # page data; the signed-in TV app will apply its own resume. When an
+            # explicit start offset is wanted, the caller will re-apply ?t=N.
+            playback_url = re.sub(r"[?&]t=\d+(&|$)", lambda m: m.group(1) or "", playback_url)
+            playback_url = re.sub(r"\?&", "?", playback_url)
+            playback_url = re.sub(r"&+", "&", playback_url).rstrip("&?")
+            if "autoplay=1" not in playback_url:
+                sep = "&" if "?" in playback_url else "?"
+                playback_url = f"{playback_url}{sep}autoplay=1"
             return playback_url
     labels = playback_labels_from_html(html, content_id)
     if has_watchable_play_button(labels):
         resume_seconds = resume_start_seconds_from_html(html, content_id)
-        if resume_seconds is not None:
-            return f"/detail/{content_id}?autoplay=1&t={resume_seconds}"
-        return f"/detail/{content_id}?autoplay=1&t=0"
+        if resume_seconds is not None and resume_seconds > 0:
+            return f"https://app.primevideo.com/detail/{content_id}?autoplay=1&t={resume_seconds}"
+        # No explicit start and no (public) resume offset found → use autoplay=1
+        # WITHOUT a t= param. This lets the native Prime app on the TV honour
+        # its per-profile resume position instead of forcing t=0 (beginning).
+        # When an explicit --start > 0 is provided, the caller overrides with
+        # _prime_target_with_start_offset which forces &t=N.
+        # Prefer the app. subdomain for contentTarget deep links to the TV app.
+        return f"https://app.primevideo.com/detail/{content_id}?autoplay=1"
     return None
 
 
