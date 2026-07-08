@@ -149,9 +149,9 @@ export const DEFAULT_CONFIG: AppConfig = {
   subtitles_enabled: false,
   subtitle_language: "en",
   subtitle_focus_down: 1,
-  subtitle_focus_right: 2,
+  subtitle_focus_right: 1,
   subtitle_section_up: 0,
-  subtitle_section_left: 0,
+  subtitle_section_left: 0,  // 0 for dedicated "Subtitles CC" (see screengrab.jpg); 1 if combined panel starts on Audio
   subtitle_menu_down: -1,
 };
 

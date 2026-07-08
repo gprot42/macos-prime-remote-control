@@ -112,16 +112,16 @@ pub struct AppConfig {
     /// Preferred subtitle language code (e.g. "en", "sv").
     #[serde(default = "default_subtitle_language")]
     pub subtitle_language: String,
-    /// DOWN-key presses after pause to reach Prime's transport icon row.
+    /// DOWN-key presses to surface the transport row (Start again / Subtitles / Audio).
     #[serde(default = "default_subtitle_focus_down")]
     pub subtitle_focus_down: i32,
-    /// RIGHT-key presses to reach the Audio & Subtitles button.
+    /// RIGHT presses after LEFT-homing to the left of the row (1 = Subtitles CC, per screengrab.jpg).
     #[serde(default = "default_subtitle_focus_right")]
     pub subtitle_focus_right: i32,
     /// UP presses inside the panel to select Subtitles instead of Audio.
     #[serde(default = "default_subtitle_section_up")]
     pub subtitle_section_up: i32,
-    /// LEFT presses inside the panel to reach the Subtitles column.
+    /// LEFT presses inside the panel to reach the Subtitles column (0 for dedicated Subs CC button per screengrab.jpg).
     #[serde(default = "default_subtitle_section_left")]
     pub subtitle_section_left: i32,
     /// DOWN-key presses in the subtitle menu (-1 = auto from language).
@@ -142,7 +142,7 @@ fn default_subtitle_focus_down() -> i32 {
 }
 
 fn default_subtitle_focus_right() -> i32 {
-    2
+    1
 }
 
 fn default_subtitle_section_up() -> i32 {
@@ -609,6 +609,7 @@ fn detect_prime_region() -> Option<String> {
              AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         )
         .set("Accept-Language", "en-GB,en;q=0.9")
+        .timeout(std::time::Duration::from_secs(5))
         .call()
         .ok()?;
     let html = response.into_string().ok()?;
@@ -655,7 +656,9 @@ fn sync_region_cache() -> String {
 
 fn catalog_cache_key(cfg: &AppConfig, collection: &str) -> String {
     if cfg.detect_vpn_region {
-        let region = sync_region_cache();
+        // Fast path: use stored region (no network). sync_region_cache() is called
+        // explicitly before actual fetches to handle region changes.
+        let region = read_stored_region().unwrap_or_else(|| "unknown".to_string());
         format!("collection_{region}_{collection}")
     } else {
         format!("collection_{collection}")
@@ -664,7 +667,7 @@ fn catalog_cache_key(cfg: &AppConfig, collection: &str) -> String {
 
 fn search_cache_key(cfg: &AppConfig, query: &str) -> String {
     if cfg.detect_vpn_region {
-        let region = sync_region_cache();
+        let region = read_stored_region().unwrap_or_else(|| "unknown".to_string());
         format!("search_{region}_{}", query.trim().to_lowercase())
     } else {
         format!("search_{}", query.trim().to_lowercase())
@@ -987,14 +990,23 @@ async fn clear_all_cache() -> Result<(), String> {
 
 /// Return the Prime Video storefront region detected for the current IP (e.g. UK, SE).
 #[tauri::command]
-fn get_prime_region() -> String {
+async fn get_prime_region() -> String {
     let cfg = load_config();
     if !cfg.detect_vpn_region {
         return "unknown".to_string();
     }
-    detect_prime_region()
-        .or_else(read_stored_region)
-        .unwrap_or_else(|| "unknown".to_string())
+    if let Some(stored) = read_stored_region() {
+        return stored;
+    }
+    // First time or no cache: compute via blocking I/O but on the blocking thread pool
+    // so we don't starve async workers or (in some contexts) block the main event loop.
+    match tauri::async_runtime::spawn_blocking(detect_prime_region).await {
+        Ok(Some(region)) => {
+            let _ = write_stored_region(&region);
+            region
+        }
+        _ => read_stored_region().unwrap_or_else(|| "unknown".to_string()),
+    }
 }
 
 fn public_ip_state_path() -> PathBuf {
@@ -1048,20 +1060,21 @@ fn detect_public_ip() -> Option<(String, String)> {
 /// Return the outgoing public IP address and country (e.g. the VPN exit), so the
 /// user can confirm which network/location Prime Video sees them from.
 #[tauri::command]
-fn get_public_ip() -> serde_json::Value {
+async fn get_public_ip() -> serde_json::Value {
     let cfg = load_config();
     if !cfg.detect_vpn_region {
         return serde_json::json!({ "ip": null, "country": null });
     }
-    match detect_public_ip() {
-        Some((ip, country)) => {
+    if let Some((ip, country)) = read_stored_public_ip() {
+        return serde_json::json!({ "ip": ip, "country": country });
+    }
+    // First time: detect on blocking pool to avoid main-thread / event-loop hang.
+    match tauri::async_runtime::spawn_blocking(detect_public_ip).await {
+        Ok(Some((ip, country))) => {
             let _ = write_stored_public_ip(&ip, &country);
             serde_json::json!({ "ip": ip, "country": country })
         }
-        None => match read_stored_public_ip() {
-            Some((ip, country)) => serde_json::json!({ "ip": ip, "country": country }),
-            None => serde_json::json!({ "ip": null, "country": null }),
-        },
+        _ => serde_json::json!({ "ip": null, "country": null }),
     }
 }
 
@@ -1074,9 +1087,27 @@ fn get_public_ip() -> serde_json::Value {
 #[tauri::command]
 async fn load_catalog(collection: String, force_refresh: bool) -> Result<String, String> {
     let cfg = load_config();
+
+    // Always use fast (stored) key for initial cache lookup. This is critical to
+    // avoid blocking the main thread/event loop (which was causing hangs during
+    // get_prime_region / cache ops on startup).
     let cache_key = catalog_cache_key(&cfg, &collection);
 
     // Try cache first
+    if !force_refresh {
+        if let Some(cached) = read_cache(&cache_key, cfg.cache_ttl_secs) {
+            return Ok(cached);
+        }
+    }
+
+    // Only on miss/force do we pay for network detect + possible cache clear.
+    // Use spawn_blocking so a slow network detect doesn't block the tokio worker thread.
+    if cfg.detect_vpn_region {
+        let _ = tauri::async_runtime::spawn_blocking(sync_region_cache).await;
+    }
+    let cache_key = catalog_cache_key(&cfg, &collection);
+
+    // Re-check after possible sync
     if !force_refresh {
         if let Some(cached) = read_cache(&cache_key, cfg.cache_ttl_secs) {
             return Ok(cached);
@@ -1092,12 +1123,22 @@ async fn load_catalog(collection: String, force_refresh: bool) -> Result<String,
         .to_string_lossy()
         .to_string();
 
-    let output = tokio::process::Command::new(&python)
-        .arg(&script)
+    let mut cmd = tokio::process::Command::new(&python);
+    cmd.arg(&script)
         .arg("--collection")
         .arg(&collection)
         .arg("--resolve-entitlement")
-        .arg("--json")
+        .arg("--json");
+    // "Included with Prime" is a very large storefront (many rows). Use the
+    // faster first-page-per-row mode to keep load times reasonable while
+    // still returning hundreds of titles. Other collections/genres keep full
+    // carousel expansion.
+    if collection.eq_ignore_ascii_case("IncludedwithPrime")
+        || collection.eq_ignore_ascii_case("IncludedWithPrime")
+    {
+        cmd.arg("--no-full-carousels");
+    }
+    let output = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -1129,6 +1170,8 @@ async fn load_catalog(collection: String, force_refresh: bool) -> Result<String,
 #[tauri::command]
 async fn search_catalog(query: String, force_refresh: bool) -> Result<String, String> {
     let cfg = load_config();
+
+    // Fast key for hit check (no network)
     let cache_key = search_cache_key(&cfg, &query);
     let search_ttl = 3600u64; // 1 hour
 
@@ -1137,6 +1180,12 @@ async fn search_catalog(query: String, force_refresh: bool) -> Result<String, St
             return Ok(cached);
         }
     }
+
+    // Only pay detect cost on miss/force. spawn_blocking to not block async worker.
+    if cfg.detect_vpn_region {
+        let _ = tauri::async_runtime::spawn_blocking(sync_region_cache).await;
+    }
+    let cache_key = search_cache_key(&cfg, &query);
 
     let root = resolve_project_root(&cfg);
     let python = python_exe(&root);
@@ -1606,13 +1655,21 @@ async fn media_control(action: String) -> Result<(), String> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Open Prime Video in an in-app browser window for Mac playback.
-#[tauri::command]
-async fn play_on_mac(
-    app: tauri::AppHandle,
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlayOnMacArgs {
     content_id: String,
     episode: Option<i32>,
     title: Option<String>,
-) -> Result<(), String> {
+}
+
+#[tauri::command]
+async fn play_on_mac(app: tauri::AppHandle, args: PlayOnMacArgs) -> Result<(), String> {
+    let PlayOnMacArgs {
+        content_id,
+        episode,
+        title,
+    } = args;
     let cfg = load_config();
     let (url, resolved_title) = resolve_prime_play_url(&cfg, &content_id, episode).await?;
     let parsed = validate_prime_video_url(&url)?;
@@ -1648,15 +1705,25 @@ async fn clear_prime_login(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 /// Send a title to the LG TV for playback. Streams progress via "play-progress" events.
-#[tauri::command]
-async fn play_on_tv(
-    app: tauri::AppHandle,
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlayOnTvArgs {
     content_id: String,
     profile: i32,
     tv_ip: String,
     episode: Option<i32>,
     start_seconds: Option<i32>,
-) -> Result<String, String> {
+}
+
+#[tauri::command]
+async fn play_on_tv(app: tauri::AppHandle, args: PlayOnTvArgs) -> Result<String, String> {
+    let PlayOnTvArgs {
+        content_id,
+        profile,
+        tv_ip,
+        episode,
+        start_seconds,
+    } = args;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     // Emit before taking the lock so the UI shows immediate feedback even when
@@ -1672,6 +1739,7 @@ async fn play_on_tv(
         .to_string_lossy()
         .to_string();
 
+    let _ = app.emit("play-progress", format!("[RUST-PLAY] args: content_id={content_id} episode={:?} start_seconds={:?} profile={}\n", episode, start_seconds, profile));
     let _ = app.emit("play-progress", format!("Connecting to TV at {tv_ip}...\n"));
 
     let mut command = tokio::process::Command::new(&python);
@@ -1766,8 +1834,17 @@ async fn play_on_tv(
 /// `content_id` is forwarded to Python so it can try re-launching the app
 /// at the desired position when the SSAP seek command is unsupported.
 /// `episode` lets the seek target a specific episode of a series.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SeekToArgs {
+    seconds: f64,
+    content_id: Option<String>,
+    episode: Option<i32>,
+}
+
 #[tauri::command]
-async fn seek_to(seconds: f64, content_id: Option<String>, episode: Option<i32>) -> Result<(), String> {
+async fn seek_to(app: tauri::AppHandle, args: SeekToArgs) -> Result<(), String> {
+    let SeekToArgs { seconds, content_id, episode } = args;
     let _tv = tv_cmd_lock().lock().await;
     let cfg = load_config();
     let root = resolve_project_root(&cfg);
@@ -1777,6 +1854,8 @@ async fn seek_to(seconds: f64, content_id: Option<String>, episode: Option<i32>)
         .join("lg-tv-connect.py")
         .to_string_lossy()
         .to_string();
+
+    let _ = app.emit("play-progress", format!("[RUST-SEEK] seek_to args seconds={} content_id={:?} episode={:?}\n", seconds, content_id, episode));
 
     let pos_str = format!("{:.0}", seconds.max(0.0));
     let mut cmd = tokio::process::Command::new(&python);
@@ -1795,24 +1874,49 @@ async fn seek_to(seconds: f64, content_id: Option<String>, episode: Option<i32>)
         }
     }
 
-    cmd.arg("--profile").arg(cfg.profile.to_string());
+    // Do not pass --profile for seek. Profile selection after a timed
+    // relaunch can send keys that pause playback or prevent ?t= from applying.
+    // Profile handling belongs to the initial play/launch flow.
+
+    let _ = app.emit("play-progress", format!("[RUST-SEEK] calling python --seek {} content_id={:?} episode={:?}\n", pos_str, content_id, episode));
 
     let output = run_tv_command(cmd, TV_CMD_TIMEOUT).await?;
+
+    // Emit captured output so user can see the [SEEK] logs even for seek
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stdout.lines() {
+        if !line.trim().is_empty() {
+            let _ = app.emit("play-progress", format!("{line}\n"));
+        }
+    }
+    for line in stderr.lines() {
+        if !line.trim().is_empty() {
+            let _ = app.emit("play-progress", format!("[err] {line}\n"));
+        }
+    }
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr).to_string();
         return Err(format!("seek failed: {err}"));
     }
+    let _ = app.emit("play-progress", "[RUST-SEEK] python seek command succeeded\n".to_string());
     Ok(())
 }
 
 /// Read Prime's saved resume position for a title (seconds, or null).
 /// Fetches the Prime detail page only — no TV connection.
-#[tauri::command]
-async fn get_resume_position(
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetResumePositionArgs {
     content_id: String,
     episode: Option<i32>,
-) -> Result<serde_json::Value, String> {
+}
+
+#[tauri::command]
+async fn get_resume_position(app: tauri::AppHandle, args: GetResumePositionArgs) -> Result<serde_json::Value, String> {
+    let GetResumePositionArgs { content_id, episode } = args;
+    let _ = app.emit("play-progress", format!("[RUST-RESUME] get_resume_position args content_id={} episode={:?}\n", content_id, episode));
     let cfg = load_config();
     let root = resolve_project_root(&cfg);
     let python = python_exe(&root);
@@ -1837,15 +1941,27 @@ async fn get_resume_position(
 
     let output = run_tv_command(cmd, TV_CMD_TIMEOUT).await?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let json_line = stdout
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    for line in stdout_str.lines() {
+        if !line.trim().is_empty() {
+            let _ = app.emit("play-progress", format!("{line}\n"));
+        }
+    }
+    for line in stderr_str.lines() {
+        if !line.trim().is_empty() {
+            let _ = app.emit("play-progress", format!("[err] {line}\n"));
+        }
+    }
+
+    let json_line = stdout_str
         .lines()
         .filter(|l| l.trim_start().starts_with('{'))
         .last()
         .unwrap_or(r#"{"position":null}"#);
 
     if !output.status.success() && json_line == r#"{"position":null}"# {
-        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        let err = stderr_str.to_string();
         return Err(format!("resume position failed: {err}"));
     }
 
@@ -1883,8 +1999,15 @@ async fn get_playback_position() -> Result<serde_json::Value, String> {
 /// List episodes for a TV season/series content_id. Returns the JSON array
 /// string produced by `lg-tv-connect.py --list-episodes` (no TV connection
 /// needed — it only fetches the Prime Video detail page).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListEpisodesArgs {
+    content_id: String,
+}
+
 #[tauri::command]
-async fn list_episodes(content_id: String) -> Result<String, String> {
+async fn list_episodes(args: ListEpisodesArgs) -> Result<String, String> {
+    let ListEpisodesArgs { content_id } = args;
     let cfg = load_config();
     let root = resolve_project_root(&cfg);
     let python = python_exe(&root);
@@ -2395,6 +2518,19 @@ pub fn run() {
                 let port = start_image_server().await;
                 *port_arc.lock().unwrap() = port;
             });
+
+            // Run region/IP detection in background thread so get_prime_region/get_public_ip
+            // and early cache key computation never block the main thread or event loop.
+            // This prevents UI hangs on startup (see previous hang reports from ureq blocking).
+            tauri::async_runtime::spawn_blocking(|| {
+                if let Some(region) = detect_prime_region() {
+                    let _ = write_stored_region(&region);
+                }
+                if let Some((ip, country)) = detect_public_ip() {
+                    let _ = write_stored_public_ip(&ip, &country);
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

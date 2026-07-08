@@ -360,6 +360,31 @@ export default function TVRemote({
         setTvOnState(false);
       } else if (/(^|\n)\s*done\.?\s*$/i.test(line)) {
         setTvOnState(true);
+        // Once launch fully done, sync the bar to actual TV position (important
+        // for resume cases where scrape gave null and initial bar is 0).
+        syncFromTV().catch(() => {});
+      } else if (/connected|launched|sent play|autoplay/i.test(line)) {
+        // Early after connect/launch, try a sync soon to catch resume pos.
+        setTimeout(() => syncFromTV().catch(() => {}), 3000);
+      }
+      // If the python play flow emitted the actual TV position (post start_playback
+      // _playback_position), use it to seed the bar for resume cases.
+      const posMatch = line.match(/"resume_position_from_tv"\s*:\s*([0-9.]+)/);
+      if (posMatch) {
+        const p = parseFloat(posMatch[1]);
+        if (!isNaN(p) && p > 0) {
+          playRef.current = { pos: p, time: Date.now() };
+          setPos(p);
+        }
+      }
+      const seekMatch = line.match(/"seeked_to"\s*:\s*([0-9.]+)/);
+      if (seekMatch) {
+        const p = parseFloat(seekMatch[1]);
+        if (!isNaN(p)) {
+          playRef.current = { pos: p, time: Date.now() };
+          setPos(p);
+          setSeekPreview(null);
+        }
       }
     }).then((fn) => {
       if (active) unlisten = fn;
@@ -482,7 +507,7 @@ export default function TVRemote({
 
   const catalogSecs    = runtimeSecondsFromTitle(nowPlaying);
   const totalSecs      = tvDurationSecs ?? fetchedDurationSecs ?? catalogSecs;
-  const sliderMax      = totalSecs ?? 4 * 3600;
+  const sliderMax      = (totalSecs && totalSecs > 0) ? totalSecs : 4 * 3600;
   const displayPos     = seekPreview ?? pos;   // show preview during drag
   const knownDuration  = totalSecs !== null;
 
@@ -496,7 +521,7 @@ export default function TVRemote({
   useEffect(() => {
     if (catalogSecs !== null || !episode || episode < 1 || !seriesContentId) return;
     let active = true;
-    invoke<string>("list_episodes", { contentId: seriesContentId })
+    invoke<string>("list_episodes", { args: { contentId: seriesContentId } })
       .then((raw) => {
         if (!active) return;
         let list: PrimeEpisode[] = [];
@@ -519,6 +544,9 @@ export default function TVRemote({
 
   // Seed position when a new title starts. Fetch Prime's saved resume offset so
   // the bar shows e.g. 31:23 / 53:23 when playback resumes mid-title.
+  // NOTE: public scrape often fails to return personal resume for episodes (null),
+  // so we also do a delayed one-time get_playback_position to capture where
+  // Prime actually started (native resume pos) and correct the bar.
   useEffect(() => {
     if (!seekEnabled || !nowPlaying) return;
     let active = true;
@@ -527,19 +555,57 @@ export default function TVRemote({
     setSeekPreview(null);
     isDraggingRef.current = false;
 
-    const resumeContentId = seriesContentId ?? nowPlaying.content_id;
+    let resumeContentId = seriesContentId ?? nowPlaying.content_id;
+    if (resumeContentId && resumeContentId.startsWith("episode:")) {
+      resumeContentId = resumeContentId.slice(8);
+    }
+    console.log("[RESUME-SEED] nowPlaying.content_id=", nowPlaying?.content_id, "seriesContentId=", seriesContentId, "episode=", episode, "effective resumeContentId=", resumeContentId);
+    let gotResumeFromScrape = false;
     invoke<{ position: number | null }>("get_resume_position", {
-      contentId: resumeContentId,
-      episode: episode ?? null,
+      args: {
+        contentId: resumeContentId,
+        episode: episode ?? null,
+      },
     })
       .then((r) => {
+        console.log("[RESUME-SEED] get_resume_position result:", r);
         if (!active || r.position == null || r.position < 1) return;
+        gotResumeFromScrape = true;
         playRef.current = { pos: r.position, time: Date.now() };
         setPos(r.position);
       })
-      .catch(() => {});
+      .catch((e) => { console.log("[RESUME-SEED] get_resume error", e); });
 
-    return () => { active = false; };
+    // Delayed sync(s) to pull real pos from TV after playback has started.
+    // The unsigned scrape (get_resume_position) almost always returns null for
+    // personal resume positions. We rely on get_playback_position after launch.
+    // Try a few times because the first report may be 0 or unavailable until
+    // the player has settled.
+    const doSync = (delay: number, attempt: number) => setTimeout(() => {
+      if (!active || gotResumeFromScrape) return;
+      console.log(`[RESUME-SEED] delayed get_playback (attempt ${attempt})`);
+      invoke<{ position: number | null; duration: number | null }>("get_playback_position")
+        .then((r) => {
+          console.log("[RESUME-SEED] delayed get_playback result:", r);
+          if (active && r && typeof r.position === "number" && r.position > 0) {
+            // Only correct if we got a meaningful >0 position (resume or current)
+            gotResumeFromScrape = true; // prevent further
+            playRef.current = { pos: r.position, time: Date.now() };
+            setPos(r.position);
+          } else if (attempt < 3) {
+            // try again
+            doSync(3000, attempt + 1);
+          }
+        })
+        .catch((e) => console.log("[RESUME-SEED] delayed get_playback error", e));
+    }, delay);
+
+    doSync(6000, 1);
+
+    return () => {
+      active = false;
+      // Timers are short and recursive only on failure; no need to clear all
+    };
   }, [nowPlaying?.content_id, episode, seekEnabled, seriesContentId]); // eslint-disable-line
 
   // NOTE: We intentionally do NOT auto-poll the TV for playback position.
@@ -576,13 +642,19 @@ export default function TVRemote({
     if (!seekEnabled || !nowPlaying) return;
     playRef.current = { pos: seconds, time: Date.now() };
     setPos(seconds); setSeekPreview(null);
-    const seekContentId = seriesContentId ?? nowPlaying.content_id;
+    let seekContentId = seriesContentId ?? nowPlaying.content_id;
+    if (seekContentId && seekContentId.startsWith("episode:")) {
+      seekContentId = seekContentId.slice(8);
+    }
     const seekEpisode = seriesContentId ? (episode ?? null) : null;
+    console.log("[SEEK-COMMIT] seconds=", seconds, "seriesContentId=", seriesContentId, "episode=", episode, "effective seekContentId=", seekContentId, "seekEpisode=", seekEpisode, "nowPlaying.content_id=", nowPlaying.content_id);
     invoke("seek_to", {
-      seconds,
-      contentId: seekContentId,
-      episode: seekEpisode,
-    }).catch(() => {});
+      args: {
+        seconds,
+        contentId: seekContentId,
+        episode: seekEpisode,
+      },
+    }).catch((e) => console.log("[SEEK-COMMIT] error", e));
   }, [seekEnabled, nowPlaying, episode, seriesContentId]);
 
   const parseTimeStr = (s: string): number | null => {
@@ -669,6 +741,8 @@ export default function TVRemote({
   const [subtitleErr, setSubtitleErr] = useState<string | null>(null);
 
   useEffect(() => {
+    // Subtitles are never auto-applied on new media. They stay off until the
+    // user explicitly clicks the subtitles button (the blue box).
     setSubtitlesOn(false);
     setSubtitleErr(null);
   }, [nowPlaying?.content_id, episode]);
@@ -676,13 +750,22 @@ export default function TVRemote({
   const toggleSubtitles = useCallback(async () => {
     if (!seekEnabled || subtitleBusy) return;
     const next = !subtitlesOn;
+    const wasPlaying = playbackState === "playing";
     setSubtitleBusy(true);
     setSubtitleErr(null);
     try {
       await invoke("set_tv_subtitles", { enabled: next });
       setSubtitlesOn(next);
       setTvOnState(true);
-      if (playbackState === "paused") onPlaybackStateChange("playing");
+      if (wasPlaying) {
+        // The transport bar navigation for subtitles can pause Prime's player.
+        // Explicitly resume via the media path (in addition to the PLAYs the
+        // Python side sends) so that turning subs on/off does not leave playback paused.
+        onPlaybackStateChange("playing");
+        try {
+          await invoke("media_control", { action: "play" });
+        } catch {}
+      }
     } catch (err) {
       const msg = String(err).replace(/^Error:\s*/, "");
       if (isTvUnreachableMessage(msg)) {
@@ -746,7 +829,7 @@ export default function TVRemote({
               <img
                 src={cachedImageSrc || nowPlaying.image_url!.replace(/\._UR\d+,\d+_\./, "._UR320,180_.")}
                 alt={nowPlaying.title}
-                className="w-full h-full object-cover"
+                className="w-full h-full object-cover object-[50%_65%]"
               />
             ) : (
               <div className="w-full h-full flex items-center justify-center">

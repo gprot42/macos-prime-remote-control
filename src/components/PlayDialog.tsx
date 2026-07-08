@@ -85,7 +85,7 @@ export default function PlayDialog({
     let active = true;
     setEpListState("loading");
     setEpisodes([]);
-    invoke<string>("list_episodes", { contentId: item.content_id })
+    invoke<string>("list_episodes", { args: { contentId: item.content_id } })
       .then((raw) => {
         if (!active) return;
         let list: PrimeEpisode[] = [];
@@ -305,7 +305,7 @@ export default function PlayDialog({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm
-                 px-4 pt-6 pb-24"
+                 px-4 pt-10 pb-24"
       onClick={(e) => {
         if (e.target === e.currentTarget && playState !== "playing") onClose();
       }}
@@ -335,7 +335,7 @@ export default function PlayDialog({
             <img
               src={imageUrl}
               alt={item.title}
-              className="w-full h-full object-cover"
+              className="w-full h-full object-cover object-[50%_70%]"
             />
           ) : (
             <div className="w-full h-full bg-gradient-to-br from-[#1A242F] to-[#0a0f15]" />
@@ -586,21 +586,33 @@ export default function PlayDialog({
 
           {/* Log output */}
           {log.length > 0 && (
-            <div
-              ref={logRef}
-              className="bg-zinc-900 rounded-xl p-3 h-36 overflow-y-auto
-                         font-mono text-[11px] leading-relaxed border border-zinc-800
-                         select-text cursor-text"
-            >
-              {log.map((line, i) => (
-                <span
-                  key={i}
-                  className={line.startsWith("[err]") ? "text-orange-300" : "text-zinc-300"}
-                >
-                  {line}
-                  {"\n"}
-                </span>
-              ))}
+            <div className="relative">
+              <button
+                onClick={() => {
+                  const text = log.join('\n');
+                  navigator.clipboard.writeText(text).catch(() => {});
+                }}
+                className="absolute right-1 top-1 z-10 text-[10px] px-1.5 py-0.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-zinc-400 hover:text-white"
+                title="Copy log to clipboard"
+              >
+                Copy
+              </button>
+              <div
+                ref={logRef}
+                className="bg-zinc-900 rounded-xl p-3 h-36 overflow-y-auto
+                           font-mono text-[11px] leading-relaxed border border-zinc-800
+                           select-text cursor-text pr-12"
+              >
+                {log.map((line, i) => (
+                  <span
+                    key={i}
+                    className={line.startsWith("[err]") ? "text-orange-300" : "text-zinc-300"}
+                  >
+                    {line}
+                    {"\n"}
+                  </span>
+                ))}
+              </div>
             </div>
           )}
 
@@ -672,7 +684,11 @@ export default function PlayDialog({
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                   </svg>
-                  {preferMac ? "Opening…" : "Connecting…"}
+                  {preferMac
+                    ? "Opening…"
+                    : log.some((l) => /connected|launched|deep.?link|sent play|autoplay|playback.*start|ready to play|contentTarget|launch result|TV launch|Done\./i.test(l))
+                      ? "Starting playback…"
+                      : "Connecting…"}
                 </>
               ) : (
                 <>

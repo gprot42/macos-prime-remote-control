@@ -94,12 +94,19 @@ DEFAULT_PROFILE_STEP_DELAY = 3.0
 PLAY_KEY_DELAY = 0.45
 SUBTITLE_KEY_DELAY = 0.4
 DEFAULT_SUBTITLE_DELAY = 0.0
-# DOWN after pause to reach the transport icon row (0 = skip).
+# DOWNs to surface/focus the transport controls row (the three options row).
+# 0 = try without extra downs (bar may appear on first action).
 DEFAULT_SUBTITLE_FOCUS_DOWN = 1
-# RIGHT presses on the pause bar to the Subtitles button (not Audio options).
-# Prime LG order: … → Start again → Subtitles → Audio options (2 reaches Subtitles).
-DEFAULT_SUBTITLE_FOCUS_RIGHT = 2
-# Only needed when one combined Audio & Subtitles panel opens (0 = separate buttons).
+# Number of RIGHTs *after homing LEFT to the leftmost of the row*.
+# From screengrab.jpg: bar shows Cast, Start again (replay), Subtitles CC, volume/speaker.
+# The 3 options are Start again → Subtitles → Audio options. Use 1 (after homing) to select Subtitles.
+# The homing makes this count reliable from the first item regardless of prior focus.
+DEFAULT_SUBTITLE_FOCUS_RIGHT = 1
+# When the picker that opens is a *combined* Audio+Subtitles panel (common), these
+# move focus from the Audio side/column/tab over to Subtitles. 0 = skip (use if you
+# targeted a dedicated Subtitles button that already focuses the subs list directly).
+# From screengrab.jpg the bar has a dedicated "Subtitles CC" button so default 0.
+# Use 1 (LEFT) only if a combined panel opens focused on the Audio side.
 DEFAULT_SUBTITLE_SECTION_UP = 0
 DEFAULT_SUBTITLE_SECTION_LEFT = 0
 # Down-steps from the top of Prime's subtitle menu (0 = Off). Available tracks
@@ -132,6 +139,12 @@ PRIME_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+
+# For public scraping / catalog pages use www; for deep-link contentTarget to the
+# native Prime app on webOS/TV, app.primevideo.com is the domain that works for
+# client deep links (per community reports and Amazon deep link notes).
+PRIME_WWW_BASE = "https://www.primevideo.com"
+PRIME_DEEP_LINK_BASE = "https://app.primevideo.com"
 
 
 def load_key() -> str | None:
@@ -284,7 +297,7 @@ async def cmd_apps(client: "WebOsClient") -> None:
 
 
 def _prime_detail_url(content_id: str) -> str:
-    return f"https://www.primevideo.com/detail/{content_id}"
+    return f"{PRIME_WWW_BASE}/detail/{content_id}"
 
 
 def _fetch_prime_html(content_id: str) -> str:
@@ -345,6 +358,7 @@ def _is_autoplay_target(target: str) -> bool:
 def _prime_target_uses_params(target: str) -> bool:
     return (
         target.startswith("/detail/")
+        or "primevideo.com/detail/" in target
         or target.startswith("primevideo://")
         or "autoplay=" in target
     )
@@ -354,13 +368,13 @@ def _prime_target_with_start_offset(target: str, pos: int) -> str:
     """Return a Prime autoplay deep link that starts playback at `pos` seconds.
 
     Prime Video on webOS honours the ``?t=<seconds>`` query param of the
-    contentTarget deep link (the same mechanism the normal play path uses with
-    ``t=0``). The plain ``{"startTime": N}`` launch param, by contrast, is
-    ignored by Prime's player — which made seeking silently do nothing.
+    contentTarget deep link. Use the app.primevideo.com domain for native app
+    deep links (more reliable per deep-link reports). Bare startTime param is
+    ignored by Prime.
     """
     if not _prime_target_uses_params(target):
-        # Bare content / detail ID → build the detail deep link used for play.
-        return f"/detail/{target}?autoplay=1&t={pos}"
+        # Bare content / detail ID → build using the deep link domain.
+        return f"{PRIME_DEEP_LINK_BASE}/detail/{target}?autoplay=1&t={pos}"
     # Already a deep link: set/replace t= and ensure autoplay is requested.
     if re.search(r"[?&]t=\d+", target):
         target = re.sub(r"([?&]t=)\d+", rf"\g<1>{pos}", target)
@@ -368,6 +382,9 @@ def _prime_target_with_start_offset(target: str, pos: int) -> str:
         target = f"{target}{'&' if '?' in target else '?'}t={pos}"
     if "autoplay=" not in target:
         target = f"{target}&autoplay=1"
+    # Normalize relative /detail/ targets to full deep-link URL for contentTarget.
+    if target.startswith("/detail/"):
+        target = PRIME_DEEP_LINK_BASE + target
     return target
 
 
@@ -382,12 +399,15 @@ def resolve_prime_launch_ids(
 ) -> list[str]:
     """Return Prime content IDs to try, best-first (GTI is what the TV app often expects)."""
     content_id = content_id.strip()
+    print(f"[LAUNCH-RESOLVE] ENTER content_id={content_id} episode={episode} autoplay={autoplay} start={start} prefer_episode={prefer_episode}", file=sys.stderr)
     if PRIME_GTI_RE.match(content_id) or PRIME_ASIN_RE.match(content_id):
+        print(f"[LAUNCH-RESOLVE] fast-path GTI/ASIN: {content_id}", file=sys.stderr)
         return [content_id]
 
     candidates: list[str] = []
     seen: set[str] = set()
     if not PRIME_DETAIL_ID_RE.match(content_id):
+        print(f"[LAUNCH-RESOLVE] not a detail id, returning raw: {content_id}", file=sys.stderr)
         return [content_id]
 
     page_html = html
@@ -430,8 +450,17 @@ def resolve_prime_launch_ids(
                 ("episode", selected_episode.get("content_id"))
             )
         launch_targets.append(("requested", content_id))
+        print(f"[LAUNCH-RESOLVE] initial launch_targets order: {launch_targets}", file=sys.stderr)
+
+        if not (start and start > 0):
+            if episode is None:
+                launch_targets = list(reversed(launch_targets))
+                print(f"[LAUNCH-RESOLVE] reversed to series-first for resume (no specific ep): {launch_targets}", file=sys.stderr)
+            else:
+                print(f"[LAUNCH-RESOLVE] keeping episode-first for specific ep resume: {launch_targets}", file=sys.stderr)
 
         if autoplay:
+            print(f"[LAUNCH-RESOLVE] building autoplay targets (autoplay=True)", file=sys.stderr)
             for _, target_id in launch_targets:
                 if not isinstance(target_id, str):
                     continue
@@ -457,6 +486,7 @@ def resolve_prime_launch_ids(
                     )
                 if autoplay_target:
                     _append_launch_id(candidates, seen, autoplay_target)
+                    print(f"[LAUNCH-RESOLVE] chose autoplay_target as first: {autoplay_target}", file=sys.stderr)
                     break
 
         for _, target_id in launch_targets:
@@ -468,10 +498,12 @@ def resolve_prime_launch_ids(
             for asin in resolve_asins_for_content_id(page_html, target_id):
                 _append_launch_id(candidates, seen, asin)
             _append_launch_id(candidates, seen, target_id)
+
+        print(f"[LAUNCH-RESOLVE] final candidates: {candidates}", file=sys.stderr)
     except ValueError:
         raise
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        print(f"  Warning: could not resolve GTI/ASIN ({exc}); using detail ID only.")
+        print(f"  Warning: could not resolve GTI/ASIN ({exc}); using detail ID only.", file=sys.stderr)
         _append_launch_id(candidates, seen, content_id)
 
     if not candidates:
@@ -516,8 +548,10 @@ async def launch_app(
     if content_id:
         # Prime appinfo deeplinkingParams map launch contentId -> contentTarget.
         print(f"Launching {app_id} (contentId={content_id}) ...")
+        print(f"[LUNA-EQUIV] luna-send -n 1 -f luna://com.webos.applicationManager/launch '{{ \"id\": \"{app_id}\", \"contentId\": \"{content_id}\" }}'", file=sys.stderr)
         return await client.launch_app_with_content_id(app_id, content_id)
     print(f"Launching {app_id} ...")
+    print(f"[LUNA-EQUIV] luna-send -n 1 -f luna://com.webos.applicationManager/launch '{{ \"id\": \"{app_id}\" }}'", file=sys.stderr)
     return await client.launch_app(app_id)
 
 
@@ -540,16 +574,24 @@ async def launch_prime_content(
     cold_start: bool = True,
 ) -> dict:
     """Cold-start Prime with a content deep link (relaunch drops the link)."""
+    print(f"[LAUNCH] launch_prime_content content_id={content_id} cold_start={cold_start} uses_params={_prime_target_uses_params(content_id)}", file=sys.stderr)
     if cold_start:
         if await close_app(client, PRIME_VIDEO_APP_ID):
             await asyncio.sleep(1.5)
     if _prime_target_uses_params(content_id):
-        print(f"Launching {PRIME_VIDEO_APP_ID} (contentTarget={content_id}) ...")
-        return await client.launch_app_with_params(
+        print(f"[LAUNCH] -> launch_app_with_params amazon contentTarget={content_id}", file=sys.stderr)
+        print(f"[LUNA-EQUIV] luna-send -n 1 -f luna://com.webos.applicationManager/launch '{{ \"id\": \"{PRIME_VIDEO_APP_ID}\", \"params\": {{\"contentTarget\": \"{content_id}\"}} }}'", file=sys.stderr)
+        res = await client.launch_app_with_params(
             PRIME_VIDEO_APP_ID,
             {"contentTarget": content_id},
         )
-    return await launch_app(client, PRIME_VIDEO_APP_ID, content_id=content_id)
+        print("[LAUNCH] Deep link / contentTarget sent to Prime (may still be applying profile or title page).", file=sys.stderr)
+        return res
+    print(f"[LAUNCH] -> launch_app_with_content_id amazon contentId={content_id}", file=sys.stderr)
+    print(f"[LUNA-EQUIV] luna-send -n 1 -f luna://com.webos.applicationManager/launch '{{ \"id\": \"{PRIME_VIDEO_APP_ID}\", \"contentId\": \"{content_id}\" }}'", file=sys.stderr)
+    res = await launch_app(client, PRIME_VIDEO_APP_ID, content_id=content_id)
+    print("[LAUNCH] contentId launch sent to Prime.", file=sys.stderr)
+    return res
 
 
 async def launch_prime_content_candidates(
@@ -565,6 +607,7 @@ async def launch_prime_content_candidates(
     start: int = 0,
 ) -> tuple[str, bool]:
     """Launch Prime with the best resolved content ID (or try each candidate)."""
+    print(f"[LAUNCH-CANDS] content_id={content_id} episode={episode} autoplay={autoplay} start={start} cold_start={cold_start}", file=sys.stderr)
     candidates = resolve_prime_launch_ids(
         content_id,
         html=detail_html,
@@ -580,6 +623,7 @@ async def launch_prime_content_candidates(
         launch_id = candidates[0]
         if launch_id != content_id:
             print(f"  TV launch target: {launch_id}")
+        print(f"[LAUNCH-CANDS] launching first candidate: {launch_id} (is_autoplay_target={_is_autoplay_target(launch_id)})", file=sys.stderr)
         result = await launch_prime_content(
             client, launch_id, cold_start=cold_start
         )
@@ -588,7 +632,9 @@ async def launch_prime_content_candidates(
         # own. A bare GTI/ASIN/contentId merely opens the title page — and for a
         # title with a saved position it shows "Resume" but does NOT auto-play —
         # so in that case start_playback must still press the Watch/Resume button.
-        return launch_id, _is_autoplay_target(launch_id)
+        used_auto = _is_autoplay_target(launch_id)
+        print(f"[LAUNCH-CANDS] launch result returnValue={result.get('returnValue')} used_autoplay={used_auto}", file=sys.stderr)
+        return launch_id, used_auto
 
     last_id = candidates[-1]
     for idx, launch_id in enumerate(candidates):
@@ -842,26 +888,38 @@ _MEDIA_INFO_ENDPOINTS = (
     ("ssap://com.webos.service.media.player/getInfo", {}),
     ("ssap://com.webos.service.cepswm.media.player/getInfo", {}),
     ("ssap://media.infoAction.getInfoPerApp", {"id": "amazon"}),
+    ("ssap://com.webos.service.media.player/getPlayInfo", {}),
+    ("ssap://media/getPlaybackState", {}),
+    ("ssap://com.webos.service.tv.playback/getPlaybackInfo", {}),
+    ("ssap://media.controls/getMediaInfo", {}),
 )
 
 
 async def _playback_position(client: "WebOsClient") -> float | None:
     """Best-effort current playback position (seconds) from the TV, or None.
 
-    Availability is WebOS/app-version dependent, so callers must treat ``None``
-    as *unknown*, not as "definitely not playing".
+    Availability is WebOS/app-version dependent (Prime in particular rarely
+    exposes via the standard SSAP player endpoints), so callers must treat
+    ``None`` as *unknown*. Raw results are logged for diagnostics.
     """
     for uri, payload in _MEDIA_INFO_ENDPOINTS:
         try:
             result = await client.request(uri, payload)
-        except Exception:
+        except Exception as exc:
+            print(f"[POS-TRY] {uri} exception: {exc}", file=sys.stderr)
             continue
+        # Always log what Prime/webOS actually returns (very useful when all null)
+        try:
+            print(f"[POS-TRY] {uri} -> returnValue={result.get('returnValue')} keys={list(result.keys())[:8]} sample={json.dumps({k: result.get(k) for k in list(result)[:6]})}", file=sys.stderr)
+        except Exception:
+            pass
         if not result.get("returnValue"):
             continue
         pos = (
             result.get("currentTime")
             or result.get("position")
             or result.get("mediaCurrentTime")
+            or result.get("playTime")
         )
         if pos is not None:
             try:
@@ -923,8 +981,10 @@ async def start_playback(
         # ENTER / PLAY / media key here lands on the *already-playing* video and
         # toggles it straight to PAUSE ("plays for a few seconds then pauses"),
         # so we stop here and let it run uninterrupted.
-        print("  Launched with autoplay=1; letting the player start on its own (no extra keys).")
+        print("  Launched with autoplay=1; letting the player start on its own (no extra keys).", file=sys.stderr)
+        print("[START-PLAYBACK] SKIPPED keys because used_autoplay_launch=True", file=sys.stderr)
         return
+    print(f"[START-PLAYBACK] proceeding with keys (method={resolved_method}) delay={delay}", file=sys.stderr)
 
     if resolved_method in ("watch", "enter") and not play_highlight:
         # A bare GTI/contentId launch lands in one of two states we can't predict
@@ -1002,8 +1062,15 @@ async def start_playback(
             else:
                 await client.button("ENTER")
                 print(f"  Sent ENTER on Watch/Resume button{note_detail}.")
-    else:
-        raise ValueError(f"unknown play method: {resolved_method}")
+    # After initiating playback (for resume or start), try to report the actual
+    # current position from the TV so the UI bar can be seeded correctly
+    # (the unsigned web scrape usually returns null for personal resume).
+    try:
+        pos = await _playback_position(client)
+        if pos is not None:
+            print(json.dumps({"resume_position_from_tv": pos}))
+    except Exception:
+        pass
 
 
 async def cmd_launch_prime(
@@ -1051,6 +1118,7 @@ async def cmd_launch_prime(
         detail_html = fetch_prime_detail_html(content_id)
         if detail_html:
             report_prime_entitlement(content_id, html=detail_html)
+    print(f"[CMD-LAUNCH] content_id={content_id} episode={episode} play={play} start={start} profile={profile}", file=sys.stderr)
 
     if browser:
         if not content_id:
@@ -1123,7 +1191,7 @@ async def cmd_launch_prime(
                 detail_html=detail_html,
                 episode=episode,
                 prefer_episode=play or episode is not None,
-                autoplay=play,
+                autoplay=bool(start and start > 0),
                 start=start,
             )
         else:
@@ -1133,6 +1201,7 @@ async def cmd_launch_prime(
             # straight on the title page. (Selecting the profile first and
             # deep-linking afterwards just bounces back to the picker.)
             print("  Prime flow: content deep link → profile gate → play")
+            print(f"[PLAY] profile-gate launch: content_id={content_id} episode={episode} start={start}", file=sys.stderr)
             _, used_autoplay_launch = await launch_prime_content_candidates(
                 client,
                 content_id,
@@ -1141,12 +1210,10 @@ async def cmd_launch_prime(
                 detail_html=detail_html,
                 episode=episode,
                 prefer_episode=play or episode is not None,
-                # Use an autoplay deep link so Prime starts after profile pick
-                # without a delayed ENTER (which toggles pause on auto-started
-                # episodes ~6–14s into playback).
-                autoplay=play or (start or 0) > 0,
+                autoplay=bool(start and start > 0),
                 start=start,
             )
+            print(f"[PLAY] profile-gate used_autoplay={used_autoplay_launch}", file=sys.stderr)
             await select_profile(
                 client,
                 profile,
@@ -1168,6 +1235,7 @@ async def cmd_launch_prime(
                 await asyncio.sleep(content_delay)
                 title_page_settled = True
     elif content_id is not None:
+        print(f"[PLAY] no-profile direct launch path: content_id={content_id} episode={episode} play={play} start={start}", file=sys.stderr)
         _, used_autoplay_launch = await launch_prime_content_candidates(
             client,
             content_id,
@@ -1176,9 +1244,10 @@ async def cmd_launch_prime(
             detail_html=detail_html,
             episode=episode,
             prefer_episode=play or episode is not None,
-            autoplay=play,
+            autoplay=bool(start and start > 0),
             start=start,
         )
+        print(f"[PLAY] direct path used_autoplay_launch={used_autoplay_launch}", file=sys.stderr)
         if profile is not None:
             await select_profile(
                 client,
@@ -1670,7 +1739,8 @@ Use --profile-highlight to verify the mapped index on TV.""",
         default=DEFAULT_SUBTITLE_FOCUS_DOWN,
         metavar="N",
         help=(
-            "DOWN-key presses after pause to reach the transport icon row "
+            "DOWN-key presses to surface/focus the transport row that contains "
+            "Start again / Subtitles / Audio options "
             f"(default: {DEFAULT_SUBTITLE_FOCUS_DOWN})"
         ),
     )
@@ -1680,7 +1750,8 @@ Use --profile-highlight to verify the mapped index on TV.""",
         default=DEFAULT_SUBTITLE_FOCUS_RIGHT,
         metavar="N",
         help=(
-            "RIGHT-key presses to reach Audio & Subtitles, then ENTER "
+            "RIGHT presses *after homing LEFT to leftmost on the row* to reach Subtitles CC "
+            "(from screengrab.jpg: 1 for middle of Start again → Subtitles CC → Audio options). "
             f"(-1 = default {DEFAULT_SUBTITLE_FOCUS_RIGHT})"
         ),
     )
@@ -1691,7 +1762,7 @@ Use --profile-highlight to verify the mapped index on TV.""",
         metavar="N",
         help=(
             "UP presses inside the panel to highlight Subtitles instead of Audio "
-            f"(default: {DEFAULT_SUBTITLE_SECTION_UP})"
+            f"(when using vertical tabs; default: {DEFAULT_SUBTITLE_SECTION_UP}; 0=skip)"
         ),
     )
     parser.add_argument(
@@ -1700,7 +1771,9 @@ Use --profile-highlight to verify the mapped index on TV.""",
         default=DEFAULT_SUBTITLE_SECTION_LEFT,
         metavar="N",
         help=(
-            "LEFT presses inside the panel to reach the Subtitles column "
+            "LEFT presses inside the panel (after ENTER on the bar button) to reach "
+            "the Subtitles column *only if* combined Audio+Subs panel opens on Audio side "
+            "(see screengrab.jpg for dedicated 'Subtitles CC' button; default 0 = skip). "
             f"(default: {DEFAULT_SUBTITLE_SECTION_LEFT})"
         ),
     )
@@ -1830,7 +1903,10 @@ async def _focus_subtitles_section(
     section_up: int,
     section_left: int,
 ) -> None:
-    """Move focus from Audio to Subtitles inside the open panel (UP/LEFT only)."""
+    """Move focus from Audio to Subtitles inside the open panel (UP/LEFT only).
+
+    Called after ENTER on the bar button when a combined panel is used.
+    """
     if section_left > 0:
         print(
             f"  Select Subtitles section: LEFT×{section_left} ...",
@@ -1855,9 +1931,14 @@ async def _open_prime_subtitle_picker(
     focus_down: int,
     focus_right: int,
 ) -> bool:
-    """Press the Subtitles button on Prime's pause bar (not Start again / Audio).
+    """Navigate to and press the Subtitles button among the transport controls.
 
-    Do not send UP during playback — that opens the cast/X-Ray actor list.
+    From screengrab.jpg, the Prime bar has Cast | Start again | Subtitles CC | volume.
+    We send PAUSE to bring up the transport bar (required for reliable access
+    to the 3 options: Start again / Subtitles / Audio options). This briefly pauses playback.
+    We then DOWN to the row (default 1), LEFT-home (to leftmost), RIGHT x N (default 1 for Subtitles CC),
+    ENTER to open picker. After selecting the track/off (or using section_left to move from Audio column),
+    we robustly resume with SSAP play() + PLAY keys.
     """
     await _send_button(client, "PAUSE")
     await asyncio.sleep(0.7)
@@ -1873,6 +1954,17 @@ async def _open_prime_subtitle_picker(
         for _ in range(down_steps):
             await _send_button(client, "DOWN")
             await asyncio.sleep(SUBTITLE_KEY_DELAY)
+
+    # Home to the left end of the row so that RIGHT counts are from the first
+    # of the three options (Start again → Subtitles → Audio options). Extra
+    # LEFTs at the edge do nothing in most UIs.
+    print(
+        "  Homing left to first item (Start again) ...",
+        file=sys.stderr,
+    )
+    for _ in range(5):
+        await _send_button(client, "LEFT")
+        await asyncio.sleep(SUBTITLE_KEY_DELAY)
 
     print(
         f"  Opening Subtitles: RIGHT×{right_steps} + ENTER ...",
@@ -1922,7 +2014,17 @@ async def apply_subtitles(
         client, focus_down=focus_down, focus_right=focus_right
     ):
         print("  Warning: could not open subtitle picker.", file=sys.stderr)
+        # Robust resume (PAUSE was sent inside the picker attempt).
+        try:
+            await client.play()
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
         await _send_button(client, "PLAY")
+        try:
+            await client.play()
+        except Exception:
+            pass
         print(json.dumps({"subtitles": enabled, "language": lang if enabled else "off"}))
         return
 
@@ -1938,10 +2040,28 @@ async def apply_subtitles(
         await asyncio.sleep(SUBTITLE_KEY_DELAY)
 
     await _send_button(client, "ENTER")
-    await asyncio.sleep(0.35)
+    await asyncio.sleep(0.8)
 
-    # Resume playback. Do not send BACK — it leaves the player and can restart.
-    await _send_button(client, "PLAY")
+    # Robust resume after menu navigation. We sent PAUSE to surface the bar
+    # (necessary for reliable subs selection). Now resume using the same
+    # pattern as cmd_media_resume: SSAP play() + PLAY key.
+    # Do this reliably so subs toggle does not leave media paused.
+    try:
+        result = await client.play()
+        if not result.get("returnValue", True):
+            print("  SSAP play returned false", file=sys.stderr)
+    except Exception as exc:
+        print(f"  media.controls/play during subs resume: {exc}", file=sys.stderr)
+    await asyncio.sleep(PLAY_KEY_DELAY)
+    if await _send_button(client, "PLAY"):
+        print("  Sent PLAY to resume after subtitles.", file=sys.stderr)
+
+    # Extra SSAP play as safety net (the key may have been interpreted by
+    # the still-visible transport bar).
+    try:
+        await client.play()
+    except Exception:
+        pass
 
     print(json.dumps({"subtitles": enabled, "language": lang if enabled else "off"}))
 
@@ -2029,42 +2149,58 @@ async def cmd_seek(
     launch param is likewise ignored by Prime, so we use ?t=<pos> instead.
     """
     pos = max(0, int(seconds))
-    print(f"Seeking to {pos}s ...")
+    print(f"[SEEK] === Seeking to {pos}s for content_id={content_id} episode={episode} ===", file=sys.stderr)
 
     # ── Method 1: Re-launch native app at ?t=<pos> (Prime) ───────────────────
     # Use the same launch-ID resolution as the play path (GTI / playbackURL /
     # episode detail IDs) so seeking works for series and saved resume points.
     if content_id:
-        detail_html = fetch_prime_detail_html(content_id)
+        # Use the resolver (same as play) with start=pos so it picks best ID (GTI, ASIN, episode, playback target)
+        # and forces the t= on it. This is consistent and uses the best launch target.
         try:
             candidates = resolve_prime_launch_ids(
                 content_id,
-                html=detail_html,
                 episode=episode,
-                prefer_episode=episode is not None,
                 autoplay=True,
                 start=pos,
             )
-            launch_id = candidates[0]
-            if launch_id != content_id:
-                print(f"  TV seek target: {launch_id}")
-            print(f"  Re-launching at t={pos}s ...")
-            if await close_app(client, PRIME_VIDEO_APP_ID):
-                await asyncio.sleep(1.5)
+            launch_id = candidates[0] if candidates else f"/detail/{content_id}?autoplay=1&t={pos}"
+            print(f"[SEEK] using resolver, launch_id: {launch_id}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[SEEK] resolver failed, falling back: {exc}", file=sys.stderr)
+            launch_id = f"{PRIME_DEEP_LINK_BASE}/detail/{content_id}?autoplay=1&t={pos}"
+        print(f"[SEEK] FINAL launch_id for contentTarget: {launch_id}", file=sys.stderr)
+        # For explicit seek-to-position (especially resume-from-bookmark cases), always
+        # cold-start (close+relaunch) to ensure the ?t= override is applied by the
+        # Prime player rather than any in-memory resume position winning.
+        print(f"[SEEK] cold relaunch with t={pos}s (ensures t= applies on resume items) ...", file=sys.stderr)
+        if await close_app(client, PRIME_VIDEO_APP_ID):
+            await asyncio.sleep(1.2)
+        result = await launch_prime_content(
+            client, launch_id, cold_start=False  # already closed above
+        )
+        print(f"[SEEK] launch result: {result}", file=sys.stderr)
+        if result.get("returnValue"):
+            used_autoplay_launch = _is_autoplay_target(launch_id)
+            if not used_autoplay_launch:
+                await start_playback(
+                    client,
+                    delay=2.0,
+                    used_autoplay_launch=False,
+                )
 
-            result = await launch_prime_content(
-                client, launch_id, cold_start=False
-            )
-            if result.get("returnValue"):
-                used_autoplay_launch = _is_autoplay_target(launch_id)
-                if profile is not None:
-                    await select_profile(client, profile, delay=1.0)
-                if not used_autoplay_launch:
-                    await start_playback(
-                        client,
-                        delay=2.0,
-                        used_autoplay_launch=False,
-                    )
+            await asyncio.sleep(7.0)
+
+            ssap_succeeded = False
+            try:
+                ssap = await client.request("ssap://media.controls/seek", {"position": pos})
+                if ssap.get("returnValue"):
+                    ssap_succeeded = True
+                    print(json.dumps({"seeked_to": pos, "success": True, "method": "relaunch+ssap"}))
+            except Exception:
+                pass
+
+            if not ssap_succeeded:
                 print(
                     json.dumps(
                         {
@@ -2075,25 +2211,16 @@ async def cmd_seek(
                         }
                     )
                 )
-                return
-            print(f"  Re-launch returned: {result}", file=sys.stderr)
-        except Exception as exc:
-            print(f"  Re-launch failed: {exc}", file=sys.stderr)
+            return
+        print(f"[SEEK] Re-launch returned failure: {result}", file=sys.stderr)
 
+        # Fallback identifiers for browser/SSAP paths (relaunch path returned early on success).
         seek_id = content_id
-        if detail_html and episode is not None and episode >= 1:
-            try:
-                resolved = resolve_episode_content_id(
-                    detail_html, content_id, episode=episode
-                )
-                if resolved:
-                    seek_id = resolved
-            except ValueError as exc:
-                print(f"  Warning: could not resolve episode {episode} ({exc})", file=sys.stderr)
     else:
         seek_id = None
 
     # ── Method 2: SSAP seek (LG built-in player / non-Prime) ─────────────────
+    print(f"[SEEK] falling back to pure SSAP seek (no content_id or launch failed)", file=sys.stderr)
     try:
         result = await client.request("ssap://media.controls/seek", {"position": pos})
         if result.get("returnValue"):
@@ -2106,9 +2233,9 @@ async def cmd_seek(
     # ── Method 3: Browser deeplink with ?autoplay=1&t=N ──────────────────────
     # Opens the Prime Video website in the LG browser; less seamless but reliable.
     if seek_id:
-        print(f"  Trying browser deeplink with t={pos} ...")
+        print(f"[SEEK] Trying browser deeplink with t={pos} ...", file=sys.stderr)
         try:
-            url = f"https://www.primevideo.com/detail/{seek_id}?autoplay=1&t={pos}"
+            url = f"https://app.primevideo.com/detail/{seek_id}?autoplay=1&t={pos}"
             result = await client.launch_app_with_params(
                 PRIME_BROWSER_APP_ID,
                 {"target": url},
@@ -2119,38 +2246,60 @@ async def cmd_seek(
             print(f"  Browser deeplink failed: {exc}", file=sys.stderr)
 
     print(json.dumps({"seeked_to": pos, "success": False, "method": "none"}))
+    print(f"[SEEK] === ALL METHODS FAILED for pos={pos} ===", file=sys.stderr)
 
 
 def cmd_resume_position(content_id: str, episode: int | None = None) -> None:
     """Return the saved resume offset for a title (no TV connection needed)."""
     content_id = content_id.strip()
+    print(f"[RESUME-POS] input content_id={content_id} episode={episode}", file=sys.stderr)
     html = _fetch_prime_html(content_id)
     play_id = content_id
     if episode is not None and episode >= 1:
-        play_id = resolve_episode_content_id(html, content_id, episode=episode)
-        if play_id != content_id:
-            html = _fetch_prime_html(play_id)
+        try:
+            resolved = resolve_episode_content_id(html, content_id, episode=episode)
+            if resolved and resolved != content_id:
+                play_id = resolved
+                html = _fetch_prime_html(play_id)
+                print(f"[RESUME-POS] resolved episode page play_id={play_id}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[RESUME-POS] resolve_episode failed: {exc}", file=sys.stderr)
+    print(f"[RESUME-POS] fetching resume from play_id={play_id}", file=sys.stderr)
     seconds = resume_start_seconds_from_html(html, play_id)
+    print(f"[RESUME-POS] resume_start_seconds_from_html returned: {seconds}", file=sys.stderr)
+    # Extra diagnostics: did we see any resume-like patterns?
+    has_resume_label = any(lbl in html for lbl in ("Resume", "Continue watching", "Continue Watching"))
+    has_time_offset = "timeOffsetInSeconds" in html or "resumeTime" in html
+    print(f"[RESUME-POS] html signals: has_resume_label={has_resume_label} has_time_offset={has_time_offset} html_len={len(html)}", file=sys.stderr)
     print(json.dumps({"position": seconds}))
 
 
 async def cmd_get_position(client: "WebOsClient") -> None:
     """Try to get current playback position and duration from the TV."""
     # Try multiple SSAP endpoints — availability depends on WebOS version / app
+    # Prime titles commonly return nulls here; raw attempts are logged by _playback_position too.
     candidates = [
         ("ssap://com.webos.service.media.player/getInfo", {}),
         ("ssap://com.webos.service.cepswm.media.player/getInfo", {}),
         ("ssap://media.infoAction.getInfoPerApp", {"id": "amazon"}),
+        ("ssap://com.webos.service.media.player/getPlayInfo", {}),
+        ("ssap://media/getPlaybackState", {}),
     ]
     for uri, payload in candidates:
         try:
             result = await client.request(uri, payload)
+            # Debug the raw response for Prime troubleshooting
+            try:
+                print(f"[GET-POS] {uri} -> rv={result.get('returnValue')} sample={json.dumps({k:result.get(k) for k in list(result.keys())[:5]})}", file=sys.stderr)
+            except Exception:
+                pass
             if not result.get("returnValue"):
                 continue
             position = (
                 result.get("currentTime")
                 or result.get("position")
                 or result.get("mediaCurrentTime")
+                or result.get("playTime")
             )
             duration = (
                 result.get("duration")
@@ -2162,7 +2311,8 @@ async def cmd_get_position(client: "WebOsClient") -> None:
                 "duration": float(duration) if duration is not None else None,
             }))
             return
-        except Exception:
+        except Exception as exc:
+            print(f"[GET-POS] {uri} exc: {exc}", file=sys.stderr)
             continue
     # Fallback: position unavailable
     print(json.dumps({"position": None, "duration": None}))
@@ -2576,8 +2726,8 @@ async def main() -> None:
 
     client = await connect(args.ip)
     try:
-        if args.content_id and not args.launch:
-            print("error: --content-id requires --launch", file=sys.stderr)
+        if args.content_id and not (args.launch or args.seek is not None or args.resume_position or args.get_position or args.list_episodes):
+            print("error: --content-id requires --launch (or is only valid with seek/resume/get/list)", file=sys.stderr)
             sys.exit(2)
         if args.profile is not None and args.profile < 0:
             print("error: --profile must be >= 0", file=sys.stderr)

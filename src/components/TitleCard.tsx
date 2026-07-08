@@ -102,7 +102,7 @@ export default function TitleCard({
             <img
               src={src}
               alt={item.title}
-              className="w-full h-full object-cover pointer-events-none"
+              className="w-full h-full object-cover object-[50%_65%] pointer-events-none"
               onError={handleImageError}
               loading="lazy"
             />

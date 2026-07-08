@@ -8,3 +8,6 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
     <App />
   </React.StrictMode>
 );
+
+// Window is created visible by default (with backgroundColor preventing white flash).
+// No manual show() needed; this restores normal macOS focus/activation behavior on launch.

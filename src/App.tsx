@@ -331,10 +331,12 @@ export default function App() {
         episode = episodeNum;
       } else if (episodeId) {
         contentId = episodeId;
-        episode = null;
+        episode = episodeNum;  // pass the number if known, for resolver/seek/resume
       } else {
         return false;
       }
+
+      console.log("[PLAY-EP-BOOKMARK] seriesId=", seriesId, "episodeNum=", episodeNum, "episodeId=", episodeId, "-> contentId=", contentId, "episode=", episode, "bookmark.content_id=", bookmark.item.content_id);
 
       setSelectedItem(null);
       setSelectedEpisode(null);
@@ -344,10 +346,12 @@ export default function App() {
 
       try {
         await invoke("play_on_tv", {
-          contentId,
-          profile: config.profile,
-          tvIp: config.tv_ip,
-          episode,
+          args: {
+            contentId,
+            profile: config.profile,
+            tvIp: config.tv_ip,
+            episode,
+          },
         });
         return true;
       } catch (err) {
@@ -401,7 +405,9 @@ export default function App() {
     if (!nowPlaying || !nowPlayingEpisode) return null;
     if (episodeBookmarkContentId(nowPlaying)) {
       const bm = bookmarks.find((b) => b.item.content_id === nowPlaying.content_id);
-      return bm?.source_item?.content_id ?? null;
+      const series = bm?.source_item?.content_id ?? null;
+      console.log("[SERIES-ID] episode bookmark, source series=", series, "nowPlaying.content_id=", nowPlaying.content_id);
+      return series;
     }
     return nowPlaying.content_id;
   }, [nowPlaying, nowPlayingEpisode, bookmarks]);
@@ -909,8 +915,8 @@ export default function App() {
       {/* pb-28 clears the fixed TVRemote bar even when seek bar is open */}
       <main className="flex-1 py-6 pb-28">
 
-        {/* Loading */}
-        {loadState === "loading" && !searching && (
+        {/* Loading (only show the full overlay on true first-time loads; cache hits are near-instant) */}
+        {loadState === "loading" && !searching && allItems.length === 0 && (
           <div className="flex flex-col items-center justify-center h-64 gap-4">
             <svg className="w-10 h-10 text-emerald-500 animate-spin" fill="none" viewBox="0 0 24 24">
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
@@ -918,7 +924,7 @@ export default function App() {
             </svg>
             <p className="text-zinc-400 text-sm">Loading {activeCollection.label}…</p>
             <p className="text-zinc-600 text-xs">
-              Fetching titles &amp; resolving availability (~30 s on first load)
+              Fetching titles from Prime Video (can take 30–90 s on first load for large collections)
             </p>
           </div>
         )}

@@ -87,7 +87,10 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
   const [subtitlesEnabled, setSubtitlesEnabled] = useState(config.subtitles_enabled ?? false);
   const [subtitleLanguage, setSubtitleLanguage] = useState(config.subtitle_language ?? "en");
   const [subtitleFocusDown, setSubtitleFocusDown] = useState(config.subtitle_focus_down ?? 1);
-  const [subtitleFocusRight, setSubtitleFocusRight] = useState(config.subtitle_focus_right ?? 2);
+  const loadedFocusRight = config.subtitle_focus_right;
+  const [subtitleFocusRight, setSubtitleFocusRight] = useState(
+    loadedFocusRight === 2 ? 1 : (loadedFocusRight ?? 1)
+  );
   const [subtitleSectionUp, setSubtitleSectionUp] = useState(config.subtitle_section_up ?? 0);
   const [subtitleSectionLeft, setSubtitleSectionLeft] = useState(config.subtitle_section_left ?? 0);
   const [subtitleMenuDown, setSubtitleMenuDown] = useState(config.subtitle_menu_down ?? -1);
@@ -367,8 +370,9 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
                       Enable subtitle controls
                     </p>
                     <p className="text-xs text-zinc-500 mt-0.5 leading-relaxed">
-                      Shows a subtitle button in the remote bar. Turn subtitles on or
-                      off there while something is playing on the TV.
+                      Shows a blue subtitles button in the remote bar (only while media is
+                      playing on TV). Subtitles are off by default when playback starts.
+                      Click the button to turn them on or off on demand. No auto-apply.
                     </p>
                   </div>
                 </label>
@@ -415,7 +419,7 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
                         value={subtitleFocusRight}
                         onChange={(e) => {
                           const n = parseInt(e.target.value, 10);
-                          setSubtitleFocusRight(Number.isNaN(n) ? 2 : Math.max(-1, Math.min(20, n)));
+                          setSubtitleFocusRight(Number.isNaN(n) ? 1 : Math.max(-1, Math.min(20, n)));
                         }}
                         className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
                                    text-white text-center focus:outline-none focus:border-emerald-500 transition-colors"
@@ -468,9 +472,12 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
                     </div>
                   </div>
                   <p className="text-xs text-zinc-500 leading-relaxed">
-                    Focus right 2 reaches Subtitles on the pause bar (order: Start again →
-                    Subtitles → Audio options). Section left/up only if one combined panel
-                    opens. Menu down: steps in the subtitle list (-1 = auto; 0 = Off).
+                    The bar row has 3 options: Start again, Subtitles, Audio options.
+                    From screengrab.jpg: the Prime bar shows Cast, Start again, Subtitles CC, volume.
+                    We send PAUSE (to surface), LEFT-home to first, RIGHT×N (default 1 = Subtitles CC)
+                    + ENTER. Briefly pauses for menu; we resume after. Section left=0 (dedicated Subs CC button);
+                    set to 1 only if combined Audio+Subs panel opens focused on Audio. Menu down (-1=auto; 0=Off).
+                    Tune per your TV.
                   </p>
                 </div>
               </div>

@@ -62,9 +62,11 @@ export async function playOnMac(
   const contentId = options?.contentId?.trim() || item.content_id;
   const episode = options?.episode ?? null;
   await invoke("play_on_mac", {
-    contentId,
-    episode: episode != null && episode >= 1 ? episode : null,
-    title: item.title,
+    args: {
+      contentId,
+      episode: episode != null && episode >= 1 ? episode : null,
+      title: item.title,
+    },
   });
 }
 
@@ -77,10 +79,12 @@ export async function playOnTv(
   const episode = options?.contentId ? null : options?.episode ?? null;
   const startSeconds = options?.startSeconds ?? null;
   await invoke("play_on_tv", {
-    contentId,
-    profile: config.profile,
-    tvIp: config.tv_ip,
-    episode: episode != null && episode >= 1 ? episode : null,
-    startSeconds: startSeconds != null && startSeconds >= 1 ? Math.round(startSeconds) : null,
+    args: {
+      contentId,
+      profile: config.profile,
+      tvIp: config.tv_ip,
+      episode: episode != null && episode >= 1 ? episode : null,
+      startSeconds: startSeconds != null && startSeconds >= 1 ? Math.round(startSeconds) : null,
+    },
   });
 }
