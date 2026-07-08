@@ -106,10 +106,55 @@ pub struct AppConfig {
     /// When true, set default_tv_volume after play and when powering on the TV.
     #[serde(default = "default_true")]
     pub apply_default_tv_volume: bool,
+    /// Show subtitle on/off controls (language configured here; toggled in the remote bar).
+    #[serde(default = "default_false")]
+    pub subtitles_enabled: bool,
+    /// Preferred subtitle language code (e.g. "en", "sv").
+    #[serde(default = "default_subtitle_language")]
+    pub subtitle_language: String,
+    /// DOWN-key presses after pause to reach Prime's transport icon row.
+    #[serde(default = "default_subtitle_focus_down")]
+    pub subtitle_focus_down: i32,
+    /// RIGHT-key presses to reach the Audio & Subtitles button.
+    #[serde(default = "default_subtitle_focus_right")]
+    pub subtitle_focus_right: i32,
+    /// UP presses inside the panel to select Subtitles instead of Audio.
+    #[serde(default = "default_subtitle_section_up")]
+    pub subtitle_section_up: i32,
+    /// LEFT presses inside the panel to reach the Subtitles column.
+    #[serde(default = "default_subtitle_section_left")]
+    pub subtitle_section_left: i32,
+    /// DOWN-key presses in the subtitle menu (-1 = auto from language).
+    #[serde(default = "default_subtitle_menu_down")]
+    pub subtitle_menu_down: i32,
 }
 
 fn default_tv_volume() -> i32 {
     13
+}
+
+fn default_subtitle_language() -> String {
+    "en".to_string()
+}
+
+fn default_subtitle_focus_down() -> i32 {
+    1
+}
+
+fn default_subtitle_focus_right() -> i32 {
+    2
+}
+
+fn default_subtitle_section_up() -> i32 {
+    0
+}
+
+fn default_subtitle_section_left() -> i32 {
+    0
+}
+
+fn default_subtitle_menu_down() -> i32 {
+    -1
 }
 
 fn default_playback_tv() -> String {
@@ -144,6 +189,13 @@ impl Default for AppConfig {
             tv_mac: String::new(),
             default_tv_volume: default_tv_volume(),
             apply_default_tv_volume: true,
+            subtitles_enabled: false,
+            subtitle_language: default_subtitle_language(),
+            subtitle_focus_down: default_subtitle_focus_down(),
+            subtitle_focus_right: default_subtitle_focus_right(),
+            subtitle_section_up: default_subtitle_section_up(),
+            subtitle_section_left: default_subtitle_section_left(),
+            subtitle_menu_down: default_subtitle_menu_down(),
         }
     }
 }
@@ -253,7 +305,14 @@ fn load_config() -> AppConfig {
             if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&data) {
                 if let Ok(cfg) = serde_json::from_value::<AppConfig>(raw.clone()) {
                     let needs_save = raw.get("default_tv_volume").is_none()
-                        || raw.get("apply_default_tv_volume").is_none();
+                        || raw.get("apply_default_tv_volume").is_none()
+                        || raw.get("subtitles_enabled").is_none()
+                        || raw.get("subtitle_language").is_none()
+                        || raw.get("subtitle_focus_down").is_none()
+                        || raw.get("subtitle_focus_right").is_none()
+                        || raw.get("subtitle_section_up").is_none()
+                        || raw.get("subtitle_section_left").is_none()
+                        || raw.get("subtitle_menu_down").is_none();
                     if needs_save {
                         let _ = save_config_to_disk(&cfg);
                     }
@@ -1471,6 +1530,64 @@ async fn run_tv_media_cmd(flag: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn append_subtitle_args(cmd: &mut tokio::process::Command, cfg: &AppConfig, language: &str) {
+    cmd.arg("--set-subtitles").arg(language);
+    cmd.arg("--subtitle-focus-down")
+        .arg(cfg.subtitle_focus_down.clamp(0, 5).to_string());
+    cmd.arg("--subtitle-focus-right")
+        .arg(cfg.subtitle_focus_right.clamp(-1, 20).to_string());
+    cmd.arg("--subtitle-section-up")
+        .arg(cfg.subtitle_section_up.clamp(0, 5).to_string());
+    cmd.arg("--subtitle-section-left")
+        .arg(cfg.subtitle_section_left.clamp(0, 5).to_string());
+    if cfg.subtitle_menu_down >= 0 {
+        cmd.arg("--subtitle-menu-down")
+            .arg(cfg.subtitle_menu_down.to_string());
+    }
+}
+
+/// Enable or disable Prime Video subtitles on the current TV playback.
+#[tauri::command]
+async fn set_tv_subtitles(enabled: bool) -> Result<(), String> {
+    let _tv = tv_cmd_lock().lock().await;
+    let cfg = load_config();
+    if !cfg.subtitles_enabled {
+        return Err(
+            "Subtitles are disabled in Settings — enable them there first.".to_string(),
+        );
+    }
+    let root = resolve_project_root(&cfg);
+    let python = python_exe(&root);
+    let script = root
+        .join("amazon")
+        .join("lg-tv-connect.py")
+        .to_string_lossy()
+        .to_string();
+
+    let language = if enabled {
+        if cfg.subtitle_language.trim().is_empty() {
+            "en".to_string()
+        } else {
+            cfg.subtitle_language.clone()
+        }
+    } else {
+        "off".to_string()
+    };
+
+    let mut cmd = tokio::process::Command::new(&python);
+    cmd.current_dir(&root).arg(&script).arg(&cfg.tv_ip);
+    append_subtitle_args(&mut cmd, &cfg, &language);
+    let output = run_tv_command(cmd, TV_CMD_TIMEOUT).await?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        let out = String::from_utf8_lossy(&output.stdout).to_string();
+        let detail = if err.trim().is_empty() { out } else { err };
+        return Err(format!("TV subtitle command failed: {detail}"));
+    }
+    Ok(())
+}
+
 /// Send a media control command to the TV (pause / play / toggle / stop).
 #[tauri::command]
 async fn media_control(action: String) -> Result<(), String> {
@@ -1678,6 +1795,8 @@ async fn seek_to(seconds: f64, content_id: Option<String>, episode: Option<i32>)
         }
     }
 
+    cmd.arg("--profile").arg(cfg.profile.to_string());
+
     let output = run_tv_command(cmd, TV_CMD_TIMEOUT).await?;
 
     if !output.status.success() {
@@ -1685,6 +1804,52 @@ async fn seek_to(seconds: f64, content_id: Option<String>, episode: Option<i32>)
         return Err(format!("seek failed: {err}"));
     }
     Ok(())
+}
+
+/// Read Prime's saved resume position for a title (seconds, or null).
+/// Fetches the Prime detail page only — no TV connection.
+#[tauri::command]
+async fn get_resume_position(
+    content_id: String,
+    episode: Option<i32>,
+) -> Result<serde_json::Value, String> {
+    let cfg = load_config();
+    let root = resolve_project_root(&cfg);
+    let python = python_exe(&root);
+    let script = root
+        .join("amazon")
+        .join("lg-tv-connect.py")
+        .to_string_lossy()
+        .to_string();
+
+    let mut cmd = tokio::process::Command::new(&python);
+    cmd.arg(&script)
+        .arg(&cfg.tv_ip)
+        .arg("--resume-position")
+        .arg("--content-id")
+        .arg(&content_id);
+
+    if let Some(ep) = episode {
+        if ep >= 1 {
+            cmd.arg("--episode").arg(ep.to_string());
+        }
+    }
+
+    let output = run_tv_command(cmd, TV_CMD_TIMEOUT).await?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let json_line = stdout
+        .lines()
+        .filter(|l| l.trim_start().starts_with('{'))
+        .last()
+        .unwrap_or(r#"{"position":null}"#);
+
+    if !output.status.success() && json_line == r#"{"position":null}"# {
+        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(format!("resume position failed: {err}"));
+    }
+
+    serde_json::from_str(json_line).map_err(|e| e.to_string())
 }
 
 /// Try to get the current playback position from the TV.
@@ -2262,8 +2427,10 @@ pub fn run() {
             set_tv_volume,
             volume_step,
             set_tv_mute,
+            set_tv_subtitles,
             seek_to,
             get_playback_position,
+            get_resume_position,
             list_episodes,
             check_tv_reachable,
             scan_for_tv,

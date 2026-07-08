@@ -18,6 +18,28 @@ export function cachedImageHttpUrl(
   return `http://127.0.0.1:${port}/${stem}.jpg?v=${v}`;
 }
 
+/** Parse a Prime display runtime string ("54 min", "1 h 23 min") into whole minutes. */
+export function runtimeMinutesFromStr(raw: string | null | undefined): number | null {
+  if (!raw?.trim()) return null;
+  const text = raw.trim();
+  let total = 0;
+  const hMatch = text.match(/(\d+)\s*h/i);
+  const mMatch = text.match(/(\d+)\s*min/i);
+  if (hMatch) total += parseInt(hMatch[1], 10) * 60;
+  if (mMatch) total += parseInt(mMatch[1], 10);
+  if (total > 0) return total;
+  if (/^\d+$/.test(text)) return parseInt(text, 10);
+  return null;
+}
+
+/** Total runtime in seconds from catalog minutes and/or display string. */
+export function runtimeSecondsFromTitle(item: PrimeTitle | null | undefined): number | null {
+  if (!item) return null;
+  if (item.runtime_min != null && item.runtime_min > 0) return item.runtime_min * 60;
+  const mins = runtimeMinutesFromStr(item.runtime_str);
+  return mins != null ? mins * 60 : null;
+}
+
 export interface PrimeTitle {
   title: string;
   content_id: string;
@@ -73,9 +95,42 @@ export interface AppConfig {
   default_tv_volume?: number;
   /** When true, set default_tv_volume after play and when powering on the TV. */
   apply_default_tv_volume?: boolean;
+  /** Show subtitle controls in the remote bar (on/off toggled there). */
+  subtitles_enabled?: boolean;
+  /** Preferred subtitle language code (see SUBTITLE_LANGUAGES). */
+  subtitle_language?: string;
+  /** DOWN-key presses after pause to reach Prime's transport icon row. */
+  subtitle_focus_down?: number;
+  /** RIGHT-key presses to reach the Audio & Subtitles button. */
+  subtitle_focus_right?: number;
+  /** UP presses inside the panel to select Subtitles instead of Audio. */
+  subtitle_section_up?: number;
+  /** LEFT presses inside the panel to reach the Subtitles column. */
+  subtitle_section_left?: number;
+  /** DOWN-key presses in the subtitle menu (-1 = auto from language). */
+  subtitle_menu_down?: number;
 }
 
 export type PlaybackTarget = "tv" | "mac";
+
+/** Subtitle languages offered in Settings (menu order varies by title). */
+export const SUBTITLE_LANGUAGES: { code: string; label: string }[] = [
+  { code: "en", label: "English" },
+  { code: "en-cc", label: "English [CC]" },
+  { code: "sv", label: "Swedish" },
+  { code: "de", label: "German" },
+  { code: "fr", label: "French" },
+  { code: "es", label: "Spanish" },
+  { code: "it", label: "Italian" },
+  { code: "pt", label: "Portuguese" },
+  { code: "nl", label: "Dutch" },
+  { code: "no", label: "Norwegian" },
+  { code: "da", label: "Danish" },
+  { code: "fi", label: "Finnish" },
+  { code: "pl", label: "Polish" },
+  { code: "ja", label: "Japanese" },
+  { code: "ko", label: "Korean" },
+];
 
 export const DEFAULT_CONFIG: AppConfig = {
   tv_ip: "192.168.0.79",
@@ -91,6 +146,13 @@ export const DEFAULT_CONFIG: AppConfig = {
   tv_mac: "",
   default_tv_volume: 13,
   apply_default_tv_volume: true,
+  subtitles_enabled: false,
+  subtitle_language: "en",
+  subtitle_focus_down: 1,
+  subtitle_focus_right: 2,
+  subtitle_section_up: 0,
+  subtitle_section_left: 0,
+  subtitle_menu_down: -1,
 };
 
 export type EntityTypeFilter = "all" | "Movie" | "TV Show";
@@ -198,6 +260,28 @@ export function groupTitles(items: PrimeTitle[]): CatalogGroup[] {
     result.push({ label, items: groupItems });
   }
   return result;
+}
+
+/** True for genre tabs (genre/action, genre/documentary, …). */
+export function isGenreCollection(slug: string): boolean {
+  return slug.startsWith("genre/");
+}
+
+/** Group a genre catalog into films vs series (merges Prime carousel rows). */
+export function groupGenreTitles(items: PrimeTitle[], genreLabel: string): CatalogGroup[] {
+  const movies: PrimeTitle[] = [];
+  const tv: PrimeTitle[] = [];
+  const other: PrimeTitle[] = [];
+  for (const item of items) {
+    if (item.entity_type === "Movie") movies.push(item);
+    else if (item.entity_type === "TV Show" || item.entity_type === "TV Episode") tv.push(item);
+    else other.push(item);
+  }
+  const groups: CatalogGroup[] = [];
+  if (movies.length > 0) groups.push({ label: `${genreLabel} films`, items: movies });
+  if (tv.length > 0) groups.push({ label: `${genreLabel} series`, items: tv });
+  if (other.length > 0) groups.push({ label: "Other", items: other });
+  return groups;
 }
 
 // ─── Color palette (single source of truth) ──────────────────────────────────

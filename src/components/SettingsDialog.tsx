@@ -1,9 +1,11 @@
 import { useState, useEffect } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import {
   AppConfig,
   AccessCategory,
   PlaybackTarget,
+  SUBTITLE_LANGUAGES,
   CATEGORY_COLORS,
   CATEGORY_TEXT,
   CATEGORY_BORDER,
@@ -82,12 +84,24 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
   const [applyDefaultTvVolume, setApplyDefaultTvVolume] = useState(
     config.apply_default_tv_volume ?? true,
   );
+  const [subtitlesEnabled, setSubtitlesEnabled] = useState(config.subtitles_enabled ?? false);
+  const [subtitleLanguage, setSubtitleLanguage] = useState(config.subtitle_language ?? "en");
+  const [subtitleFocusDown, setSubtitleFocusDown] = useState(config.subtitle_focus_down ?? 1);
+  const [subtitleFocusRight, setSubtitleFocusRight] = useState(config.subtitle_focus_right ?? 2);
+  const [subtitleSectionUp, setSubtitleSectionUp] = useState(config.subtitle_section_up ?? 0);
+  const [subtitleSectionLeft, setSubtitleSectionLeft] = useState(config.subtitle_section_left ?? 0);
+  const [subtitleMenuDown, setSubtitleMenuDown] = useState(config.subtitle_menu_down ?? -1);
 
   const [saving, setSaving] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [clearingPrime, setClearingPrime] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [clearMsg, setClearMsg] = useState<string | null>(null);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => {});
+  }, []);
 
   const categoryValues: Record<
     "show_prime" | "show_channel" | "show_rent_buy" | "show_other",
@@ -116,6 +130,13 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
       default_playback_target: playbackTarget,
       default_tv_volume: Math.max(0, Math.min(100, defaultTvVolume)),
       apply_default_tv_volume: applyDefaultTvVolume,
+      subtitles_enabled: subtitlesEnabled,
+      subtitle_language: subtitleLanguage,
+      subtitle_focus_down: Math.max(0, Math.min(5, subtitleFocusDown)),
+      subtitle_focus_right: Math.max(-1, Math.min(20, subtitleFocusRight)),
+      subtitle_section_up: Math.max(0, Math.min(5, subtitleSectionUp)),
+      subtitle_section_left: Math.max(0, Math.min(5, subtitleSectionLeft)),
+      subtitle_menu_down: Math.max(-1, Math.min(30, subtitleMenuDown)),
     };
     try {
       await invoke("save_config", { cfg: newCfg });
@@ -332,6 +353,127 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
                   </p>
                 </div>
               </div>
+              <div>
+                <label className="flex items-start gap-3 cursor-pointer group">
+                  <input
+                    type="checkbox"
+                    checked={subtitlesEnabled}
+                    onChange={(e) => setSubtitlesEnabled(e.target.checked)}
+                    className="mt-1 w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-emerald-500
+                               focus:ring-emerald-500 focus:ring-offset-zinc-900"
+                  />
+                  <div className="flex-1">
+                    <p className="text-sm text-zinc-300 group-hover:text-white transition-colors">
+                      Enable subtitle controls
+                    </p>
+                    <p className="text-xs text-zinc-500 mt-0.5 leading-relaxed">
+                      Shows a subtitle button in the remote bar. Turn subtitles on or
+                      off there while something is playing on the TV.
+                    </p>
+                  </div>
+                </label>
+                <div className={`mt-3 space-y-3 ${subtitlesEnabled ? "" : "opacity-50 pointer-events-none"}`}>
+                  <div>
+                    <label className="block text-sm text-zinc-300 mb-1.5">Subtitle language</label>
+                    <select
+                      value={subtitleLanguage}
+                      onChange={(e) => setSubtitleLanguage(e.target.value)}
+                      className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
+                                 text-white focus:outline-none focus:border-emerald-500 transition-colors"
+                    >
+                      {SUBTITLE_LANGUAGES.map(({ code, label }) => (
+                        <option key={code} value={code}>{label}</option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-zinc-500 mt-1.5">
+                      Available tracks vary by title. If the wrong language is selected,
+                      adjust the menu steps below.
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                    <div>
+                      <label className="block text-sm text-zinc-300 mb-1.5">Focus down</label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={5}
+                        value={subtitleFocusDown}
+                        onChange={(e) => {
+                          const n = parseInt(e.target.value, 10);
+                          setSubtitleFocusDown(Number.isNaN(n) ? 0 : Math.max(0, Math.min(5, n)));
+                        }}
+                        className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
+                                   text-white text-center focus:outline-none focus:border-emerald-500 transition-colors"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm text-zinc-300 mb-1.5">Focus right</label>
+                      <input
+                        type="number"
+                        min={-1}
+                        max={20}
+                        value={subtitleFocusRight}
+                        onChange={(e) => {
+                          const n = parseInt(e.target.value, 10);
+                          setSubtitleFocusRight(Number.isNaN(n) ? 2 : Math.max(-1, Math.min(20, n)));
+                        }}
+                        className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
+                                   text-white text-center focus:outline-none focus:border-emerald-500 transition-colors"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm text-zinc-300 mb-1.5">Section up</label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={5}
+                        value={subtitleSectionUp}
+                        onChange={(e) => {
+                          const n = parseInt(e.target.value, 10);
+                          setSubtitleSectionUp(Number.isNaN(n) ? 0 : Math.max(0, Math.min(5, n)));
+                        }}
+                        className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
+                                   text-white text-center focus:outline-none focus:border-emerald-500 transition-colors"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm text-zinc-300 mb-1.5">Section left</label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={5}
+                        value={subtitleSectionLeft}
+                        onChange={(e) => {
+                          const n = parseInt(e.target.value, 10);
+                          setSubtitleSectionLeft(Number.isNaN(n) ? 0 : Math.max(0, Math.min(5, n)));
+                        }}
+                        className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
+                                   text-white text-center focus:outline-none focus:border-emerald-500 transition-colors"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm text-zinc-300 mb-1.5">Menu down</label>
+                      <input
+                        type="number"
+                        min={-1}
+                        max={30}
+                        value={subtitleMenuDown}
+                        onChange={(e) => {
+                          const n = parseInt(e.target.value, 10);
+                          setSubtitleMenuDown(Number.isNaN(n) ? -1 : Math.max(-1, Math.min(30, n)));
+                        }}
+                        className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
+                                   text-white text-center focus:outline-none focus:border-emerald-500 transition-colors"
+                      />
+                    </div>
+                  </div>
+                  <p className="text-xs text-zinc-500 leading-relaxed">
+                    Focus right 2 reaches Subtitles on the pause bar (order: Start again →
+                    Subtitles → Audio options). Section left/up only if one combined panel
+                    opens. Menu down: steps in the subtitle list (-1 = auto; 0 = Off).
+                  </p>
+                </div>
+              </div>
             </div>
           </section>
 
@@ -502,21 +644,29 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
             <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-3">
               Advanced
             </h3>
-            <div>
-              <label className="block text-sm text-zinc-300 mb-1.5">Project Root</label>
-              <input
-                type="text"
-                value={projectRoot}
-                onChange={(e) => setProjectRoot(e.target.value)}
-                className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
-                           text-white font-mono focus:outline-none focus:border-emerald-500 transition-colors"
-                placeholder="/home/user/src/lgtv-fun"
-              />
-              <p className="text-xs text-zinc-500 mt-1.5">
-                Directory containing{" "}
-                <code className="text-zinc-400 bg-zinc-800 px-1 rounded">amazon/prime-catalog.py</code>.
-                Leave blank to auto-detect.
-              </p>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-sm text-zinc-300 mb-1.5">Project Root</label>
+                <input
+                  type="text"
+                  value={projectRoot}
+                  onChange={(e) => setProjectRoot(e.target.value)}
+                  className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
+                             text-white font-mono focus:outline-none focus:border-emerald-500 transition-colors"
+                  placeholder="/home/user/src/lgtv-fun"
+                />
+                <p className="text-xs text-zinc-500 mt-1.5">
+                  Directory containing{" "}
+                  <code className="text-zinc-400 bg-zinc-800 px-1 rounded">amazon/prime-catalog.py</code>.
+                  Leave blank to auto-detect.
+                </p>
+              </div>
+              {appVersion && (
+                <div className="flex items-center justify-between pt-1">
+                  <p className="text-sm text-zinc-300">Version</p>
+                  <p className="text-sm text-zinc-500 font-mono">{appVersion}</p>
+                </div>
+              )}
             </div>
           </section>
 

@@ -14,8 +14,10 @@
 import { useState, useEffect, useCallback, useRef, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { PrimeTitle } from "../types";
+import { PrimeEpisode, PrimeTitle, SUBTITLE_LANGUAGES, runtimeSecondsFromTitle } from "../types";
 import { isTvUnreachableMessage, repairTvConnection } from "../playback";
+import { formatTime } from "../timeFormat";
+import HorizontalSeekBar from "./HorizontalSeekBar";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface VolumeState { volume: number | null; muted: boolean; }
@@ -28,8 +30,14 @@ interface TVRemoteProps {
   cachedImageSrc?: string;
   /** Configured default TV volume (0–100), used before the TV reports its level. */
   defaultTvVolume?: number;
-  /** Position (seconds) playback was launched at, e.g. via the "Start at" field. */
-  initialPositionSeconds?: number | null;
+  /** When true, show the subtitle on/off button (configured in Settings). */
+  subtitlesFeatureEnabled?: boolean;
+  /** Configured subtitle language code from Settings. */
+  subtitleLanguage?: string;
+  /** When true, the seek bar and time jump controls are active (media is on the TV). */
+  seekEnabled?: boolean;
+  /** Series/season content_id for episode playback — used to resolve episode runtime. */
+  seriesContentId?: string | null;
   onPlaybackStateChange: (s: PlaybackState) => void;
   onDismissPlaying: () => void;
 }
@@ -179,105 +187,6 @@ const QuickFixButton = memo(function QuickFixButton({
   );
 });
 
-// ─── Utilities ────────────────────────────────────────────────────────────────
-function formatTime(secs: number): string {
-  const s = Math.max(0, Math.floor(secs));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  return h > 0
-    ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
-    : `${m}:${String(sec).padStart(2, "0")}`;
-}
-
-// ─── Custom horizontal seek bar ───────────────────────────────────────────────
-// Uses pointer events on a plain div — completely avoids the React
-// controlled-component snap-back problem of <input type="range">.
-function HorizontalSeekBar({
-  value, max, knownDuration,
-  onChange, onCommit,
-}: {
-  value: number;         // current playback position in seconds
-  max: number;           // total seconds (or large default)
-  knownDuration: boolean;// whether max is real runtime or just a fallback
-  onChange: (v: number) => void;   // called during drag (preview)
-  onCommit: (v: number) => void;   // called on release (actual seek)
-}) {
-  const trackRef    = useRef<HTMLDivElement>(null);
-  const draggingRef = useRef(false);
-  // localValue is the source of truth for the visual; syncs from parent when idle
-  const [local, setLocal] = useState(value);
-
-  useEffect(() => {
-    if (!draggingRef.current) setLocal(value);
-  }, [value]);
-
-  const fromPointer = (clientX: number): number => {
-    if (!trackRef.current) return local;
-    const rect = trackRef.current.getBoundingClientRect();
-    const pct  = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    return Math.round(pct * max);
-  };
-
-  const pct        = max > 0 ? Math.min(100, (local / max) * 100) : 0;
-  const fillColor  = knownDuration ? "#10b981" : "#4b5563"; // green or grey
-
-  // Drag via document-level listeners so the thumb keeps following the cursor
-  // even when it leaves the thin track (and works reliably inside the Tauri
-  // WebView, where setPointerCapture on a div is unreliable).
-  const startDrag = (clientX: number) => {
-    draggingRef.current = true;
-    const v = fromPointer(clientX);
-    setLocal(v); onChange(v);
-
-    const move = (ev: PointerEvent) => {
-      if (!draggingRef.current) return;
-      const nv = fromPointer(ev.clientX);
-      setLocal(nv); onChange(nv);
-    };
-    const up = (ev: PointerEvent) => {
-      if (!draggingRef.current) return;
-      draggingRef.current = false;
-      const nv = fromPointer(ev.clientX);
-      setLocal(nv); onCommit(nv);
-      document.removeEventListener("pointermove", move);
-      document.removeEventListener("pointerup", up);
-      document.removeEventListener("pointercancel", up);
-    };
-    document.addEventListener("pointermove", move);
-    document.addEventListener("pointerup", up);
-    document.addEventListener("pointercancel", up);
-  };
-
-  return (
-    <div
-      ref={trackRef}
-      onPointerDown={e => {
-        e.preventDefault();
-        startDrag(e.clientX);
-      }}
-      className="relative h-5 flex items-center cursor-pointer select-none"
-      style={{ touchAction: "none" }}
-    >
-      {/* Track */}
-      <div className="absolute inset-x-0 h-2 rounded-full bg-zinc-700">
-        {/* Fill */}
-        <div
-          className="absolute left-0 inset-y-0 rounded-full"
-          style={{ width: `${pct}%`, backgroundColor: fillColor }}
-        />
-      </div>
-      {/* Thumb — visible and draggable */}
-      <div
-        className="absolute w-4 h-4 rounded-full bg-white shadow-md
-                   border-2 border-zinc-900 z-10 -translate-x-1/2
-                   hover:scale-110 transition-transform"
-        style={{ left: `${pct}%` }}
-      />
-    </div>
-  );
-}
-
 // ─── Speaker icon ─────────────────────────────────────────────────────────────
 function SpeakerIcon({ level, muted, size = 16 }: { level: number | null; muted: boolean; size?: number }) {
   if (muted || level === 0)
@@ -298,6 +207,48 @@ function SpeakerIcon({ level, muted, size = 16 }: { level: number | null; muted:
     </svg>
   );
 }
+
+// ─── Volume step buttons ─────────────────────────────────────────────────────
+const VolStepButton = memo(function VolStepButton({
+  direction,
+  disabled,
+  busy,
+  onStep,
+}: {
+  direction: "up" | "down";
+  disabled: boolean;
+  busy: boolean;
+  onStep: (direction: "up" | "down") => void;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={disabled || busy}
+      title={direction === "up" ? "Volume up" : "Volume down"}
+      onPointerDown={(e) => {
+        if (e.button !== 0 || disabled || busy) return;
+        e.preventDefault();
+        e.stopPropagation();
+        onStep(direction);
+      }}
+      className="w-7 h-6 flex items-center justify-center rounded-md
+                 text-zinc-400 hover:text-white hover:bg-zinc-700/60
+                 disabled:opacity-40 transition-colors"
+    >
+      {busy ? (
+        <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+        </svg>
+      ) : (
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round"
+                d={direction === "up" ? "M5 15l7-7 7 7" : "M19 9l-7 7-7-7"} />
+        </svg>
+      )}
+    </button>
+  );
+});
 
 // ─── Custom vertical volume slider ───────────────────────────────────────────
 const SLIDER_H = 104;
@@ -341,9 +292,15 @@ function VerticalSlider({ value, muted, onChange }: {
 // ─── Main component ───────────────────────────────────────────────────────────
 export default function TVRemote({
   nowPlaying, episode, playbackState, cachedImageSrc,
-  defaultTvVolume = 13, initialPositionSeconds = null,
+  defaultTvVolume = 13,
+  subtitlesFeatureEnabled = false,
+  subtitleLanguage = "en",
+  seekEnabled = false, seriesContentId = null,
   onPlaybackStateChange, onDismissPlaying,
 }: TVRemoteProps) {
+
+  const subtitleLabel =
+    SUBTITLE_LANGUAGES.find((l) => l.code === subtitleLanguage)?.label ?? subtitleLanguage;
 
   // ── TV power + volume ─────────────────────────────────────────────────────
   const [tvOn, setTvOn]       = useState<boolean | null>(null);
@@ -351,7 +308,11 @@ export default function TVRemote({
   const [vol, setVol]         = useState<VolumeState>({ volume: null, muted: false });
   const [slider, setSlider]   = useState(defaultTvVolume);
   const [volError, setVE]     = useState(false);
+  const [volOpen, setVolOpen] = useState(false);
+  const [volStepBusy, setVolStepBusy] = useState(false);
   const volDebounce           = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const volStepBusyRef        = useRef(false);
+  const volAreaRef            = useRef<HTMLDivElement>(null);
 
   const setTvOnState = useCallback((on: boolean | null) => {
     tvOnRef.current = on;
@@ -441,6 +402,47 @@ export default function TVRemote({
     }, 180);
   };
 
+  const handleVolStep = useCallback(async (direction: "up" | "down") => {
+    if (!tvOnRef.current || volStepBusyRef.current) return;
+    volStepBusyRef.current = true;
+    setVolStepBusy(true);
+    if (volDebounce.current) clearTimeout(volDebounce.current);
+    try {
+      const s = await invoke<VolumeState>("volume_step", { direction, steps: 1 });
+      setVol(s);
+      setSlider(s.volume ?? slider);
+      setVE(false);
+    } catch {
+      setVE(true);
+    } finally {
+      volStepBusyRef.current = false;
+      setVolStepBusy(false);
+    }
+  }, [slider]);
+
+  // Close the volume popup when clicking outside it (or pressing Escape).
+  useEffect(() => {
+    if (!volOpen) return;
+    const handleClick = (e: MouseEvent) => {
+      if (e.button !== 0) return;
+      if (volAreaRef.current && !volAreaRef.current.contains(e.target as Node)) {
+        setVolOpen(false);
+      }
+    };
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setVolOpen(false);
+    };
+    const timer = window.setTimeout(() => {
+      document.addEventListener("mousedown", handleClick);
+      document.addEventListener("keydown", handleKey);
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("mousedown", handleClick);
+      document.removeEventListener("keydown", handleKey);
+    };
+  }, [volOpen]);
+
   const handleMute = async () => {
     if (!tvOnRef.current) return;
     const m = !vol.muted;
@@ -475,20 +477,70 @@ export default function TVRemote({
   const [timeMode, setTimeMode]         = useState<"seek" | "anchor">("seek");
   const [timeInput, setTimeInput]       = useState("");
 
-  const totalSecs      = nowPlaying?.runtime_min ? nowPlaying.runtime_min * 60 : null;
+  const [fetchedDurationSecs, setFetchedDurationSecs] = useState<number | null>(null);
+  const [tvDurationSecs, setTvDurationSecs]           = useState<number | null>(null);
+
+  const catalogSecs    = runtimeSecondsFromTitle(nowPlaying);
+  const totalSecs      = tvDurationSecs ?? fetchedDurationSecs ?? catalogSecs;
   const sliderMax      = totalSecs ?? 4 * 3600;
   const displayPos     = seekPreview ?? pos;   // show preview during drag
   const knownDuration  = totalSecs !== null;
 
-  // Reset when a new title starts — anchor to the requested start position
-  // (e.g. "Start at" in the play dialog) instead of always 0, so the dock
-  // accurately reflects where playback actually began.
+  // Drop fetched/TV overrides when the title or episode changes.
   useEffect(() => {
-    const start = initialPositionSeconds ?? 0;
-    playRef.current = { pos: start, time: Date.now() };
-    setPos(start); setSeekPreview(null);
+    setFetchedDurationSecs(null);
+    setTvDurationSecs(null);
+  }, [nowPlaying?.content_id, episode]);
+
+  // Episodes often lack runtime on the series row — fetch the episode list once.
+  useEffect(() => {
+    if (catalogSecs !== null || !episode || episode < 1 || !seriesContentId) return;
+    let active = true;
+    invoke<string>("list_episodes", { contentId: seriesContentId })
+      .then((raw) => {
+        if (!active) return;
+        let list: PrimeEpisode[] = [];
+        try {
+          list = JSON.parse(raw);
+        } catch {
+          list = [];
+        }
+        if (!Array.isArray(list)) return;
+        const ep =
+          list.find((e) => e.sequence_number === episode) ??
+          list[episode - 1];
+        if (ep?.runtime_min != null && ep.runtime_min > 0) {
+          setFetchedDurationSecs(ep.runtime_min * 60);
+        }
+      })
+      .catch(() => {});
+    return () => { active = false; };
+  }, [catalogSecs, episode, seriesContentId, nowPlaying?.content_id]);
+
+  // Seed position when a new title starts. Fetch Prime's saved resume offset so
+  // the bar shows e.g. 31:23 / 53:23 when playback resumes mid-title.
+  useEffect(() => {
+    if (!seekEnabled || !nowPlaying) return;
+    let active = true;
+    playRef.current = { pos: 0, time: Date.now() };
+    setPos(0);
+    setSeekPreview(null);
     isDraggingRef.current = false;
-  }, [nowPlaying?.content_id]); // eslint-disable-line
+
+    const resumeContentId = seriesContentId ?? nowPlaying.content_id;
+    invoke<{ position: number | null }>("get_resume_position", {
+      contentId: resumeContentId,
+      episode: episode ?? null,
+    })
+      .then((r) => {
+        if (!active || r.position == null || r.position < 1) return;
+        playRef.current = { pos: r.position, time: Date.now() };
+        setPos(r.position);
+      })
+      .catch(() => {});
+
+    return () => { active = false; };
+  }, [nowPlaying?.content_id, episode, seekEnabled, seriesContentId]); // eslint-disable-line
 
   // NOTE: We intentionally do NOT auto-poll the TV for playback position.
   // Querying position (get_playback_position) opens an SSAP session and issues
@@ -521,14 +573,17 @@ export default function TVRemote({
 
   // ── Seek ─────────────────────────────────────────────────────────────────
   const commitSeek = useCallback((seconds: number) => {
+    if (!seekEnabled || !nowPlaying) return;
     playRef.current = { pos: seconds, time: Date.now() };
     setPos(seconds); setSeekPreview(null);
+    const seekContentId = seriesContentId ?? nowPlaying.content_id;
+    const seekEpisode = seriesContentId ? (episode ?? null) : null;
     invoke("seek_to", {
       seconds,
-      contentId: nowPlaying?.content_id ?? null,
-      episode: episode ?? null,
+      contentId: seekContentId,
+      episode: seekEpisode,
     }).catch(() => {});
-  }, [nowPlaying?.content_id, episode]); // eslint-disable-line
+  }, [seekEnabled, nowPlaying, episode, seriesContentId]);
 
   const parseTimeStr = (s: string): number | null => {
     const p = s.trim().split(":").map(x => parseFloat(x));
@@ -541,8 +596,9 @@ export default function TVRemote({
 
   const syncFromTV = async () => {
     try {
-      const r = await invoke<{ position: number | null }>("get_playback_position");
+      const r = await invoke<{ position: number | null; duration: number | null }>("get_playback_position");
       if (r.position != null) { playRef.current = { pos: r.position, time: Date.now() }; setPos(r.position); }
+      if (r.duration != null && r.duration > 0) setTvDurationSecs(r.duration);
     } catch { /* not supported */ }
   };
 
@@ -606,6 +662,39 @@ export default function TVRemote({
       setPowerBusy(false);
     }
   };
+
+  // ── Subtitles ─────────────────────────────────────────────────────────────
+  const [subtitlesOn, setSubtitlesOn] = useState(false);
+  const [subtitleBusy, setSubtitleBusy] = useState(false);
+  const [subtitleErr, setSubtitleErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSubtitlesOn(false);
+    setSubtitleErr(null);
+  }, [nowPlaying?.content_id, episode]);
+
+  const toggleSubtitles = useCallback(async () => {
+    if (!seekEnabled || subtitleBusy) return;
+    const next = !subtitlesOn;
+    setSubtitleBusy(true);
+    setSubtitleErr(null);
+    try {
+      await invoke("set_tv_subtitles", { enabled: next });
+      setSubtitlesOn(next);
+      setTvOnState(true);
+      if (playbackState === "paused") onPlaybackStateChange("playing");
+    } catch (err) {
+      const msg = String(err).replace(/^Error:\s*/, "");
+      if (isTvUnreachableMessage(msg)) {
+        setTvOnState(false);
+        setSubtitleErr("TV unreachable");
+      } else {
+        setSubtitleErr(msg.slice(0, 60));
+      }
+    } finally {
+      setSubtitleBusy(false);
+    }
+  }, [seekEnabled, subtitleBusy, subtitlesOn, setTvOnState, playbackState, onPlaybackStateChange]);
 
   // ── Transport ─────────────────────────────────────────────────────────────
   const [pbBusy, setPbBusy] = useState<TransportAction | null>(null);
@@ -724,76 +813,94 @@ export default function TVRemote({
 
         <div className="w-px h-9 bg-zinc-700/60 shrink-0" />
 
-        {/* ── CENTRE: Position / seek ───────────────────────────────────── */}
-        <div className="flex-1 flex items-center gap-2 min-w-0">
+        {/* ── CENTRE: Position / seek (active while media is playing on TV) ─ */}
+        <div className={`flex-1 flex items-center gap-2 min-w-0 ${
+          !seekEnabled ? "opacity-40 pointer-events-none" : ""
+        }`}>
+          {seekEnabled ? (
+            <>
+              {/* Elapsed time — click to type a target time (re-launches there) */}
+              {editingTime ? (
+                <input
+                  type="text"
+                  value={timeInput}
+                  onChange={e => setTimeInput(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === "Enter") commitTimeInput();
+                    if (e.key === "Escape") { setEditingTime(false); setTimeInput(""); }
+                  }}
+                  onBlur={commitTimeInput}
+                  placeholder={formatTime(displayPos)}
+                  title={timeMode === "anchor"
+                    ? "Set the displayed time to match the TV (no re-launch)"
+                    : "Jump to this time on the TV (re-launches playback)"}
+                  className={`shrink-0 w-16 text-xs font-mono text-center bg-zinc-800
+                             border rounded px-1 py-0.5 text-white outline-none select-text ${
+                    timeMode === "anchor" ? "border-sky-500" : "border-emerald-500"}`}
+                  autoFocus
+                />
+              ) : (
+                <button
+                  type="button"
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    openTimeEditor("seek");
+                  }}
+                  title="Click to jump to a specific time on the TV  e.g. 1:23:45"
+                  className="shrink-0 w-14 text-right text-xs font-mono tabular-nums
+                             text-zinc-300 hover:text-emerald-400 hover:underline
+                             transition-colors cursor-pointer"
+                >
+                  {formatTime(displayPos)}
+                </button>
+              )}
 
-          {/* Elapsed time — click to type a target time (re-launches there) */}
-          {editingTime ? (
-            <input
-              type="text"
-              value={timeInput}
-              onChange={e => setTimeInput(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === "Enter") commitTimeInput();
-                if (e.key === "Escape") { setEditingTime(false); setTimeInput(""); }
-              }}
-              onBlur={commitTimeInput}
-              placeholder={formatTime(displayPos)}
-              title={timeMode === "anchor"
-                ? "Set the displayed time to match the TV (no re-launch)"
-                : "Jump to this time on the TV (re-launches playback)"}
-              className={`shrink-0 w-16 text-xs font-mono text-center bg-zinc-800
-                         border rounded px-1 py-0.5 text-white outline-none ${
-                timeMode === "anchor" ? "border-sky-500" : "border-emerald-500"}`}
-              autoFocus
-            />
+              {/* Seek bar */}
+              <div className="flex-1 min-w-0">
+                <HorizontalSeekBar
+                  value={displayPos}
+                  max={sliderMax}
+                  knownDuration={knownDuration}
+                  onChange={v => { isDraggingRef.current = true; setSeekPreview(v); }}
+                  onCommit={v => { isDraggingRef.current = false; commitSeek(v); }}
+                />
+              </div>
+
+              {/* Total duration */}
+              <span className="shrink-0 w-14 text-xs font-mono tabular-nums text-zinc-600">
+                {knownDuration ? formatTime(totalSecs!) : "?:??"}
+              </span>
+
+              {/* Set displayed position (no re-launch) — fixes the readout when
+                  Prime auto-resumed at a different point than the bar shows */}
+              <button
+                type="button"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  openTimeEditor("anchor");
+                }}
+                title="Set the displayed time to match the TV (no re-launch)"
+                className="shrink-0 p-1 text-zinc-700 hover:text-sky-400 hover:bg-zinc-800/60 rounded-lg transition-colors">
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2.2} viewBox="0 0 24 24">
+                  <circle cx="12" cy="12" r="8.25" />
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 7.5V12l2.75 1.75" />
+                </svg>
+              </button>
+
+              {/* Sync from TV */}
+              <button onClick={syncFromTV} title="Sync position from TV (briefly pauses the stream)"
+                className="shrink-0 p-1 text-zinc-700 hover:text-zinc-400 hover:bg-zinc-800/60 rounded-lg transition-colors">
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round"
+                    d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99"/>
+                </svg>
+              </button>
+            </>
           ) : (
-            <button
-              onClick={() => openTimeEditor("seek")}
-              title="Click to jump to a specific time on the TV  e.g. 1:23:45"
-              className="shrink-0 w-14 text-right text-xs font-mono tabular-nums
-                         text-zinc-300 hover:text-emerald-400 hover:underline
-                         transition-colors cursor-pointer"
-            >
-              {formatTime(displayPos)}
-            </button>
+            <p className="flex-1 text-center text-xs text-zinc-600">
+              Play something to seek
+            </p>
           )}
-
-          {/* Seek bar */}
-          <div className="flex-1 min-w-0">
-            <HorizontalSeekBar
-              value={displayPos}
-              max={sliderMax}
-              knownDuration={knownDuration}
-              onChange={v => { isDraggingRef.current = true; setSeekPreview(v); }}
-              onCommit={v => { isDraggingRef.current = false; commitSeek(v); }}
-            />
-          </div>
-
-          {/* Total duration */}
-          <span className="shrink-0 w-14 text-xs font-mono tabular-nums text-zinc-600">
-            {knownDuration ? formatTime(totalSecs!) : "?:??"}
-          </span>
-
-          {/* Set displayed position (no re-launch) — fixes the readout when
-              Prime auto-resumed at a different point than the bar shows */}
-          <button onClick={() => openTimeEditor("anchor")}
-            title="Set the displayed time to match the TV (no re-launch)"
-            className="shrink-0 p-1 text-zinc-700 hover:text-sky-400 hover:bg-zinc-800/60 rounded-lg transition-colors">
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2.2} viewBox="0 0 24 24">
-              <circle cx="12" cy="12" r="8.25" />
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 7.5V12l2.75 1.75" />
-            </svg>
-          </button>
-
-          {/* Sync from TV */}
-          <button onClick={syncFromTV} title="Sync position from TV (briefly pauses the stream)"
-            className="shrink-0 p-1 text-zinc-700 hover:text-zinc-400 hover:bg-zinc-800/60 rounded-lg transition-colors">
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round"
-                d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99"/>
-            </svg>
-          </button>
         </div>
 
         <div className="w-px h-9 bg-zinc-700/60 shrink-0" />
@@ -808,6 +915,54 @@ export default function TVRemote({
         />
 
         <div className="w-px h-9 bg-zinc-700/60 shrink-0" />
+
+        {/* ── SUBTITLES (only when enabled in Settings) ─────────────────── */}
+        {subtitlesFeatureEnabled && (
+        <>
+        <div className={`flex flex-col items-center shrink-0 ${
+          !seekEnabled || tvOn === false ? "opacity-40 pointer-events-none" : ""
+        }`}>
+          <button
+            type="button"
+            disabled={subtitleBusy || !seekEnabled}
+            onClick={toggleSubtitles}
+            title={
+              subtitleErr ?? (
+                subtitlesOn
+                  ? `Subtitles on (${subtitleLabel}) — click to turn off`
+                  : "Subtitles off — click to turn on"
+              )
+            }
+            className={`w-9 h-9 flex items-center justify-center rounded-xl border transition-colors
+                        disabled:opacity-40 shrink-0 ${
+              subtitlesOn
+                ? "bg-sky-900/50 border-sky-600 text-sky-200 hover:bg-sky-800/60"
+                : "bg-zinc-800/80 border-zinc-700/60 text-zinc-400 hover:bg-zinc-700 hover:text-white"
+            }`}
+          >
+            {subtitleBusy ? (
+              <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+              </svg>
+            ) : (
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round"
+                  d="M7 8h10M7 12h6m-6 4h10M5 6a2 2 0 012-2h10a2 2 0 012 2v12a2 2 0 01-2 2H7a2 2 0 01-2-2V6z" />
+              </svg>
+            )}
+          </button>
+          {subtitleErr && (
+            <span className="text-[9px] text-red-400 max-w-[72px] text-center leading-tight truncate mt-0.5"
+                  title={subtitleErr}>
+              {subtitleErr}
+            </span>
+          )}
+        </div>
+
+        <div className="w-px h-9 bg-zinc-700/60 shrink-0" />
+        </>
+        )}
 
         {/* ── POWER (single toggle: green=on, red=off) ──────────────────── */}
         <div className="flex flex-col items-center shrink-0">
@@ -846,37 +1001,78 @@ export default function TVRemote({
         <div className="w-px h-9 bg-zinc-700/60 shrink-0" />
 
         {/* ── VOLUME (only active when TV is on) ─────────────────────────── */}
-        <div className={`relative flex flex-col items-center justify-center shrink-0 w-10 h-full ${
-          tvOn === false ? "opacity-40 pointer-events-none" : ""
-        }`}>
+        <div
+          ref={volAreaRef}
+          className={`relative flex flex-col items-center justify-center shrink-0 w-10 h-full ${
+            tvOn === false ? "opacity-40 pointer-events-none" : ""
+          }`}
+        >
 
-          {/* Vertical slider pops above dock */}
-          <div className="absolute bottom-full mb-1 flex flex-col items-center gap-1 pb-1.5
-                          bg-zinc-900/90 border border-zinc-700/60 rounded-xl px-2 pt-2"
-               style={{ width: "36px" }}>
-            <VerticalSlider value={volPct} muted={vol.muted} onChange={handleVolSlider} />
-            <span className={`text-[10px] font-bold tabular-nums leading-none mt-0.5 ${
-              vol.muted ? "text-zinc-600" : volPct > 75 ? "text-orange-400" : "text-emerald-400"
-            }`}>
-              {volError ? "!" : vol.muted ? "—" : slider}
-            </span>
-          </div>
+          {/* Volume popup — step buttons + slider */}
+          {volOpen && (
+            <div className="absolute bottom-full mb-1 flex flex-col items-center gap-0.5 pb-1.5
+                            bg-zinc-900/90 border border-zinc-700/60 rounded-xl px-1.5 pt-1"
+                 style={{ width: "40px" }}>
+              <VolStepButton
+                direction="up"
+                disabled={tvOn !== true}
+                busy={volStepBusy}
+                onStep={handleVolStep}
+              />
+              <VerticalSlider value={volPct} muted={vol.muted} onChange={handleVolSlider} />
+              <VolStepButton
+                direction="down"
+                disabled={tvOn !== true}
+                busy={volStepBusy}
+                onStep={handleVolStep}
+              />
+              <span className={`text-[10px] font-bold tabular-nums leading-none mt-0.5 ${
+                vol.muted ? "text-zinc-600" : volPct > 75 ? "text-orange-400" : "text-emerald-400"
+              }`}>
+                {volError ? "!" : vol.muted ? "—" : slider}
+              </span>
+              <button
+                type="button"
+                onClick={() => { if (volError) fetchVolume(); else handleMute(); }}
+                title={
+                  volError ? "Retry volume sync"
+                  : vol.muted ? "Unmute" : "Mute"
+                }
+                className={`mt-0.5 p-1 rounded-md transition-colors ${
+                  vol.muted
+                    ? "text-red-400 bg-red-900/40 hover:bg-red-900/60"
+                    : volError
+                      ? "text-orange-400 bg-orange-900/30 hover:bg-orange-900/50"
+                      : "text-zinc-400 hover:text-white hover:bg-zinc-700/60"
+                }`}
+              >
+                <SpeakerIcon level={dispVol} muted={vol.muted} size={14} />
+              </button>
+            </div>
+          )}
 
-          {/* Mute button — click also retries volume sync when TV is on */}
+          {/* Speaker — opens volume popup; retries sync when volume read failed */}
           <button
-            onClick={() => { if (volError) fetchVolume(); else handleMute(); }}
+            onClick={() => {
+              if (volError) fetchVolume();
+              else setVolOpen(o => !o);
+            }}
             title={
               tvOn === false ? "TV is off"
               : volError ? "Retry volume sync"
-              : vol.muted ? "Unmute" : "Mute"
+              : volOpen ? "Close volume"
+              : vol.muted ? "Volume (muted)" : "Volume"
             }
             className={`p-1.5 rounded-lg transition-colors ${
-              vol.muted
-                ? "text-red-400 bg-red-900/40 hover:bg-red-900/60"
-                : volError
-                  ? "text-orange-400 bg-orange-900/30 hover:bg-orange-900/50"
-                  : "text-zinc-400 hover:text-white hover:bg-zinc-700/60"
-            }`}>
+              volOpen
+                ? "text-white bg-zinc-700/80"
+                : vol.muted
+                  ? "text-red-400 bg-red-900/40 hover:bg-red-900/60"
+                  : volError
+                    ? "text-orange-400 bg-orange-900/30 hover:bg-orange-900/50"
+                    : "text-zinc-400 hover:text-white hover:bg-zinc-700/60"
+            }`}
+          >
             <SpeakerIcon level={dispVol} muted={vol.muted} size={18} />
           </button>
         </div>

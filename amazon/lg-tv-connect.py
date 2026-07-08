@@ -70,6 +70,7 @@ from amazon.prime_entitlement import (
     resolve_asins_for_content_id,
     resolve_episode_content_id,
     resolve_gti_for_content_id,
+    resume_start_seconds_from_html,
     title_type_for_content_id,
 )
 
@@ -91,6 +92,37 @@ PROFILE_KEY_DELAY = 0.35
 DEFAULT_PIN_DELAY = 2.0
 DEFAULT_PROFILE_STEP_DELAY = 3.0
 PLAY_KEY_DELAY = 0.45
+SUBTITLE_KEY_DELAY = 0.4
+DEFAULT_SUBTITLE_DELAY = 0.0
+# DOWN after pause to reach the transport icon row (0 = skip).
+DEFAULT_SUBTITLE_FOCUS_DOWN = 1
+# RIGHT presses on the pause bar to the Subtitles button (not Audio options).
+# Prime LG order: … → Start again → Subtitles → Audio options (2 reaches Subtitles).
+DEFAULT_SUBTITLE_FOCUS_RIGHT = 2
+# Only needed when one combined Audio & Subtitles panel opens (0 = separate buttons).
+DEFAULT_SUBTITLE_SECTION_UP = 0
+DEFAULT_SUBTITLE_SECTION_LEFT = 0
+# Down-steps from the top of Prime's subtitle menu (0 = Off). Available tracks
+# vary per title; override with --subtitle-menu-down if the wrong row is picked.
+# Steps within the Subtitles list (0 = Off). Track order varies per title.
+SUBTITLE_LANGUAGE_DOWN: dict[str, int] = {
+    "off": 0,
+    "en-cc": 1,
+    "en": 1,
+    "de": 2,
+    "fr": 3,
+    "es": 4,
+    "it": 5,
+    "pt": 6,
+    "nl": 7,
+    "sv": 8,
+    "no": 9,
+    "da": 10,
+    "fi": 11,
+    "pl": 12,
+    "ja": 13,
+    "ko": 14,
+}
 PRIME_PLAY_METHODS = ("auto", "media", "watch", "enter")
 PRIME_PROFILE_TYPES = ("adult", "kid", "none")
 PRIME_DETAIL_ID_RE = re.compile(r"^[0-9A-Z]{26,32}$")
@@ -898,18 +930,24 @@ async def start_playback(
         # A bare GTI/contentId launch lands in one of two states we can't predict
         # up front: a fresh episode auto-plays (player already up), while one with
         # a saved position shows its Resume detail page and waits for a keypress.
-        # Probe the TV during the page-load wait — if it is already playing, an
-        # ENTER here would toggle it to PAUSE ("plays for a few seconds then
-        # pauses"), so only press the button when playback has NOT started.
+        # For Prime, SSAP position probes interrupt playback and cannot report
+        # Prime's position reliably — use a fixed wait only. For other players,
+        # poll during the wait and skip keys when playback already started.
         probe = delay if delay > 0 else DEFAULT_PLAY_DELAY
-        print(
-            f"  Waiting up to {probe:.1f}s for the title page / autoplay, "
-            "then starting playback only if needed ..."
-        )
-        if await _wait_until_playing(client, probe):
-            print("  Playback already started after launch; no extra keys needed.")
-            return
-        print("  Not playing yet — pressing the Watch/Resume button.")
+        if await _prefer_remote_keys(client):
+            print(
+                f"  Waiting {probe:.1f}s for the title page (Prime — no SSAP probe) ..."
+            )
+            await asyncio.sleep(probe)
+        else:
+            print(
+                f"  Waiting up to {probe:.1f}s for the title page / autoplay, "
+                "then starting playback only if needed ..."
+            )
+            if await _wait_until_playing(client, probe):
+                print("  Playback already started after launch; no extra keys needed.")
+                return
+            print("  Not playing yet — pressing the Watch/Resume button.")
     elif delay > 0:
         detail = f" ({note})" if note else ""
         print(
@@ -935,13 +973,12 @@ async def start_playback(
             highlight_only=play_highlight,
         )
         if not play_highlight:
-            await client.button("ENTER")
-            print("  Sent ENTER after focus navigation.")
-            # Safety: if the episode was already auto-playing, ENTER toggled it
-            # to PAUSE. Send PLAY immediately to recover.
-            await asyncio.sleep(PLAY_KEY_DELAY)
-            await client.button("PLAY")
-            print("  Sent PLAY to ensure playback is running.")
+            if await _prefer_remote_keys(client):
+                await client.button("PLAY")
+                print("  Sent PLAY after focus navigation (Prime).")
+            else:
+                await client.button("ENTER")
+                print("  Sent ENTER after focus navigation.")
     elif resolved_method == "enter":
         # The Prime detail page focuses its primary Watch/Resume button by
         # default, so ENTER resumes immediately. The UP/DOWN/LEFT focus dance is
@@ -956,14 +993,15 @@ async def start_playback(
                 "(use --play-method watch if it is not focused)."
             )
         else:
-            await client.button("ENTER")
-            # Safety: if the episode was already auto-playing (e.g. the GTI deep
-            # link started it after profile selection), ENTER toggles it to PAUSE.
-            # Send PLAY immediately to recover — if ENTER correctly started a
-            # paused video instead, PLAY is a no-op on LG WebOS.
-            await asyncio.sleep(PLAY_KEY_DELAY)
-            await client.button("PLAY")
-            print(f"  Sent ENTER+PLAY on Watch/Resume button{note_detail}.")
+            if await _prefer_remote_keys(client):
+                # ENTER toggles pause when Prime auto-started during the page-load
+                # waits; PLAY is a no-op while playing and still starts/resumes
+                # from the title page in most builds.
+                await client.button("PLAY")
+                print(f"  Sent PLAY to start/resume (Prime){note_detail}.")
+            else:
+                await client.button("ENTER")
+                print(f"  Sent ENTER on Watch/Resume button{note_detail}.")
     else:
         raise ValueError(f"unknown play method: {resolved_method}")
 
@@ -996,11 +1034,19 @@ async def cmd_launch_prime(
     skip_entitlement_check: bool = False,
     episode: int | None = None,
     start: int = 0,
+    set_subtitles: str | None = None,
+    subtitle_delay: float = DEFAULT_SUBTITLE_DELAY,
+    subtitle_focus_down: int = DEFAULT_SUBTITLE_FOCUS_DOWN,
+    subtitle_focus_right: int = DEFAULT_SUBTITLE_FOCUS_RIGHT,
+    subtitle_section_up: int = DEFAULT_SUBTITLE_SECTION_UP,
+    subtitle_section_left: int = DEFAULT_SUBTITLE_SECTION_LEFT,
+    subtitle_menu_down: int | None = None,
 ) -> None:
     profile_display_name: str | None = None
     effective_profile_type = profile_type or "adult"
     detail_html: str | None = None
     used_autoplay_launch = False
+    title_page_settled = False
     if content_id and not skip_entitlement_check:
         detail_html = fetch_prime_detail_html(content_id)
         if detail_html:
@@ -1086,7 +1132,7 @@ async def cmd_launch_prime(
             # picker act as a gate: once the profile is chosen, Prime lands
             # straight on the title page. (Selecting the profile first and
             # deep-linking afterwards just bounces back to the picker.)
-            print("  Prime flow: content deep link → profile gate → title page")
+            print("  Prime flow: content deep link → profile gate → play")
             _, used_autoplay_launch = await launch_prime_content_candidates(
                 client,
                 content_id,
@@ -1095,11 +1141,10 @@ async def cmd_launch_prime(
                 detail_html=detail_html,
                 episode=episode,
                 prefer_episode=play or episode is not None,
-                # Normally this flow deep-links without autoplay and lets the
-                # profile picker gate playback. When a start offset is requested
-                # we need the autoplay ?t=<pos> deep link so Prime begins at that
-                # position once the profile is chosen.
-                autoplay=(start or 0) > 0,
+                # Use an autoplay deep link so Prime starts after profile pick
+                # without a delayed ENTER (which toggles pause on auto-started
+                # episodes ~6–14s into playback).
+                autoplay=play or (start or 0) > 0,
                 start=start,
             )
             await select_profile(
@@ -1121,6 +1166,7 @@ async def cmd_launch_prime(
             if content_delay > 0:
                 print(f"  Waiting {content_delay:.1f}s for the title page ...")
                 await asyncio.sleep(content_delay)
+                title_page_settled = True
     elif content_id is not None:
         _, used_autoplay_launch = await launch_prime_content_candidates(
             client,
@@ -1207,7 +1253,7 @@ async def cmd_launch_prime(
         else:
             await start_playback(
                 client,
-                delay=play_delay,
+                delay=0 if title_page_settled else play_delay,
                 method=play_method,
                 play_labels=play_labels,
                 used_autoplay_launch=used_autoplay_launch,
@@ -1216,6 +1262,17 @@ async def cmd_launch_prime(
                 play_focus_left=play_focus_left,
                 play_highlight=play_highlight,
             )
+            if set_subtitles is not None:
+                await cmd_set_subtitles(
+                    client,
+                    language=set_subtitles,
+                    delay=subtitle_delay,
+                    focus_down=subtitle_focus_down,
+                    focus_right=subtitle_focus_right,
+                    section_up=subtitle_section_up,
+                    section_left=subtitle_section_left,
+                    menu_down=subtitle_menu_down,
+                )
 
     print("  Done.")
 
@@ -1249,6 +1306,13 @@ async def cmd_launch(
     skip_entitlement_check: bool = False,
     episode: int | None = None,
     start: int = 0,
+    set_subtitles: str | None = None,
+    subtitle_delay: float = DEFAULT_SUBTITLE_DELAY,
+    subtitle_focus_down: int = DEFAULT_SUBTITLE_FOCUS_DOWN,
+    subtitle_focus_right: int = DEFAULT_SUBTITLE_FOCUS_RIGHT,
+    subtitle_section_up: int = DEFAULT_SUBTITLE_SECTION_UP,
+    subtitle_section_left: int = DEFAULT_SUBTITLE_SECTION_LEFT,
+    subtitle_menu_down: int | None = None,
 ) -> None:
     if app_id == PRIME_VIDEO_APP_ID:
         await cmd_launch_prime(
@@ -1278,6 +1342,13 @@ async def cmd_launch(
             skip_entitlement_check=skip_entitlement_check,
             episode=episode,
             start=start,
+            set_subtitles=set_subtitles,
+            subtitle_delay=subtitle_delay,
+            subtitle_focus_down=subtitle_focus_down,
+            subtitle_focus_right=subtitle_focus_right,
+            subtitle_section_up=subtitle_section_up,
+            subtitle_section_left=subtitle_section_left,
+            subtitle_menu_down=subtitle_menu_down,
         )
         return
 
@@ -1577,6 +1648,69 @@ Use --profile-highlight to verify the mapped index on TV.""",
         action="store_true",
         help="Unmute the TV",
     )
+    # ── Subtitles (Prime Video player) ────────────────────────────────────────
+    parser.add_argument(
+        "--set-subtitles",
+        metavar="LANG",
+        help=(
+            "Set Prime subtitles: 'off' to disable, or a language code "
+            "(en, sv, de, …). Applied after --play or to current playback."
+        ),
+    )
+    parser.add_argument(
+        "--subtitle-delay",
+        type=float,
+        default=DEFAULT_SUBTITLE_DELAY,
+        metavar="SECS",
+        help=f"Seconds to wait before opening the subtitle menu (default: {DEFAULT_SUBTITLE_DELAY:g})",
+    )
+    parser.add_argument(
+        "--subtitle-focus-down",
+        type=int,
+        default=DEFAULT_SUBTITLE_FOCUS_DOWN,
+        metavar="N",
+        help=(
+            "DOWN-key presses after pause to reach the transport icon row "
+            f"(default: {DEFAULT_SUBTITLE_FOCUS_DOWN})"
+        ),
+    )
+    parser.add_argument(
+        "--subtitle-focus-right",
+        type=int,
+        default=DEFAULT_SUBTITLE_FOCUS_RIGHT,
+        metavar="N",
+        help=(
+            "RIGHT-key presses to reach Audio & Subtitles, then ENTER "
+            f"(-1 = default {DEFAULT_SUBTITLE_FOCUS_RIGHT})"
+        ),
+    )
+    parser.add_argument(
+        "--subtitle-section-up",
+        type=int,
+        default=DEFAULT_SUBTITLE_SECTION_UP,
+        metavar="N",
+        help=(
+            "UP presses inside the panel to highlight Subtitles instead of Audio "
+            f"(default: {DEFAULT_SUBTITLE_SECTION_UP})"
+        ),
+    )
+    parser.add_argument(
+        "--subtitle-section-left",
+        type=int,
+        default=DEFAULT_SUBTITLE_SECTION_LEFT,
+        metavar="N",
+        help=(
+            "LEFT presses inside the panel to reach the Subtitles column "
+            f"(default: {DEFAULT_SUBTITLE_SECTION_LEFT})"
+        ),
+    )
+    parser.add_argument(
+        "--subtitle-menu-down",
+        type=int,
+        default=-1,
+        metavar="N",
+        help="DOWN-key presses in the subtitle list (-1 = auto from language)",
+    )
     # ── Power ─────────────────────────────────────────────────────────────────
     parser.add_argument(
         "--power-off",
@@ -1621,6 +1755,11 @@ Use --profile-highlight to verify the mapped index on TV.""",
         "--get-position",
         action="store_true",
         help="Get current playback position and duration as JSON",
+    )
+    parser.add_argument(
+        "--resume-position",
+        action="store_true",
+        help="Read saved resume position (seconds) from a Prime detail page as JSON",
     )
     parser.add_argument(
         "--list-episodes",
@@ -1676,6 +1815,164 @@ async def _send_button(client: "WebOsClient", name: str) -> bool:
     return False
 
 
+def _resolve_subtitle_menu_down(language: str, menu_down: int | None) -> int:
+    if menu_down is not None and menu_down >= 0:
+        return menu_down
+    lang = (language or "en").strip().lower()
+    if lang == "off":
+        return 0
+    return SUBTITLE_LANGUAGE_DOWN.get(lang, SUBTITLE_LANGUAGE_DOWN.get("en", 1))
+
+
+async def _focus_subtitles_section(
+    client: "WebOsClient",
+    *,
+    section_up: int,
+    section_left: int,
+) -> None:
+    """Move focus from Audio to Subtitles inside the open panel (UP/LEFT only)."""
+    if section_left > 0:
+        print(
+            f"  Select Subtitles section: LEFT×{section_left} ...",
+            file=sys.stderr,
+        )
+        for _ in range(section_left):
+            await _send_button(client, "LEFT")
+            await asyncio.sleep(SUBTITLE_KEY_DELAY)
+    if section_up > 0:
+        print(
+            f"  Select Subtitles section: UP×{section_up} ...",
+            file=sys.stderr,
+        )
+        for _ in range(section_up):
+            await _send_button(client, "UP")
+            await asyncio.sleep(SUBTITLE_KEY_DELAY)
+
+
+async def _open_prime_subtitle_picker(
+    client: "WebOsClient",
+    *,
+    focus_down: int,
+    focus_right: int,
+) -> bool:
+    """Press the Subtitles button on Prime's pause bar (not Start again / Audio).
+
+    Do not send UP during playback — that opens the cast/X-Ray actor list.
+    """
+    await _send_button(client, "PAUSE")
+    await asyncio.sleep(0.7)
+
+    right_steps = DEFAULT_SUBTITLE_FOCUS_RIGHT if focus_right < 0 else focus_right
+    down_steps = max(0, focus_down)
+
+    if down_steps:
+        print(
+            f"  Focus transport row: DOWN×{down_steps} ...",
+            file=sys.stderr,
+        )
+        for _ in range(down_steps):
+            await _send_button(client, "DOWN")
+            await asyncio.sleep(SUBTITLE_KEY_DELAY)
+
+    print(
+        f"  Opening Subtitles: RIGHT×{right_steps} + ENTER ...",
+        file=sys.stderr,
+    )
+    for _ in range(right_steps):
+        await _send_button(client, "RIGHT")
+        await asyncio.sleep(SUBTITLE_KEY_DELAY)
+    if not await _send_button(client, "ENTER"):
+        return False
+    await asyncio.sleep(0.75)
+    return True
+
+
+async def apply_subtitles(
+    client: "WebOsClient",
+    *,
+    enabled: bool,
+    language: str = "en",
+    delay: float = DEFAULT_SUBTITLE_DELAY,
+    focus_down: int = DEFAULT_SUBTITLE_FOCUS_DOWN,
+    focus_right: int = DEFAULT_SUBTITLE_FOCUS_RIGHT,
+    section_up: int = DEFAULT_SUBTITLE_SECTION_UP,
+    section_left: int = DEFAULT_SUBTITLE_SECTION_LEFT,
+    menu_down: int | None = None,
+) -> None:
+    """Open Prime's Audio & Subtitles picker and select Off or a language.
+
+    UP is only sent inside the open panel (not during playback — that opens cast).
+    Never sends BACK/EXIT (exits the player).
+    """
+    lang = (language or "en").strip().lower()
+    if not enabled:
+        lang = "off"
+    steps_down = _resolve_subtitle_menu_down(lang, menu_down)
+
+    print(
+        f"  Applying subtitles: {'on' if enabled else 'off'}"
+        f"{f' ({language})' if enabled else ''} ...",
+        file=sys.stderr,
+    )
+
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+    if not await _open_prime_subtitle_picker(
+        client, focus_down=focus_down, focus_right=focus_right
+    ):
+        print("  Warning: could not open subtitle picker.", file=sys.stderr)
+        await _send_button(client, "PLAY")
+        print(json.dumps({"subtitles": enabled, "language": lang if enabled else "off"}))
+        return
+
+    # Skip when Prime has separate Subtitles / Audio buttons (section steps are for
+    # a combined Audio & Subtitles panel only).
+    if section_up > 0 or section_left > 0:
+        await _focus_subtitles_section(
+            client, section_up=section_up, section_left=section_left
+        )
+
+    for _ in range(max(0, steps_down)):
+        await _send_button(client, "DOWN")
+        await asyncio.sleep(SUBTITLE_KEY_DELAY)
+
+    await _send_button(client, "ENTER")
+    await asyncio.sleep(0.35)
+
+    # Resume playback. Do not send BACK — it leaves the player and can restart.
+    await _send_button(client, "PLAY")
+
+    print(json.dumps({"subtitles": enabled, "language": lang if enabled else "off"}))
+
+
+async def cmd_set_subtitles(
+    client: "WebOsClient",
+    *,
+    language: str,
+    delay: float = DEFAULT_SUBTITLE_DELAY,
+    focus_down: int = DEFAULT_SUBTITLE_FOCUS_DOWN,
+    focus_right: int = DEFAULT_SUBTITLE_FOCUS_RIGHT,
+    section_up: int = DEFAULT_SUBTITLE_SECTION_UP,
+    section_left: int = DEFAULT_SUBTITLE_SECTION_LEFT,
+    menu_down: int | None = None,
+) -> None:
+    """Configure Prime Video subtitles on the current playback."""
+    lang = (language or "off").strip().lower()
+    enabled = lang not in ("off", "none", "disabled")
+    await apply_subtitles(
+        client,
+        enabled=enabled,
+        language=lang if enabled else "off",
+        delay=delay,
+        focus_down=focus_down,
+        focus_right=focus_right,
+        section_up=section_up,
+        section_left=section_left,
+        menu_down=menu_down,
+    )
+
+
 async def cmd_media_stop(client: "WebOsClient") -> None:
     """Stop playback — remote keys first (Prime), SSAP fallback."""
     print("Stopping playback...")
@@ -1715,6 +2012,7 @@ async def cmd_seek(
     seconds: float,
     content_id: str | None = None,
     episode: int | None = None,
+    profile: int | None = None,
 ) -> None:
     """Seek to an absolute position.
 
@@ -1733,42 +2031,67 @@ async def cmd_seek(
     pos = max(0, int(seconds))
     print(f"Seeking to {pos}s ...")
 
-    # For a series/season, resolve the specific episode's detail ID so the seek
-    # deep link targets the episode being watched — otherwise it would relaunch
-    # the series landing page instead of moving the episode's player.
-    seek_id = content_id
-    if content_id and episode is not None and episode >= 1:
-        try:
-            html = fetch_prime_detail_html(content_id)
-            if html:
-                resolved = resolve_episode_content_id(html, content_id, episode=episode)
-                if resolved and resolved != content_id:
-                    print(f"  Resolved episode {episode} → {resolved}")
-                    seek_id = resolved
-        except (OSError, ValueError) as exc:
-            print(f"  Warning: could not resolve episode {episode} ({exc})", file=sys.stderr)
-
     # ── Method 1: Re-launch native app at ?t=<pos> (Prime) ───────────────────
-    # Amazon Prime Video on LG WebOS honours the ?t=<seconds> query param of the
-    # contentTarget deep link — the exact mechanism the normal play path uses
-    # (with t=0). The older {"startTime": N} launch param is ignored by Prime's
-    # player, which made the seek silently do nothing.
-    if seek_id:
-        target = _prime_target_with_start_offset(seek_id, pos)
-        print(f"  Re-launching at t={pos}s (contentTarget={target}) ...")
+    # Use the same launch-ID resolution as the play path (GTI / playbackURL /
+    # episode detail IDs) so seeking works for series and saved resume points.
+    if content_id:
+        detail_html = fetch_prime_detail_html(content_id)
         try:
+            candidates = resolve_prime_launch_ids(
+                content_id,
+                html=detail_html,
+                episode=episode,
+                prefer_episode=episode is not None,
+                autoplay=True,
+                start=pos,
+            )
+            launch_id = candidates[0]
+            if launch_id != content_id:
+                print(f"  TV seek target: {launch_id}")
+            print(f"  Re-launching at t={pos}s ...")
             if await close_app(client, PRIME_VIDEO_APP_ID):
                 await asyncio.sleep(1.5)
 
-            result = await client.launch_app_with_params(
-                PRIME_VIDEO_APP_ID, {"contentTarget": target}
+            result = await launch_prime_content(
+                client, launch_id, cold_start=False
             )
             if result.get("returnValue"):
-                print(json.dumps({"seeked_to": pos, "success": True, "method": "relaunch"}))
+                used_autoplay_launch = _is_autoplay_target(launch_id)
+                if profile is not None:
+                    await select_profile(client, profile, delay=1.0)
+                if not used_autoplay_launch:
+                    await start_playback(
+                        client,
+                        delay=2.0,
+                        used_autoplay_launch=False,
+                    )
+                print(
+                    json.dumps(
+                        {
+                            "seeked_to": pos,
+                            "success": True,
+                            "method": "relaunch",
+                            "launch_id": launch_id,
+                        }
+                    )
+                )
                 return
             print(f"  Re-launch returned: {result}", file=sys.stderr)
         except Exception as exc:
             print(f"  Re-launch failed: {exc}", file=sys.stderr)
+
+        seek_id = content_id
+        if detail_html and episode is not None and episode >= 1:
+            try:
+                resolved = resolve_episode_content_id(
+                    detail_html, content_id, episode=episode
+                )
+                if resolved:
+                    seek_id = resolved
+            except ValueError as exc:
+                print(f"  Warning: could not resolve episode {episode} ({exc})", file=sys.stderr)
+    else:
+        seek_id = None
 
     # ── Method 2: SSAP seek (LG built-in player / non-Prime) ─────────────────
     try:
@@ -1796,6 +2119,19 @@ async def cmd_seek(
             print(f"  Browser deeplink failed: {exc}", file=sys.stderr)
 
     print(json.dumps({"seeked_to": pos, "success": False, "method": "none"}))
+
+
+def cmd_resume_position(content_id: str, episode: int | None = None) -> None:
+    """Return the saved resume offset for a title (no TV connection needed)."""
+    content_id = content_id.strip()
+    html = _fetch_prime_html(content_id)
+    play_id = content_id
+    if episode is not None and episode >= 1:
+        play_id = resolve_episode_content_id(html, content_id, episode=episode)
+        if play_id != content_id:
+            html = _fetch_prime_html(play_id)
+    seconds = resume_start_seconds_from_html(html, play_id)
+    print(json.dumps({"position": seconds}))
 
 
 async def cmd_get_position(client: "WebOsClient") -> None:
@@ -2199,6 +2535,18 @@ async def main() -> None:
         ]))
         return
 
+    if args.resume_position:
+        if not args.content_id:
+            print("error: --resume-position requires --content-id", file=sys.stderr)
+            sys.exit(2)
+        try:
+            cmd_resume_position(args.content_id, episode=args.episode)
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"error: could not read resume position ({exc})", file=sys.stderr)
+            print(json.dumps({"position": None}))
+            sys.exit(1)
+        return
+
     profile_name = args.profile_name
     if (
         args.launch == PRIME_VIDEO_APP_ID
@@ -2262,6 +2610,24 @@ async def main() -> None:
             if getattr(args, name) < 0:
                 print(f"error: --{name.replace('_', '-')} must be >= 0", file=sys.stderr)
                 sys.exit(2)
+        if args.subtitle_focus_down < 0:
+            print("error: --subtitle-focus-down must be >= 0", file=sys.stderr)
+            sys.exit(2)
+        if args.subtitle_focus_right < -1:
+            print("error: --subtitle-focus-right must be >= -1", file=sys.stderr)
+            sys.exit(2)
+        if args.subtitle_section_up < 0:
+            print("error: --subtitle-section-up must be >= 0", file=sys.stderr)
+            sys.exit(2)
+        if args.subtitle_section_left < 0:
+            print("error: --subtitle-section-left must be >= 0", file=sys.stderr)
+            sys.exit(2)
+        if args.subtitle_menu_down < -1:
+            print("error: --subtitle-menu-down must be >= -1", file=sys.stderr)
+            sys.exit(2)
+        subtitle_menu_down = (
+            None if args.subtitle_menu_down < 0 else args.subtitle_menu_down
+        )
         if args.launch:
             await cmd_launch(
                 client,
@@ -2291,6 +2657,24 @@ async def main() -> None:
                 skip_entitlement_check=args.skip_entitlement_check,
                 episode=args.episode,
                 start=int(args.start) if args.start else 0,
+                set_subtitles=args.set_subtitles,
+                subtitle_delay=args.subtitle_delay,
+                subtitle_focus_down=args.subtitle_focus_down,
+                subtitle_focus_right=args.subtitle_focus_right,
+                subtitle_section_up=args.subtitle_section_up,
+                subtitle_section_left=args.subtitle_section_left,
+                subtitle_menu_down=subtitle_menu_down,
+            )
+        elif args.set_subtitles is not None:
+            await cmd_set_subtitles(
+                client,
+                language=args.set_subtitles,
+                delay=args.subtitle_delay,
+                focus_down=args.subtitle_focus_down,
+                focus_right=args.subtitle_focus_right,
+                section_up=args.subtitle_section_up,
+                section_left=args.subtitle_section_left,
+                menu_down=subtitle_menu_down,
             )
         elif args.media_pause:
             await cmd_media_pause(client)
@@ -2317,7 +2701,13 @@ async def main() -> None:
         elif args.unmute:
             await cmd_set_mute(client, False)
         elif args.seek is not None:
-            await cmd_seek(client, args.seek, content_id=args.content_id, episode=args.episode)
+            await cmd_seek(
+                client,
+                args.seek,
+                content_id=args.content_id,
+                episode=args.episode,
+                profile=args.profile,
+            )
         elif args.get_position:
             await cmd_get_position(client)
         elif args.apps:

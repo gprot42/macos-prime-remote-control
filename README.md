@@ -140,3 +140,7 @@ re-tests — then tells you exactly what to change on the TV or router if needed
 
 See [docs/troubleshooting-tv-connection.md](docs/troubleshooting-tv-connection.md)
 for the full diagnosis, manual commands, and fixes.
+
+## Compatibility
+
+Tested and works on **LG OLED55C56LB**.

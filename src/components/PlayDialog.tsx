@@ -2,7 +2,13 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { isBookmarked } from "../bookmarks";
-import { PrimeTitle, PrimeEpisode, getAccessLabel, accessBadgeStyle, AppConfig } from "../types";
+import {
+  PrimeTitle,
+  PrimeEpisode,
+  getAccessLabel,
+  accessBadgeStyle,
+  AppConfig,
+} from "../types";
 import { ContextMenuItem } from "./ContextMenu";
 import { showMediaContextMenu } from "../contextMenuBus";
 import { BookmarkIcon, ExternalLinkIcon, LaptopIcon, PlayIcon, TrailerIcon } from "./BookmarkMenuIcons";
@@ -28,7 +34,7 @@ interface PlayDialogProps {
   ) => void;
   onClose: () => void;
   onOpenSettings: () => void;
-  onStartPlaying: (item: PrimeTitle, episode: number | null, startSeconds?: number | null) => void;
+  onStartPlaying: (item: PrimeTitle, episode: number | null) => void;
   onPlayed: (item: PrimeTitle) => void;
 }
 
@@ -40,18 +46,6 @@ function formatRuntimeMin(min: number): string {
   const h = Math.floor(min / 60);
   const m = min % 60;
   return h > 0 ? `${h} h ${m} min` : `${m} min`;
-}
-
-/** Parse "ss", "mm:ss" or "h:mm:ss" into seconds. Returns null when invalid. */
-function parseTimeToSeconds(s: string): number | null {
-  const t = s.trim();
-  if (!t) return null;
-  const parts = t.split(":").map((x) => Number(x));
-  if (parts.some((n) => Number.isNaN(n) || n < 0)) return null;
-  if (parts.length === 1) return parts[0];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  return null;
 }
 
 export default function PlayDialog({
@@ -79,10 +73,6 @@ export default function PlayDialog({
   // TV series episode selection (movies ignore this)
   const isSeries = item.entity_type === "TV Show";
   const [episode, setEpisode] = useState(initialEpisode ?? 1);
-
-  // Optional start position ("mm:ss" / "h:mm:ss") to begin playback from.
-  const [startAt, setStartAt] = useState("");
-
 
   // Full episode list (fetched for TV shows). Falls back to the numeric
   // stepper when the list can't be loaded.
@@ -223,16 +213,6 @@ export default function PlayDialog({
 
   // Total length of the media currently selected (the chosen episode for a
   // series, otherwise the movie itself).
-  const selectedRuntimeMin = isSeries
-    ? selectedEpisode?.runtime_min ?? null
-    : item.runtime_min;
-  const selectedRuntimeStr =
-    selectedRuntimeMin != null
-      ? formatRuntimeMin(selectedRuntimeMin)
-      : !isSeries
-      ? item.runtime_str
-      : null;
-
   const label = getAccessLabel(item);
   const badgeStyle = accessBadgeStyle(label);
 
@@ -265,15 +245,21 @@ export default function PlayDialog({
     const useLaunchId = launchContentId?.trim() || null;
     const ep = useLaunchId ? null : isSeries ? epNum : null;
     const epRow = hasEpisodeList ? episodes[epNum - 1] : null;
-    const epRuntimeMin = epRow?.runtime_min ?? null;
-    const playedItem = epRuntimeMin ? { ...item, runtime_min: epRuntimeMin } : item;
-    const startSeconds = parseTimeToSeconds(startAt);
-    onStartPlaying(playedItem, useLaunchId ? epNum : ep, startSeconds);
+    const playedItem = epRow
+      ? {
+          ...item,
+          runtime_min: epRow.runtime_min ?? item.runtime_min,
+          runtime_str:
+            epRow.runtime_min != null
+              ? formatRuntimeMin(epRow.runtime_min)
+              : item.runtime_str,
+        }
+      : item;
+    onStartPlaying(playedItem, useLaunchId ? epNum : ep);
     try {
       await playOnTv(item, { tv_ip: config.tv_ip, profile }, {
         contentId: useLaunchId,
         episode: ep,
-        startSeconds,
       });
       setPlayState("done");
       onPlayed(item);
@@ -326,7 +312,7 @@ export default function PlayDialog({
     >
       <div
         data-media-dialog
-        className="bg-[#1A242F] rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden select-none
+        className="bg-[#1A242F] rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden
                    flex flex-col max-h-full"
         onContextMenu={(e) => {
           const items = titleMenuItems();
@@ -414,14 +400,14 @@ export default function PlayDialog({
 
           {/* Synopsis */}
           {item.synopsis && (
-            <p className="text-zinc-400 text-sm leading-relaxed line-clamp-3">
+            <p className="text-zinc-400 text-sm leading-relaxed line-clamp-3 select-text">
               {item.synopsis}
             </p>
           )}
 
           {/* Availability detail */}
           {item.availability && (
-            <p className="text-xs text-zinc-500 italic">{item.availability}</p>
+            <p className="text-xs text-zinc-500 italic select-text">{item.availability}</p>
           )}
 
           {/* Episode selector — TV series only ──────────────────────────── */}
@@ -603,7 +589,8 @@ export default function PlayDialog({
             <div
               ref={logRef}
               className="bg-zinc-900 rounded-xl p-3 h-36 overflow-y-auto
-                         font-mono text-[11px] leading-relaxed border border-zinc-800"
+                         font-mono text-[11px] leading-relaxed border border-zinc-800
+                         select-text cursor-text"
             >
               {log.map((line, i) => (
                 <span
@@ -611,6 +598,7 @@ export default function PlayDialog({
                   className={line.startsWith("[err]") ? "text-orange-300" : "text-zinc-300"}
                 >
                   {line}
+                  {"\n"}
                 </span>
               ))}
             </div>
@@ -647,13 +635,13 @@ export default function PlayDialog({
                 />
               </div>
             ) : (
-              <p className="text-center text-red-400 text-sm">
+              <p className="text-center text-red-400 text-sm select-text">
                 Playback failed. See the log above for details.
               </p>
             )
           )}
           {macPlayState === "error" && macError && (
-            <p className="text-center text-red-400 text-sm">{macError}</p>
+            <p className="text-center text-red-400 text-sm select-text">{macError}</p>
           )}
           {macPlayState === "done" && (
             <p className="text-center text-emerald-400 text-sm">
@@ -663,40 +651,9 @@ export default function PlayDialog({
 
         </div>
 
-        {/* Pinned footer — length + start position + actions stay visible so a
-            long episode list can never push them off-screen / under the bottom
-            position bar. */}
+        {/* Pinned footer — actions stay visible so a long episode list can never
+            push them off-screen / under the bottom position bar. */}
         <div className="shrink-0 border-t border-zinc-800/70 px-5 py-4 space-y-3">
-          {/* Length + optional start position */}
-          <div className="flex items-center gap-3 bg-zinc-800/60 rounded-xl px-4 py-2.5">
-            <svg className="w-5 h-5 text-zinc-400 shrink-0" fill="none" stroke="currentColor"
-              strokeWidth={1.5} viewBox="0 0 24 24">
-              <circle cx="12" cy="12" r="9" />
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 7v5l3 2" />
-            </svg>
-            <div className="flex-1 min-w-0">
-              <p className="text-white text-sm font-medium">
-                {selectedRuntimeStr ? `Length: ${selectedRuntimeStr}` : "Length unavailable"}
-              </p>
-              <p className="text-zinc-500 text-xs">Leave blank to start from the beginning</p>
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <label className="text-xs text-zinc-400 whitespace-nowrap">Start at</label>
-              <input
-                type="text"
-                inputMode="numeric"
-                value={startAt}
-                onChange={(e) => setStartAt(e.target.value)}
-                placeholder="0:00"
-                disabled={playState === "playing"}
-                title="Start playback from this position, e.g. 12:30 or 1:05:00"
-                className="w-20 bg-zinc-700 border border-zinc-600 rounded-lg px-2 py-1 text-sm
-                           text-white text-center font-mono focus:outline-none focus:border-emerald-500
-                           transition-colors disabled:opacity-50"
-              />
-            </div>
-          </div>
-
           {/* Action buttons */}
           <div className="flex gap-2">
             <button

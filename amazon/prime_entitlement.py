@@ -467,6 +467,59 @@ def _entitlement_is_channel_only(html: str, content_id: str) -> bool:
     )
 
 
+def _playback_url_from_label(html: str, label: str) -> str | None:
+    """Return the playbackURL for a buybox action with the given primary label."""
+    needle = f'"label":"{label}"'
+    for match in re.finditer(re.escape(needle), html):
+        segment = html[match.start() : match.start() + 8000]
+        if '"isTrailer":true' in segment:
+            continue
+        url_match = re.search(r'"playbackURL":"((?:\\.|[^"\\])*)"', segment)
+        if not url_match:
+            continue
+        return _unescape_prime_url(url_match.group(1))
+    return None
+
+
+def _start_seconds_from_playback_url(url: str | None) -> int | None:
+    if not url:
+        return None
+    match = re.search(r"[?&]t=(\d+)", url)
+    if not match:
+        return None
+    try:
+        seconds = int(match.group(1))
+    except ValueError:
+        return None
+    return seconds if seconds > 0 else None
+
+
+def resume_start_seconds_from_html(html: str, content_id: str) -> int | None:
+    """Return the saved resume position (seconds) from a Prime detail page, if any."""
+    content_id = content_id.strip()
+    for label in ("Resume", "Continue watching", "Continue Watching"):
+        seconds = _start_seconds_from_playback_url(
+            _playback_url_from_label(html, label)
+        )
+        if seconds is not None:
+            return seconds
+    for pattern in (
+        r'"timeOffsetInSeconds":(\d+)',
+        r'"resumeTime":(\d+)',
+        r'"watchedPosition":(\d+)',
+        r'"playbackStartPosition":(\d+)',
+    ):
+        match = re.search(pattern, html)
+        if match:
+            try:
+                seconds = int(match.group(1))
+            except ValueError:
+                continue
+            if seconds > 0:
+                return seconds
+    return None
+
+
 def playback_launch_target_from_html(html: str, content_id: str) -> str | None:
     """Return a Prime contentTarget that requests autoplay when Watch now is available."""
     content_id = content_id.strip()
@@ -475,18 +528,15 @@ def playback_launch_target_from_html(html: str, content_id: str) -> str | None:
     # so the caller falls back to opening the detail page for a manual choice.
     if _entitlement_is_channel_only(html, content_id):
         return None
-    for match in re.finditer(r'"label":"Watch now"', html):
-        segment = html[match.start() : match.start() + 5000]
-        if '"isTrailer":true' in segment:
-            continue
-        url_match = re.search(r'"playbackURL":"((?:\\.|[^"\\])*)"', segment)
-        if not url_match:
-            continue
-        playback_url = _unescape_prime_url(url_match.group(1))
-        if "autoplay=1" in playback_url:
+    for label in ("Watch now", "Resume", "Continue watching", "Continue Watching"):
+        playback_url = _playback_url_from_label(html, label)
+        if playback_url and "autoplay=1" in playback_url:
             return playback_url
     labels = playback_labels_from_html(html, content_id)
     if has_watchable_play_button(labels):
+        resume_seconds = resume_start_seconds_from_html(html, content_id)
+        if resume_seconds is not None:
+            return f"/detail/{content_id}?autoplay=1&t={resume_seconds}"
         return f"/detail/{content_id}?autoplay=1&t=0"
     return None
 

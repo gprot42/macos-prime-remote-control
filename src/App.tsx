@@ -10,6 +10,8 @@ import {
   EntityTypeFilter,
   Bookmark,
   groupTitles,
+  groupGenreTitles,
+  isGenreCollection,
   formatCacheAge,
   isTitleVisible,
   cachedImageHttpUrl,
@@ -21,6 +23,7 @@ import {
   isEpisodeBookmark,
   isMovieBookmark,
   isTvBookmark,
+  episodeBookmarkContentId,
   resolveEpisodePlayId,
 } from "./bookmarks";
 import { playOnMac } from "./playback";
@@ -101,6 +104,7 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searching, setSearching]     = useState(false);
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const catalogLoadIdRef = useRef(0);
 
   // Filters
   const [typeFilter, setTypeFilter] = useState<EntityTypeFilter>("all");
@@ -119,7 +123,6 @@ export default function App() {
   // Now-playing (drives the TVRemote bar)
   const [nowPlaying, setNowPlaying]         = useState<PrimeTitle | null>(null);
   const [nowPlayingEpisode, setNPEpisode]   = useState<number | null>(null);
-  const [nowPlayingStart, setNPStart]       = useState<number | null>(null);
   const [playbackState, setPlaybackState]   = useState<PlaybackState>("playing");
 
   const stopTvPlayback = useCallback(async () => {
@@ -131,7 +134,6 @@ export default function App() {
     setPlaybackState("paused");
     setNowPlaying(null);
     setNPEpisode(null);
-    setNPStart(null);
   }, []);
 
   // Escape stops TV playback when something is playing (same as the stop button).
@@ -338,7 +340,6 @@ export default function App() {
       setSelectedEpisode(null);
       setNowPlaying(bookmark.item);
       setNPEpisode(episodeNum);
-      setNPStart(null);
       setPlaybackState("playing");
 
       try {
@@ -395,6 +396,16 @@ export default function App() {
     }
   }, []);
 
+  /** Series content_id when an episode is playing — for resolving episode runtime. */
+  const playingSeriesContentId = useMemo(() => {
+    if (!nowPlaying || !nowPlayingEpisode) return null;
+    if (episodeBookmarkContentId(nowPlaying)) {
+      const bm = bookmarks.find((b) => b.item.content_id === nowPlaying.content_id);
+      return bm?.source_item?.content_id ?? null;
+    }
+    return nowPlaying.content_id;
+  }, [nowPlaying, nowPlayingEpisode, bookmarks]);
+
   const bookmarkedIds = useMemo(
     () => new Set(bookmarks.map((b) => b.content_id)),
     [bookmarks]
@@ -423,6 +434,7 @@ export default function App() {
   // ── Load catalog ────────────────────────────────────────────────────────────
   const loadCatalog = useCallback(
     async (forceRefresh = false, slug: CollectionSlug = collection) => {
+      const loadId = catalogLoadIdRef.current;
       setLoadState("loading");
       setError(null);
       setIsStale(false);
@@ -432,8 +444,10 @@ export default function App() {
 
       if (!forceRefresh) {
         invoke<number | null>("collection_cache_age", { collection: slug })
-          .then((age) => setCacheAge(age ?? null))
-          .catch(() => setCacheAge(null));
+          .then((age) => {
+            if (loadId === catalogLoadIdRef.current) setCacheAge(age ?? null);
+          })
+          .catch(() => {});
       } else {
         setCacheAge(null);
       }
@@ -443,6 +457,7 @@ export default function App() {
           collection: slug,
           forceRefresh,
         });
+        if (loadId !== catalogLoadIdRef.current) return;
         const { data, stale, staleReason: reason } = parseResult(raw);
         setAllItems(data);
         setIsStale(stale);
@@ -462,7 +477,9 @@ export default function App() {
         }
 
         invoke<number | null>("collection_cache_age", { collection: slug })
-          .then((age) => setCacheAge(age ?? null))
+          .then((age) => {
+            if (loadId === catalogLoadIdRef.current) setCacheAge(age ?? null);
+          })
           .catch(() => {});
 
         // Prefetch posters; on hard refresh re-download even if a JPEG already exists.
@@ -480,6 +497,7 @@ export default function App() {
           }).catch(() => {});
         }
       } catch (err) {
+        if (loadId !== catalogLoadIdRef.current) return;
         setError(String(err));
         setLoadState("error");
       }
@@ -490,8 +508,10 @@ export default function App() {
 
   useEffect(() => {
     if (viewMode !== "catalog") return;
-    loadCatalog(false, collection);
+    catalogLoadIdRef.current += 1;
+    setAllItems([]);
     setTypeFilter("all");
+    loadCatalog(false, collection);
   }, [collection, viewMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Debounced search ────────────────────────────────────────────────────────
@@ -596,8 +616,12 @@ export default function App() {
     if (viewMode === "bookmarks") {
       return groupBookmarks(items);
     }
+    if (isGenreCollection(collection)) {
+      const genreLabel = COLLECTIONS.find((c) => c.slug === collection)?.label ?? "Genre";
+      return groupGenreTitles(items, genreLabel).filter((g) => g.items.length > 0);
+    }
     return groupTitles(items).filter((g) => g.items.length > 0);
-  }, [sourceItems, typeFilter, config, viewMode]);
+  }, [sourceItems, typeFilter, config, viewMode, collection]);
 
   const totalFiltered = filteredGroups.reduce((s, g) => s + g.items.length, 0);
   const movieCount    = sourceItems.filter((i) => isMovieBookmark(i)).length;
@@ -971,7 +995,7 @@ export default function App() {
         )}
 
         {/* Catalog groups */}
-        {filteredGroups.length > 0 && filteredGroups.map((group) => (
+        {(showCatalogData || showBookmarksData) && filteredGroups.length > 0 && filteredGroups.map((group) => (
           <CatalogGroupRow
             key={group.label}
             group={group}
@@ -1005,11 +1029,10 @@ export default function App() {
             setSelectedLaunchContentId(null);
             setShowSettings(true);
           }}
-          onStartPlaying={(item, episode, startSeconds) => {
+          onStartPlaying={(item, episode) => {
             // Show in the dock immediately — before the TV command completes
             setNowPlaying(item);
             setNPEpisode(episode);
-            setNPStart(startSeconds != null && startSeconds >= 1 ? startSeconds : null);
             setPlaybackState("playing");
           }}
           onPlayed={() => {
@@ -1042,8 +1065,11 @@ export default function App() {
       <TVRemote
         nowPlaying={nowPlaying ?? selectedItem}
         episode={nowPlaying ? nowPlayingEpisode : null}
-        initialPositionSeconds={nowPlaying ? nowPlayingStart : null}
+        seekEnabled={!!nowPlaying}
+        seriesContentId={playingSeriesContentId}
         defaultTvVolume={config.default_tv_volume ?? 13}
+        subtitlesFeatureEnabled={config.subtitles_enabled ?? false}
+        subtitleLanguage={config.subtitle_language ?? "en"}
         playbackState={nowPlaying ? playbackState : "paused"}
         cachedImageSrc={(() => {
           const item = nowPlaying ?? selectedItem;
@@ -1054,7 +1080,7 @@ export default function App() {
             : undefined;
         })()}
         onPlaybackStateChange={setPlaybackState}
-        onDismissPlaying={() => { setNowPlaying(null); setNPEpisode(null); setNPStart(null); }}
+        onDismissPlaying={() => { setNowPlaying(null); setNPEpisode(null); }}
       />
     </div>
   );
