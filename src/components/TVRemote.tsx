@@ -45,7 +45,7 @@ interface TVRemoteProps {
 // ─── Transport controls (stable module-level components — must NOT be defined
 //     inside TVRemote or they remount every position tick and lose clicks/hover) ─
 
-type TransportAction = "pause" | "play" | "stop";
+type TransportAction = "pause" | "play" | "stop" | "skip_back" | "skip_forward";
 
 const TransportButton = memo(function TransportButton({
   action,
@@ -53,6 +53,7 @@ const TransportButton = memo(function TransportButton({
   active,
   busy,
   anyBusy,
+  disabled: disabledProp,
   onAction,
   children,
 }: {
@@ -61,10 +62,11 @@ const TransportButton = memo(function TransportButton({
   active?: boolean;
   busy: boolean;
   anyBusy: boolean;
+  disabled?: boolean;
   onAction: (action: TransportAction) => void;
   children: React.ReactNode;
 }) {
-  const disabled = anyBusy;
+  const disabled = anyBusy || !!disabledProp;
 
   return (
     <button
@@ -94,24 +96,39 @@ const TransportButton = memo(function TransportButton({
 
 const TransportBar = memo(function TransportBar({
   tvOn,
+  seekEnabled,
   playbackState,
   pbBusy,
   transportErr,
   onTransport,
 }: {
   tvOn: boolean | null;
+  seekEnabled: boolean;
   playbackState: PlaybackState;
   pbBusy: TransportAction | null;
   transportErr: string | null;
   onTransport: (action: TransportAction) => void;
 }) {
   const anyBusy = pbBusy !== null;
+  const skipDisabled = !seekEnabled || tvOn === false;
 
   return (
     <div className={`flex flex-col items-center gap-0.5 shrink-0 ${
       tvOn === false ? "opacity-40" : ""
     }`}>
-      <div className="flex items-center gap-1.5">
+      <div className="flex items-center gap-1">
+        <TransportButton
+          action="skip_back"
+          title="Rewind (~10s)"
+          busy={pbBusy === "skip_back"}
+          anyBusy={anyBusy}
+          disabled={skipDisabled}
+          onAction={onTransport}
+        >
+          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24" aria-hidden>
+            <path d="M11 18V6l-8.5 6L11 18zm.5-6l8.5 6V6l-8.5 6z"/>
+          </svg>
+        </TransportButton>
         <TransportButton
           action="pause"
           title="Pause"
@@ -138,6 +155,18 @@ const TransportBar = memo(function TransportBar({
           </svg>
         </TransportButton>
         <TransportButton
+          action="skip_forward"
+          title="Fast forward (~10s)"
+          busy={pbBusy === "skip_forward"}
+          anyBusy={anyBusy}
+          disabled={skipDisabled}
+          onAction={onTransport}
+        >
+          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24" aria-hidden>
+            <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z"/>
+          </svg>
+        </TransportButton>
+        <TransportButton
           action="stop"
           title="Stop"
           busy={pbBusy === "stop"}
@@ -150,7 +179,7 @@ const TransportBar = memo(function TransportBar({
         </TransportButton>
       </div>
       {transportErr && (
-        <span className="text-[9px] text-red-400 max-w-[120px] text-center leading-tight truncate"
+        <span className="text-[9px] text-red-400 max-w-[140px] text-center leading-tight truncate"
               title={transportErr}>
           {transportErr}
         </span>
@@ -788,21 +817,28 @@ export default function TVRemote({
   };
 
   // ── Power toggle ──────────────────────────────────────────────────────────
+  // Power-on can take ~10s (WoL + SSAP + default volume). Optimistically flip
+  // the indicator immediately so the user sees on/off right away; only the
+  // spinner was showing while the backend caught up.
   const [powerBusy, setPowerBusy] = useState(false);
   const [powerErr, setPowerErr] = useState<string | null>(null);
+  const powerBusyRef = useRef(false);
 
   const togglePower = async () => {
+    if (powerBusyRef.current || tvOn === null) return;
     const turningOff = tvOn === true;
+    powerBusyRef.current = true;
     setPowerBusy(true);
     setPowerErr(null);
+    // Immediate UI feedback — do not wait for WoL / connect / volume apply.
+    setTvOnState(!turningOff);
+    if (turningOff) {
+      setVE(false);
+      onDismissPlaying();
+    }
     try {
       const applied = await invoke<VolumeState | null>("tv_power", { action: turningOff ? "off" : "on" });
-      if (turningOff) {
-        setTvOnState(false);
-        setVE(false);
-        onDismissPlaying();
-      } else {
-        setTvOnState(true);
+      if (!turningOff) {
         // Prefer the volume the backend just applied (avoids a separate read that
         // races a just-woken TV and can latch a stale level). Fall back to a live
         // fetch when the default-volume feature is off.
@@ -818,6 +854,7 @@ export default function TVRemote({
       setPowerErr(String(err).replace(/^Error:\s*/, "").slice(0, 60));
       await refreshTvPower();
     } finally {
+      powerBusyRef.current = false;
       setPowerBusy(false);
     }
   };
@@ -838,7 +875,16 @@ export default function TVRemote({
   }, [nowPlaying?.content_id, episode]);
 
   const toggleSubtitles = useCallback(async () => {
-    if (!seekEnabled || subtitleBusyRef.current) return;
+    // Need an active title session on the TV (seek bar enabled). tvOn alone is
+    // not enough — captions are navigated in the Prime player UI.
+    if (!seekEnabled || subtitleBusyRef.current) {
+      if (!seekEnabled) setSubtitleErr("Play a title first");
+      return;
+    }
+    if (tvOn === false) {
+      setSubtitleErr("TV is off");
+      return;
+    }
     const next = !subtitlesOn;
     const wasPlaying = playbackState === "playing";
     subtitleBusyRef.current = true;
@@ -848,7 +894,7 @@ export default function TVRemote({
       await invoke("set_tv_subtitles", { enabled: next });
       setSubtitlesOn(next);
       setTvOnState(true);
-      if (wasPlaying) {
+      if (wasPlaying || next) {
         // Python already resumes via SSAP play(). Avoid a second media "play"
         // command immediately after — a remote PLAY while the captions UI is
         // still closing can act like ENTER and flip On back to Off.
@@ -860,7 +906,7 @@ export default function TVRemote({
         setTvOnState(false);
         setSubtitleErr("TV unreachable");
       } else {
-        setSubtitleErr(msg.slice(0, 60));
+        setSubtitleErr(msg.slice(0, 80));
       }
     } finally {
       subtitleBusyRef.current = false;
@@ -872,6 +918,7 @@ export default function TVRemote({
     setTvOnState,
     playbackState,
     onPlaybackStateChange,
+    tvOn,
   ]);
 
   // ── Transport ─────────────────────────────────────────────────────────────
@@ -879,9 +926,12 @@ export default function TVRemote({
   const [transportErr, setTransportErr] = useState<string | null>(null);
 
   const handleTransport = useCallback(async (action: TransportAction) => {
-    // Each button maps to a literal action — pause pauses, play resumes, stop
-    // stops. (No play/pause toggle: there are dedicated Play and Pause buttons,
-    // and toggling off a possibly-stale playbackState made Pause send "play".)
+    // Pause / play / stop are literal. Skip back/forward send REWIND / FASTFORWARD
+    // on the TV (~10s per press on Prime). Scrubber still does absolute seek.
+    if ((action === "skip_back" || action === "skip_forward") && !seekEnabled) {
+      setTransportErr("Play a title first");
+      return;
+    }
     setPbBusy(action);
     setTransportErr(null);
     try {
@@ -890,7 +940,17 @@ export default function TVRemote({
       setTvOnState(true);
       if (action === "pause") onPlaybackStateChange("paused");
       else if (action === "play") onPlaybackStateChange("playing");
-      else { onPlaybackStateChange("paused"); onDismissPlaying(); }
+      else if (action === "stop") {
+        onPlaybackStateChange("paused");
+        onDismissPlaying();
+      } else if (action === "skip_back" || action === "skip_forward") {
+        // Optimistic bar nudge (~10s). TV may skip a different amount.
+        const delta = action === "skip_forward" ? 10 : -10;
+        const next = Math.max(0, (playRef.current.pos) + delta);
+        playRef.current = { pos: next, time: Date.now() };
+        setPos(next);
+        onPlaybackStateChange("playing");
+      }
     } catch (err) {
       const msg = String(err).replace(/^Error:\s*/, "");
       if (isTvUnreachableMessage(msg)) {
@@ -902,7 +962,7 @@ export default function TVRemote({
     } finally {
       setPbBusy(null);
     }
-  }, [onPlaybackStateChange, onDismissPlaying, setTvOnState]);
+  }, [onPlaybackStateChange, onDismissPlaying, setTvOnState, seekEnabled]);
 
   const volPct    = vol.muted ? 0 : slider;
   const dispVol   = vol.muted ? 0 : (vol.volume ?? slider);
@@ -1086,6 +1146,7 @@ export default function TVRemote({
         {/* ── TRANSPORT ─────────────────────────────────────────────────── */}
         <TransportBar
           tvOn={tvOn}
+          seekEnabled={seekEnabled}
           playbackState={playbackState}
           pbBusy={pbBusy}
           transportErr={transportErr}
@@ -1098,17 +1159,21 @@ export default function TVRemote({
         {subtitlesFeatureEnabled && (
         <>
         <div className={`flex flex-col items-center shrink-0 ${
-          !seekEnabled || tvOn === false ? "opacity-40 pointer-events-none" : ""
+          !seekEnabled || tvOn === false ? "opacity-40" : ""
         }`}>
           <button
             type="button"
-            disabled={subtitleBusy || !seekEnabled}
+            disabled={subtitleBusy || !seekEnabled || tvOn === false}
             onClick={toggleSubtitles}
             title={
               subtitleErr ?? (
-                subtitlesOn
-                  ? `Subtitles on (${subtitleLabel}) — click to turn off`
-                  : "Subtitles off — click to turn on"
+                !seekEnabled
+                  ? "Play a title on the TV first, then enable subtitles"
+                  : tvOn === false
+                    ? "TV is off"
+                    : subtitlesOn
+                      ? `Subtitles on (${subtitleLabel}) — click to turn off`
+                      : `Subtitles off — click to turn on (${subtitleLabel})`
               )
             }
             className={`w-9 h-9 flex items-center justify-center rounded-xl border transition-colors
@@ -1146,24 +1211,36 @@ export default function TVRemote({
         <div className="flex flex-col items-center shrink-0">
           <button
             onClick={togglePower}
-            disabled={powerBusy || tvOn === null}
+            disabled={tvOn === null || powerBusy}
             title={
               powerErr ?? (
-                tvOn === true ? "TV is on — click to power off"
+                powerBusy && tvOn === true ? "Turning TV on…"
+                : powerBusy && tvOn === false ? "Turning TV off…"
+                : tvOn === true ? "TV is on — click to power off"
                 : tvOn === false ? "TV is off — click to power on"
                 : "Checking TV…"
               )
             }
             className={`w-9 h-9 flex items-center justify-center rounded-xl border transition-colors
-                        disabled:opacity-40 shrink-0 ${
-              tvOn === true
-                ? "bg-emerald-900/50 border-emerald-600 text-emerald-300 hover:bg-emerald-800/60"
-                : tvOn === false
-                  ? "bg-red-900/40 border-red-700/70 text-red-300 hover:bg-red-900/60"
-                  : "bg-zinc-800/80 border-zinc-700/60 text-zinc-400"
+                        shrink-0 ${
+              tvOn === null
+                ? "opacity-40 cursor-not-allowed bg-zinc-800/80 border-zinc-700/60 text-zinc-400"
+                : powerBusy
+                  ? "cursor-wait " + (
+                      tvOn === true
+                        ? "bg-emerald-900/50 border-emerald-600 text-emerald-300"
+                        : "bg-red-900/40 border-red-700/70 text-red-300"
+                    )
+                  : tvOn === true
+                    ? "bg-emerald-900/50 border-emerald-600 text-emerald-300 hover:bg-emerald-800/60"
+                    : tvOn === false
+                      ? "bg-red-900/40 border-red-700/70 text-red-300 hover:bg-red-900/60"
+                      : "bg-zinc-800/80 border-zinc-700/60 text-zinc-400"
             }`}
           >
-            {powerBusy ? (
+            {/* Spinner only while we still don't know power state (startup probe).
+                After a click we optimistically show on/off instead of a long circle. */}
+            {tvOn === null ? (
               <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>

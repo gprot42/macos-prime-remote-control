@@ -486,6 +486,10 @@ def resolve_prime_launch_ids(
                     autoplay_target = _prime_target_with_start_offset(
                         autoplay_target or target_id, int(start)
                     )
+                # Do NOT synthesize bare ?autoplay=1 HTTPS links when the
+                # unsigned page has no Watch button. On many webOS/AmazOff
+                # builds those URLs open the app but never start media;
+                # bare GTI contentId launches do. Prefer GTI (appended below).
                 if autoplay_target:
                     _append_launch_id(candidates, seen, autoplay_target)
                     print(f"[LAUNCH-RESOLVE] chose autoplay_target as first: {autoplay_target}", file=sys.stderr)
@@ -886,6 +890,116 @@ async def _focus_prime_watch_button(
         print("  Watch area focused (no ENTER). Check the TV highlight.")
 
 
+async def _media_play_state(client: "WebOsClient") -> str | None:
+    """Return playState from the foreground media session, if any.
+
+    Values seen on webOS: "playing", "paused", "buffering". None = no session.
+    """
+    try:
+        media = await client.get_media_foreground_app()
+    except Exception as exc:
+        print(f"  media foreground check failed: {exc}", file=sys.stderr)
+        return None
+    if not media:
+        return None
+    if isinstance(media, list):
+        for item in media:
+            if not isinstance(item, dict):
+                continue
+            state = str(item.get("playState") or "").lower().strip()
+            if state:
+                return state
+        return None
+    return None
+
+
+async def _media_is_playing(client: "WebOsClient") -> bool:
+    """True only when media is actively playing (not merely paused/focused)."""
+    state = await _media_play_state(client)
+    return state in {"playing", "buffering"}
+
+
+async def _press_keys(client: "WebOsClient", *keys: str) -> None:
+    for key in keys:
+        await client.button(key)
+        await asyncio.sleep(PLAY_KEY_DELAY)
+
+
+async def _activate_prime_resume_or_watch(
+    client: "WebOsClient",
+    *,
+    note: str = "",
+) -> None:
+    """Focus and activate the hero Resume/Watch CTA on a season/series hub.
+
+    Verified on webOS Prime (PSYCHO-PASS 3 "Resume S3 E1"): after a content
+    deep link, focus is rarely on the Resume button. Bare ENTER does nothing
+    useful. The reliable path is:
+
+        DOWN → LEFT×4 → UP → ENTER
+
+    That steps into the action row, homes to the leftmost CTA (Resume/Watch),
+    nudges up onto the hero button if needed, then activates it.
+    """
+    print(f"  Selecting Resume/Watch CTA then ENTER{note} ...")
+
+    # Already playing — do nothing (ENTER would pause).
+    state = await _media_play_state(client)
+    if state in {"playing", "buffering"}:
+        print(f"  Media already {state}; leaving it alone.")
+        return
+    if state == "paused":
+        await client.button("PLAY")
+        print("  Media was paused — sent PLAY to resume.")
+        await asyncio.sleep(1.5)
+        if await _media_is_playing(client):
+            return
+
+    # Primary path: explicitly select Resume (user-visible focus) then ENTER.
+    # DOWN into the content/action area, LEFT to the leftmost primary CTA,
+    # UP onto the hero Resume/Watch pill if focus sat one row below.
+    print("  Focus: DOWN → LEFT×4 → UP → ENTER (select Resume/Watch)")
+    await _press_keys(client, "DOWN", "LEFT", "LEFT", "LEFT", "LEFT", "UP", "ENTER")
+    await asyncio.sleep(2.5)
+    state = await _media_play_state(client)
+    if state in {"playing", "buffering"}:
+        print("  Playback started after Resume focus + ENTER.")
+        return
+    if state == "paused":
+        await client.button("PLAY")
+        print("  ENTER left media paused — sent PLAY.")
+        await asyncio.sleep(1.5)
+        if await _media_is_playing(client):
+            return
+
+    # Fallback: CTA may already have been focused — plain ENTER.
+    print("  Retry: ENTER only")
+    await client.button("ENTER")
+    await asyncio.sleep(2.5)
+    if await _media_is_playing(client):
+        print("  Playback started after plain ENTER.")
+        return
+
+    # Fallback: extra DOWN if we were still in top chrome.
+    print("  Retry: DOWN → LEFT×4 → ENTER")
+    await _press_keys(client, "DOWN", "LEFT", "LEFT", "LEFT", "LEFT", "ENTER")
+    await asyncio.sleep(2.5)
+    if await _media_is_playing(client):
+        print("  Playback started after DOWN+LEFT focus + ENTER.")
+        return
+
+    await client.button("PLAY")
+    print("  Sent PLAY fallback.")
+    await asyncio.sleep(1.5)
+    if await _media_is_playing(client):
+        print("  Playback started after PLAY fallback.")
+    else:
+        print(
+            "  Warning: media still not playing — Resume/Watch may not be focused.",
+            file=sys.stderr,
+        )
+
+
 _MEDIA_INFO_ENDPOINTS = (
     ("ssap://com.webos.service.media.player/getInfo", {}),
     ("ssap://com.webos.service.cepswm.media.player/getInfo", {}),
@@ -979,12 +1093,25 @@ async def start_playback(
         resolved_method, note = "enter", None
 
     if used_autoplay_launch:
-        # The autoplay=1 deeplink already starts the player. Sending any extra
-        # ENTER / PLAY / media key here lands on the *already-playing* video and
-        # toggles it straight to PAUSE ("plays for a few seconds then pauses"),
-        # so we stop here and let it run uninterrupted.
-        print("  Launched with autoplay=1; letting the player start on its own (no extra keys).", file=sys.stderr)
-        print("[START-PLAYBACK] SKIPPED keys because used_autoplay_launch=True", file=sys.stderr)
+        # autoplay=1 is supposed to start the player. ENTER would toggle pause
+        # if video already started; PLAY is a no-op while playing and still
+        # starts/resumes from the detail page — nudge with PLAY only.
+        settle = delay if delay > 0 else min(DEFAULT_PLAY_DELAY, 4.0)
+        print(
+            f"  Launched with autoplay=1; waiting {settle:.1f}s then nudging PLAY "
+            f"(safe if already playing).",
+            file=sys.stderr,
+        )
+        print("[START-PLAYBACK] autoplay path: settle + PLAY nudge", file=sys.stderr)
+        await asyncio.sleep(settle)
+        await client.button("PLAY")
+        print("  Sent PLAY nudge after autoplay launch (Prime).")
+        try:
+            pos = await _playback_position(client)
+            if pos is not None:
+                print(json.dumps({"resume_position_from_tv": pos}))
+        except Exception:
+            pass
         return
     print(f"[START-PLAYBACK] proceeding with keys (method={resolved_method}) delay={delay}", file=sys.stderr)
 
@@ -995,7 +1122,9 @@ async def start_playback(
         # For Prime, SSAP position probes interrupt playback and cannot report
         # Prime's position reliably — use a fixed wait only. For other players,
         # poll during the wait and skip keys when playback already started.
-        probe = delay if delay > 0 else DEFAULT_PLAY_DELAY
+        # When the caller already waited for the title page (delay=0), only a
+        # short settle is needed before ENTER/PLAY.
+        probe = delay if delay > 0 else 2.0
         if await _prefer_remote_keys(client):
             print(
                 f"  Waiting {probe:.1f}s for the title page (Prime — no SSAP probe) ..."
@@ -1042,11 +1171,10 @@ async def start_playback(
                 await client.button("ENTER")
                 print("  Sent ENTER after focus navigation.")
     elif resolved_method == "enter":
-        # The Prime detail page focuses its primary Watch/Resume button by
-        # default, so ENTER resumes immediately. The UP/DOWN/LEFT focus dance is
-        # only needed for the uncertain "watch" fallback — here it overshoots up
-        # into the top-nav profile avatar, which reopens the profile picker and
-        # never starts playback. Select the already-focused button directly.
+        # Season/series hubs (e.g. PSYCHO-PASS 3 with "Resume S3 E1") often land
+        # focus on the episode rail, not the hero Resume/Watch CTA. Home left,
+        # step up onto the CTA, ENTER to activate. Only send PLAY if media has
+        # not started — PLAY while playing can pause.
         note_detail = f" ({note})" if note else ""
         if play_highlight:
             print(
@@ -1055,15 +1183,7 @@ async def start_playback(
                 "(use --play-method watch if it is not focused)."
             )
         else:
-            if await _prefer_remote_keys(client):
-                # ENTER toggles pause when Prime auto-started during the page-load
-                # waits; PLAY is a no-op while playing and still starts/resumes
-                # from the title page in most builds.
-                await client.button("PLAY")
-                print(f"  Sent PLAY to start/resume (Prime){note_detail}.")
-            else:
-                await client.button("ENTER")
-                print(f"  Sent ENTER on Watch/Resume button{note_detail}.")
+            await _activate_prime_resume_or_watch(client, note=note_detail)
     # After initiating playback (for resume or start), try to report the actual
     # current position from the TV so the UI bar can be seeded correctly
     # (the unsigned web scrape usually returns null for personal resume).
@@ -1161,81 +1281,85 @@ async def cmd_launch_prime(
         )
 
     if profile is not None and content_id is not None:
+        # NEVER open bare Prime home before profile keys (home-rail picks wrong
+        # titles like "Jesy Nelson"). And NEVER re-deep-link after profile:
+        # a second content launch re-opens the profile picker (users saw:
+        # profile → title → profile again → homepage without Resume focused).
+        #
+        # One content deep link → profile picker gates on that title → after
+        # profile selection Prime lands on the hub → focus Resume → ENTER.
+        #
+        # For play without seek on ep≤1: launch the season/series hub so the
+        # hero "Resume Sx Ey" CTA is present (not a one-shot episode flash).
+        launch_episode = episode
+        if play and not (start and start > 0) and (episode is None or episode <= 1):
+            launch_episode = None
+            print(
+                "  Using series/season hub for Resume/Watch CTA "
+                f"(requested episode={episode}).",
+                file=sys.stderr,
+            )
+        elif start and start > 0:
+            launch_episode = episode
+
+        print("  Prime flow: content deep link → profile once → Resume/play")
+        print(
+            f"[PLAY] content-gate: content_id={content_id} episode={launch_episode} "
+            f"start={start} close_after_profile={close_after_profile}",
+            file=sys.stderr,
+        )
+        _, used_autoplay_launch = await launch_prime_content_candidates(
+            client,
+            content_id,
+            try_all_ids=try_all_ids,
+            cold_start=False,
+            detail_html=detail_html,
+            episode=launch_episode,
+            prefer_episode=launch_episode is not None,
+            autoplay=bool(start and start > 0),
+            start=start,
+        )
+        await select_profile(
+            client,
+            profile,
+            delay=profile_delay,
+            row=profile_row,
+            profile_type=effective_profile_type,
+            profile_type_right=profile_type_right,
+            profile_step_delay=profile_step_delay,
+            pin=profile_pin,
+            pin_delay=profile_pin_delay,
+            highlight_only=profile_highlight,
+            profile_display_name=profile_display_name,
+        )
+        if profile_highlight:
+            print("  Done (profile highlight only).")
+            return
         if close_after_profile:
-            # Legacy: close resets the profile session on many Prime builds.
-            print("  Prime flow: launch → profile → close → cold content launch")
-            result = await launch_app(client, PRIME_VIDEO_APP_ID)
-            _check_launch_result(result)
-            await select_profile(
-                client,
-                profile,
-                delay=profile_delay,
-                row=profile_row,
-                profile_type=effective_profile_type,
-                profile_type_right=profile_type_right,
-                profile_step_delay=profile_step_delay,
-                pin=profile_pin,
-                pin_delay=profile_pin_delay,
-                highlight_only=profile_highlight,
-                profile_display_name=profile_display_name,
-            )
-            if profile_highlight:
-                print("  Done (profile highlight only).")
-                return
-            if content_delay > 0:
-                print(f"  Waiting {content_delay:.1f}s after profile selection ...")
-                await asyncio.sleep(content_delay)
+            # Rare: force a cold content launch after profile without a second
+            # picker cycle on builds that drop the deep link at the gate.
+            if await close_app(client, PRIME_VIDEO_APP_ID):
+                await asyncio.sleep(1.5)
             _, used_autoplay_launch = await launch_prime_content_candidates(
                 client,
                 content_id,
                 try_all_ids=try_all_ids,
                 cold_start=False,
                 detail_html=detail_html,
-                episode=episode,
-                prefer_episode=play or episode is not None,
+                episode=launch_episode,
+                prefer_episode=launch_episode is not None,
                 autoplay=bool(start and start > 0),
                 start=start,
             )
-        else:
-            # This Prime build re-shows the profile picker whenever it receives
-            # a content deep link. So deep-link the title FIRST and let the
-            # picker act as a gate: once the profile is chosen, Prime lands
-            # straight on the title page. (Selecting the profile first and
-            # deep-linking afterwards just bounces back to the picker.)
-            print("  Prime flow: content deep link → profile gate → play")
-            print(f"[PLAY] profile-gate launch: content_id={content_id} episode={episode} start={start}", file=sys.stderr)
-            _, used_autoplay_launch = await launch_prime_content_candidates(
-                client,
-                content_id,
-                try_all_ids=try_all_ids,
-                cold_start=False,
-                detail_html=detail_html,
-                episode=episode,
-                prefer_episode=play or episode is not None,
-                autoplay=bool(start and start > 0),
-                start=start,
-            )
-            print(f"[PLAY] profile-gate used_autoplay={used_autoplay_launch}", file=sys.stderr)
-            await select_profile(
-                client,
-                profile,
-                delay=profile_delay,
-                row=profile_row,
-                profile_type=effective_profile_type,
-                profile_type_right=profile_type_right,
-                profile_step_delay=profile_step_delay,
-                pin=profile_pin,
-                pin_delay=profile_pin_delay,
-                highlight_only=profile_highlight,
-                profile_display_name=profile_display_name,
-            )
-            if profile_highlight:
-                print("  Done (profile highlight only).")
-                return
-            if content_delay > 0:
-                print(f"  Waiting {content_delay:.1f}s for the title page ...")
-                await asyncio.sleep(content_delay)
-                title_page_settled = True
+
+        print(f"[PLAY] after profile used_autoplay={used_autoplay_launch}", file=sys.stderr)
+        # After profile, Prime should already show the deep-linked hub. Give it
+        # time to paint Resume/Watch before we move focus and press ENTER.
+        settle = max(content_delay, DEFAULT_PLAY_DELAY) if play else content_delay
+        if settle > 0:
+            print(f"  Waiting {settle:.1f}s for the title / Resume CTA ...")
+            await asyncio.sleep(settle)
+            title_page_settled = True
     elif content_id is not None:
         print(f"[PLAY] no-profile direct launch path: content_id={content_id} episode={episode} play={play} start={start}", file=sys.stderr)
         _, used_autoplay_launch = await launch_prime_content_candidates(
@@ -1719,6 +1843,22 @@ Use --profile-highlight to verify the mapped index on TV.""",
         action="store_true",
         help="Unmute the TV",
     )
+    parser.add_argument(
+        "--media-skip-back",
+        type=int,
+        nargs="?",
+        const=1,
+        metavar="N",
+        help="Rewind / skip back N remote steps (default 1, ~10s each on Prime)",
+    )
+    parser.add_argument(
+        "--media-skip-forward",
+        type=int,
+        nargs="?",
+        const=1,
+        metavar="N",
+        help="Fast-forward / skip ahead N remote steps (default 1, ~10s each on Prime)",
+    )
     # ── Subtitles (Prime Video player) ────────────────────────────────────────
     parser.add_argument(
         "--set-subtitles",
@@ -1951,6 +2091,38 @@ def _normalize_subtitle_focus_right(focus_right: int) -> int:
     return focus_right
 
 
+async def _ensure_paused_for_subtitles(client: "WebOsClient") -> None:
+    """Pause playback so the transport / captions bar can be focused.
+
+    Prefer SSAP pause() when playing — the remote PAUSE key *toggles*, so if we
+    are already paused it would resume and every following key hits the wrong UI.
+
+    If already paused, do nothing (do not send PAUSE). The open-picker step uses
+    DOWN to move onto the icon row once the stream is stopped.
+    """
+    state = await _media_play_state(client)
+    if state == "paused":
+        print("  Already paused — ready for subtitle menu.", file=sys.stderr)
+        await asyncio.sleep(0.3)
+        return
+    if state in {"playing", "buffering"}:
+        try:
+            result = await client.pause()
+            if result.get("returnValue", True):
+                print("  SSAP pause for subtitle menu.", file=sys.stderr)
+                await asyncio.sleep(1.0)
+                # Confirm we did not stay in playing (some builds ignore SSAP).
+                if await _media_play_state(client) == "paused":
+                    return
+                print("  Still not paused after SSAP — trying PAUSE key.", file=sys.stderr)
+        except Exception as exc:
+            print(f"  SSAP pause failed ({exc}); trying PAUSE key.", file=sys.stderr)
+    # Unknown state or SSAP failed — remote PAUSE only if not already paused.
+    if await _media_play_state(client) != "paused":
+        await _send_button(client, "PAUSE")
+        await asyncio.sleep(1.0)
+
+
 async def _open_prime_subtitle_picker(
     client: "WebOsClient",
     *,
@@ -1962,11 +2134,10 @@ async def _open_prime_subtitle_picker(
     From screengrab.jpg the row is: Start again → Subtitles CC → Audio (speaker).
     Cast sits above the scrubber and is not on this row.
 
-    Sequence: PAUSE (surface bar) → DOWN×N (focus icon row) → LEFT-home to
-    Start again → RIGHT×1 (Subtitles CC) → ENTER. Resume is handled by the caller.
+    Sequence: ensure paused (surface bar) → DOWN×N (focus icon row) → LEFT-home
+    to Start again → RIGHT×1 (Subtitles CC) → ENTER. Resume is handled by the caller.
     """
-    await _send_button(client, "PAUSE")
-    await asyncio.sleep(0.7)
+    await _ensure_paused_for_subtitles(client)
 
     right_steps = _normalize_subtitle_focus_right(focus_right)
     down_steps = max(0, focus_down)
@@ -1999,7 +2170,7 @@ async def _open_prime_subtitle_picker(
         await asyncio.sleep(SUBTITLE_KEY_DELAY)
     if not await _send_button(client, "ENTER"):
         return False
-    await asyncio.sleep(0.75)
+    await asyncio.sleep(0.9)
     return True
 
 
@@ -2045,26 +2216,27 @@ async def _select_subtitles_on_off(
     enabled: bool,
     steps_down: int,
 ) -> None:
-    """Set the Subtitles column to On or Off inside the open captions panel.
+    """Set the Subtitles list to On or Off inside the open captions panel.
 
-    Panel layout (screengrab): Subtitles | Languages | Sizes | Styles.
-    Rows after UP-home: Off (0), On (1).
+    Documented panel (Settings help / device): first column is Subtitles with
+    rows Off (0), On (1) after UP-home. Do **not** wander into Languages /
+    Sizes / Styles — extra RIGHT/UP presses select the wrong controls.
 
-    Only one ENTER here (confirm). A second ENTER — or a later PLAY key while
-    focus is still on this control — toggles back (enable then immediately disable).
+    Only one ENTER (confirm). A second ENTER or a PLAY key while focus is still
+    on this row toggles the value back.
     """
     target = "On" if enabled else "Off"
     print(
-        f"  Subtitles column → {target}: LEFT-home, UP-home, "
+        f"  Subtitles → {target}: LEFT-home, UP-home, "
         f"DOWN×{steps_down}, ENTER once ...",
         file=sys.stderr,
     )
-    # Leftmost column is Subtitles.
+    # Leftmost column is Subtitles (Start again / Off row home).
     for _ in range(3):
         await _send_button(client, "LEFT")
         await asyncio.sleep(SUBTITLE_KEY_DELAY)
 
-    # Home to first row (Off). Only 2 UPs for a 2-row list (extra UPs may wrap).
+    # Home to first row (Off). Two UPs is enough for Off/On; more can wrap.
     for _ in range(2):
         await _send_button(client, "UP")
         await asyncio.sleep(SUBTITLE_KEY_DELAY)
@@ -2073,9 +2245,8 @@ async def _select_subtitles_on_off(
         await _send_button(client, "DOWN")
         await asyncio.sleep(SUBTITLE_KEY_DELAY)
 
-    # Confirm selection exactly once.
     await _send_button(client, "ENTER")
-    await asyncio.sleep(0.75)
+    await asyncio.sleep(0.9)
 
 
 async def apply_subtitles(
@@ -2092,9 +2263,12 @@ async def apply_subtitles(
 ) -> None:
     """Open Prime's subtitles picker, set On or Off, dismiss panel, resume.
 
-    UP is only sent inside the open panel (not during playback — that opens cast).
-    After selection, one BACK closes the overlay; resume uses SSAP play (not PLAY
-    key) so the choice is not immediately toggled back.
+    Minimal key path (matches Settings help text):
+      pause → DOWN×focus_down → LEFT-home → RIGHT×focus_right → ENTER
+      → LEFT-home → UP-home → DOWN×menu → ENTER → BACK → resume
+
+    Do not send exploratory RIGHT/UP into Languages after On — that was
+    sending the wrong keypresses on current Prime builds.
     """
     lang = (language or "en").strip().lower()
     if not enabled:
@@ -2118,8 +2292,7 @@ async def apply_subtitles(
         print(json.dumps({"subtitles": enabled, "language": lang if enabled else "off"}))
         return
 
-    # Skip when Prime has separate Subtitles / Audio buttons (section steps are for
-    # a combined Audio & Subtitles panel only).
+    # Only for combined Audio+Subtitles panels (section_* defaults are 0 = skip).
     if section_up > 0 or section_left > 0:
         await _focus_subtitles_section(
             client, section_up=section_up, section_left=section_left
@@ -2129,7 +2302,6 @@ async def apply_subtitles(
         client, enabled=enabled, steps_down=steps_down
     )
 
-    # Close captions panel, then resume without a PLAY key that can re-hit the menu.
     await _dismiss_subtitle_config_panel(client)
     await _resume_after_subtitles(client)
 
@@ -2557,6 +2729,49 @@ async def cmd_media_toggle(client: "WebOsClient") -> None:
     print("  Sent PLAY (toggle).")
 
 
+async def cmd_media_skip(client: "WebOsClient", direction: str, steps: int = 1) -> None:
+    """Skip backward/forward during playback (remote REWIND / FASTFORWARD).
+
+    Prefer dedicated WebOS methods when available; fall back to remote keys.
+    One step is one remote press (typically ~10s on Prime). Absolute seek
+    (``--seek``) is still used for the scrubber / typed time.
+    """
+    direction = (direction or "").strip().lower()
+    if direction not in {"back", "backward", "rewind", "forward", "ff"}:
+        print(f"error: unknown skip direction: {direction!r}", file=sys.stderr)
+        sys.exit(2)
+    going_back = direction in {"back", "backward", "rewind"}
+    steps = max(1, min(int(steps), 12))
+    label = "rewind" if going_back else "fast-forward"
+    print(f"Skipping {label} ×{steps} ...")
+
+    sent = 0
+    for i in range(steps):
+        ok = False
+        try:
+            if going_back and hasattr(client, "rewind"):
+                await client.rewind()
+                ok = True
+            elif not going_back and hasattr(client, "fast_forward"):
+                await client.fast_forward()
+                ok = True
+        except Exception as exc:
+            print(f"  {label} method failed ({exc}); trying key.", file=sys.stderr)
+        if not ok:
+            key = "REWIND" if going_back else "FASTFORWARD"
+            ok = await _send_button(client, key)
+        if ok:
+            sent += 1
+            await asyncio.sleep(0.2)
+        else:
+            break
+
+    if sent == 0:
+        print(f"error: could not {label} on TV", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps({"skip": label, "steps": sent}))
+
+
 _MAC_RE = re.compile(
     r"\b([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})\b",
 )
@@ -2904,6 +3119,10 @@ async def main() -> None:
             await cmd_media_toggle(client)
         elif args.media_stop:
             await cmd_media_stop(client)
+        elif args.media_skip_back is not None:
+            await cmd_media_skip(client, "back", args.media_skip_back)
+        elif args.media_skip_forward is not None:
+            await cmd_media_skip(client, "forward", args.media_skip_forward)
         elif args.power_off:
             await cmd_power_off(client)
         elif args.power_state:

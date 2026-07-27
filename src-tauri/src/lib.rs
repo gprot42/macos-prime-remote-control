@@ -712,7 +712,9 @@ fn default_project_root() -> PathBuf {
     }
     if let Ok(exe) = std::env::current_exe() {
         let mut p = exe.clone();
-        for _ in 0..6 {
+        // Release .app lives under target/release/bundle/macos/.../MacOS/ — need
+        // enough parent hops to reach the project root with amazon/.
+        for _ in 0..12 {
             p = match p.parent() {
                 Some(parent) => parent.to_path_buf(),
                 None => break,
@@ -722,7 +724,7 @@ fn default_project_root() -> PathBuf {
             }
         }
     }
-    home_dir().join("src").join("prime-remote-control")
+    home_dir().join("src").join("public").join("macos-prime-remote-control")
 }
 
 fn resolve_project_root(cfg: &AppConfig) -> PathBuf {
@@ -1673,7 +1675,7 @@ async fn set_tv_subtitles(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Send a media control command to the TV (pause / play / toggle / stop).
+/// Send a media control command to the TV (pause / play / toggle / stop / skip).
 #[tauri::command]
 async fn media_control(action: String) -> Result<(), String> {
     let flag = match action.as_str() {
@@ -1681,6 +1683,9 @@ async fn media_control(action: String) -> Result<(), String> {
         "play" | "resume" => "--media-play",
         "toggle" => "--media-toggle",
         "stop"   => "--media-stop",
+        // One remote REWIND / FASTFORWARD press (~10s on Prime).
+        "skip_back" | "rewind" => "--media-skip-back",
+        "skip_forward" | "fast_forward" | "ff" => "--media-skip-forward",
         other    => return Err(format!("Unknown media action: {other}")),
     };
     run_tv_media_cmd(flag).await
