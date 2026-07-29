@@ -118,7 +118,8 @@ pub struct AppConfig {
     /// DOWN-key presses to surface the transport row (Start again / Subtitles / Audio).
     #[serde(default = "default_subtitle_focus_down")]
     pub subtitle_focus_down: i32,
-    /// RIGHT presses after LEFT-homing to Start again (1 = Subtitles CC; 2/3 select Audio — see screengrab.jpg).
+    /// LEFT presses after RIGHT-homing to Audio to reach Subtitles CC (default 1).
+    /// Legacy values 1–2 (old RIGHT-from-Start counts) both map to 1.
     #[serde(default = "default_subtitle_focus_right")]
     pub subtitle_focus_right: i32,
     /// UP presses inside the panel to select Subtitles instead of Audio.
@@ -145,6 +146,7 @@ fn default_subtitle_focus_down() -> i32 {
 }
 
 fn default_subtitle_focus_right() -> i32 {
+    // LEFT×1 from Audio after RIGHT-home (Subtitles is always left of Audio).
     1
 }
 
@@ -302,16 +304,15 @@ fn config_path() -> PathBuf {
     home_dir().join(".config").join("prime-remote-control.json")
 }
 
-/// Normalize subtitle bar navigation after left-homing was added.
+/// Normalize subtitle bar navigation for the current Prime player chrome.
 ///
-/// Prime's pause bar (see screengrab.jpg) is:
-///   Start again → Subtitles CC → Audio (speaker)
-/// After LEFT-homing to Start again, only RIGHT×1 selects Subtitles. Legacy
-/// configs used RIGHT×2 (pre-homing default) or 3+ (manual overshoot) and open
-/// Audio options instead — migrate those to 1.
+/// Navigation RIGHT-homes to Audio then LEFT to Subtitles so ENTER never hits
+/// "Start again" (which restarts the title at 00:00). Legacy configs stored
+/// RIGHT counts from Start again (1 without Next, 2 with Next); both meant
+/// Subtitles and map to LEFT×1 from Audio.
 fn migrate_subtitle_focus_right(value: i32) -> i32 {
     match value {
-        2 | 3 => 1,
+        1 | 2 => 1,
         n => n,
     }
 }
@@ -561,6 +562,17 @@ fn read_cache(key: &str, max_age_secs: u64) -> Option<String> {
         return None;
     }
     serde_json::to_string(&entry.data).ok()
+}
+
+/// Like `read_cache` but ignores age — used for stale-while-revalidate on startup
+/// so the UI is not blocked for ~20–30s waiting on a Prime catalog scrape.
+fn read_cache_any_age(key: &str) -> Option<(String, u64)> {
+    let path = cache_path(key);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let entry: CacheEntry = serde_json::from_str(&raw).ok()?;
+    let age = now_secs().saturating_sub(entry.timestamp);
+    let json = serde_json::to_string(&entry.data).ok()?;
+    Some((json, age))
 }
 
 /// Write a JSON string to the cache.
@@ -912,6 +924,11 @@ async fn run_get_mac_cmd(ip: &str) -> Result<Option<String>, String> {
 #[tauri::command]
 async fn discover_tv_mac(app: tauri::AppHandle) -> Result<AppConfig, String> {
     let mut cfg = load_config();
+    // Skip a full ARP probe when we already have a MAC — every launch used to
+    // spawn Python for this even though the value never changes.
+    if !cfg.tv_mac.trim().is_empty() {
+        return Ok(cfg);
+    }
     if autofill_tv_mac(&mut cfg).await? {
         let _ = app.emit("config-updated", cfg.clone());
     }
@@ -1111,8 +1128,17 @@ async fn get_public_ip() -> serde_json::Value {
 
 /// Load a Prime Video collection. Serves from disk cache unless `force_refresh`
 /// is true or the cache is older than the configured TTL.
+///
+/// **Startup path:** when the cache is merely *expired* (not missing), return it
+/// immediately as `__STALE__…` instead of blocking the UI for a full Prime scrape
+/// (~20–30s for Included with Prime). A background task refreshes the file so
+/// the next load (or a hard refresh) gets fresh data.
 #[tauri::command]
-async fn load_catalog(collection: String, force_refresh: bool) -> Result<String, String> {
+async fn load_catalog(
+    app: tauri::AppHandle,
+    collection: String,
+    force_refresh: bool,
+) -> Result<String, String> {
     let cfg = load_config();
 
     // Always use fast (stored) key for initial cache lookup. This is critical to
@@ -1120,29 +1146,66 @@ async fn load_catalog(collection: String, force_refresh: bool) -> Result<String,
     // get_prime_region / cache ops on startup).
     let cache_key = catalog_cache_key(&cfg, &collection);
 
-    // Try cache first
+    // Fresh cache — instant return.
     if !force_refresh {
         if let Some(cached) = read_cache(&cache_key, cfg.cache_ttl_secs) {
             return Ok(cached);
         }
+        // Expired but present: serve immediately (stale-while-revalidate).
+        // Without this, every cold launch after TTL waits on a full scrape.
+        if let Some((stale_json, age)) = read_cache_any_age(&cache_key) {
+            let hours = age / 3600;
+            let reason = if hours >= 48 {
+                format!("Catalog cache is {hours}h old — refreshing in background")
+            } else {
+                format!("Catalog cache expired ({hours}h) — refreshing in background")
+            };
+            spawn_catalog_refresh(app, collection.clone(), cache_key.clone());
+            return Ok(format!("__STALE__{reason}\u{0}{stale_json}"));
+        }
     }
 
+    // No disk cache, or forced refresh: must wait on network.
+    fetch_catalog_live(&cfg, &collection, &cache_key, force_refresh).await
+}
+
+/// Background re-fetch after a stale hit so the next open is fresh.
+fn spawn_catalog_refresh(app: tauri::AppHandle, collection: String, cache_key: String) {
+    tauri::async_runtime::spawn(async move {
+        let cfg = load_config();
+        match fetch_catalog_live(&cfg, &collection, &cache_key, true).await {
+            Ok(_) => {
+                let _ = app.emit("catalog-refreshed", collection);
+            }
+            Err(e) => {
+                eprintln!("background catalog refresh failed: {e}");
+            }
+        }
+    });
+}
+
+/// Blocking live fetch of a collection (Python scrape + write cache).
+async fn fetch_catalog_live(
+    cfg: &AppConfig,
+    collection: &str,
+    _cache_key: &str,
+    force_refresh: bool,
+) -> Result<String, String> {
     // Only on miss/force do we pay for network detect + possible cache clear.
-    // Use spawn_blocking so a slow network detect doesn't block the tokio worker thread.
     if cfg.detect_vpn_region {
         let _ = tauri::async_runtime::spawn_blocking(sync_region_cache).await;
     }
-    let cache_key = catalog_cache_key(&cfg, &collection);
+    // Recompute after region sync — VPN change may have rewritten the key.
+    let cache_key = catalog_cache_key(cfg, collection);
 
-    // Re-check after possible sync
+    // Re-check after possible region-driven cache clear / key change.
     if !force_refresh {
         if let Some(cached) = read_cache(&cache_key, cfg.cache_ttl_secs) {
             return Ok(cached);
         }
     }
 
-    // Fetch fresh data
-    let root = resolve_project_root(&cfg);
+    let root = resolve_project_root(cfg);
     let python = python_exe(&root);
     let script = root
         .join("amazon")
@@ -1153,7 +1216,7 @@ async fn load_catalog(collection: String, force_refresh: bool) -> Result<String,
     let mut cmd = tokio::process::Command::new(&python);
     cmd.arg(&script)
         .arg("--collection")
-        .arg(&collection)
+        .arg(collection)
         .arg("--resolve-entitlement")
         .arg("--json");
     // "Included with Prime" is a very large storefront (many rows). Use the
@@ -1177,7 +1240,7 @@ async fn load_catalog(collection: String, force_refresh: bool) -> Result<String,
         // On failure, try stale cache as fallback — but still surface the real
         // error reason (last non-empty stderr line) so the UI isn't silently
         // stuck showing the same generic banner on every retry.
-        if let Some(stale) = read_cache(&cache_key, 30 * 24 * 3600) {
+        if let Some((stale, _)) = read_cache_any_age(&cache_key) {
             let reason = last_error_line(&err);
             return Ok(format!("__STALE__{reason}\u{0}{stale}"));
         }
@@ -1186,7 +1249,6 @@ async fn load_catalog(collection: String, force_refresh: bool) -> Result<String,
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-    // Cache the result (delete stale before writing)
     delete_cache_entry(&cache_key);
     let _ = write_cache(&cache_key, &stdout);
 
@@ -1607,8 +1669,8 @@ async fn run_tv_media_cmd(flag: &str) -> Result<(), String> {
 }
 
 fn append_subtitle_args(cmd: &mut tokio::process::Command, cfg: &AppConfig, language: &str) {
-    // Coerce legacy focus-right (2/3 → Audio) so TV commands hit Subtitles CC
-    // even if config on disk has not been re-saved since the LEFT-home change.
+    // Coerce legacy focus-right (RIGHT-from-Start counts 1|2 → LEFT×1 from Audio)
+    // so TV commands never ENTER on Start again (restart at 00:00).
     let focus_right = migrate_subtitle_focus_right(cfg.subtitle_focus_right).clamp(-1, 20);
     cmd.arg("--set-subtitles").arg(language);
     cmd.arg("--subtitle-focus-down")
@@ -1643,6 +1705,8 @@ async fn set_tv_subtitles(enabled: bool) -> Result<(), String> {
         .to_string_lossy()
         .to_string();
 
+    // When disabling, still pass the preferred track as "off:<lang>" so Python
+    // knows how many UPs reach Off from that row (en → 1, en-cc → 2).
     let language = if enabled {
         if cfg.subtitle_language.trim().is_empty() {
             "en".to_string()
@@ -1650,7 +1714,12 @@ async fn set_tv_subtitles(enabled: bool) -> Result<(), String> {
             cfg.subtitle_language.clone()
         }
     } else {
-        "off".to_string()
+        let prefer = if cfg.subtitle_language.trim().is_empty() {
+            "en"
+        } else {
+            cfg.subtitle_language.trim()
+        };
+        format!("off:{prefer}")
     };
 
     let mut cmd = tokio::process::Command::new(&python);

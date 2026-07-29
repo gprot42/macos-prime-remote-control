@@ -667,6 +667,14 @@ def _trial_from_text(text: str) -> str | None:
 
 def _messages_indicate_prime_inclusion(*messages: str | None) -> bool:
     joined = " ".join(m for m in messages if m).lower()
+    if not joined:
+        return False
+    # Membership trial / "subscribe then auto-renew" upsells are NOT free with an
+    # existing Prime plan (e.g. "Watch with a 7 day free Prime trial, auto renews…").
+    if "trial" in joined and "included with prime" not in joined:
+        return False
+    if "subscribe to" in joined and "included with prime" not in joined:
+        return False
     prime_markers = (
         "included with prime",
         "included with your prime",
@@ -675,11 +683,7 @@ def _messages_indicate_prime_inclusion(*messages: str | None) -> bool:
         "stream free with prime",
         "prime member",
     )
-    if any(marker in joined for marker in prime_markers):
-        if "trial" in joined and "included with prime" not in joined:
-            return False
-        return True
-    return False
+    return any(marker in joined for marker in prime_markers)
 
 
 def _messages_indicate_rent_or_buy(*messages: str | None) -> bool:
@@ -938,6 +942,17 @@ def entitlement_from_cues(
         focus_message, glance_message, compact_focus_message
     ):
         included_with_prime = True
+
+    # Rent/buy or channel-subscribe copy wins over a false "included" guess.
+    # Storefront carousels often put MGM+/PDR titles on "Included with Prime"
+    # rows with trial or "Subscribe to MGM+ or buy" messaging.
+    if _messages_indicate_rent_or_buy(
+        focus_message, glance_message, compact_focus_message
+    ) or _messages_indicate_channel_addon(
+        focus_message, glance_message, compact_focus_message
+    ):
+        if entitlement_type != "Entitled":
+            included_with_prime = False
 
     if entitlement_type == "Entitled" and channel and channel != "Prime":
         included_with_prime = False

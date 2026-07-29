@@ -520,6 +520,20 @@ export default function App() {
     loadCatalog(false, collection);
   }, [collection, viewMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // After a stale-while-revalidate background scrape finishes, reload so the
+  // UI picks up fresh titles without another full-screen loading wait.
+  useEffect(() => {
+    const unlisten = listen<string>("catalog-refreshed", (event) => {
+      if (viewMode !== "catalog") return;
+      if (event.payload !== collection) return;
+      if (searchQuery.trim()) return;
+      loadCatalog(false, collection);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [collection, viewMode, searchQuery, loadCatalog]);
+
   // ── Debounced search ────────────────────────────────────────────────────────
   const handleSearchChange = (q: string) => {
     setSearchQuery(q);

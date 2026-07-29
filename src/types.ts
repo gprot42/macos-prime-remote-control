@@ -108,26 +108,31 @@ export interface AppConfig {
   /** DOWN-key presses after pause to reach Prime's transport icon row. */
   subtitle_focus_down?: number;
   /**
-   * RIGHT presses *after LEFT-homing* to Start again on the pause bar.
-   * From screengrab.jpg: Start again → Subtitles CC → Audio; use 1 for Subtitles.
-   * Values 2–3 are legacy (select Audio) and are migrated to 1.
+   * LEFT presses *after RIGHT-homing to Audio* to reach Subtitles CC (default **1**).
+   * Bar: Start again → [Next] → Subtitles → Audio. We home right so ENTER never
+   * hits Start again (which restarts the title at 00:00). Legacy 1|2 (old
+   * RIGHT-from-Start counts) both migrate to 1.
    */
   subtitle_focus_right?: number;
   /** UP presses inside the panel to select Subtitles instead of Audio. */
   subtitle_section_up?: number;
   /** LEFT presses inside the panel to reach the Subtitles column. */
   subtitle_section_left?: number;
-  /** DOWN-key presses in the Subtitles column (-1 = auto: Off=0, On=1). */
+  /**
+   * DOWN presses in the expanded captions list after Select on Off (-1 = auto).
+   * Auto: Off=0, English=1 (title-dependent).
+   */
   subtitle_menu_down?: number;
 }
 
 /**
- * Legacy focus-right values from before LEFT-homing. With the current bar
- * (Start again → Subtitles CC → Audio), 2 and 3 open Audio instead of Subtitles.
+ * Map legacy focus-right to LEFT steps from Audio → Subtitles CC.
+ * Navigation RIGHT-homes to Audio then LEFT×N (never LEFT-homes to Start again).
+ * Legacy RIGHT-from-Start counts 1|2 both meant Subtitles → 1.
  */
 export function migrateSubtitleFocusRight(value: number | undefined): number {
   if (value === undefined || value === null || Number.isNaN(value)) return 1;
-  if (value === 2 || value === 3) return 1;
+  if (value === 1 || value === 2) return 1;
   return value;
 }
 
@@ -170,10 +175,10 @@ export const DEFAULT_CONFIG: AppConfig = {
   subtitles_active: false,
   subtitle_language: "en",
   subtitle_focus_down: 1,
-  // After LEFT-home: 1 = Subtitles CC (screengrab.jpg). 2/3 = Audio — do not use.
+  // After RIGHT-home to Audio: 1 = LEFT to Subtitles CC (never Start again).
   subtitle_focus_right: 1,
   subtitle_section_up: 0,
-  // 0 for dedicated Subtitles CC (screengrab.jpg); 1 only if combined panel starts on Audio
+  // 0 for dedicated Subtitles CC; 1 only if a combined panel starts on Audio
   subtitle_section_left: 0,
   subtitle_menu_down: -1,
 };
@@ -213,14 +218,55 @@ export type AccessLabel = "Prime" | "Channel" | "Rent/Buy" | "Rent" | "Buy" | "?
 export type AccessCategory = "prime" | "channel" | "rent_buy" | "other";
 
 export function getAccessLabel(item: PrimeTitle): AccessLabel {
-  if (item.included_with_prime || item.prime_catalog) return "Prime";
+  // Strong structured fields first.
   if (item.included_with_channel) return "Channel";
   if (item.rent_from && item.buy_from) return "Rent/Buy";
   if (item.rent_from) return "Rent";
   if (item.buy_from) return "Buy";
+
   const s = (item.availability || "").toLowerCase();
-  if (!s) return "-";
-  // Prime membership trial/renewal copy (not a channel add-on).
+  const focus = (item.focus_message || "").toLowerCase();
+  const container = (item.container || "").toLowerCase();
+  const blob = `${s} ${focus} ${container}`;
+
+  // Strong paywall / channel signals only. Do NOT treat generic unsigned-scrape
+  // copy like "Watch with a 30 day free Prime trial, auto renews…" as paywall —
+  // that appears on almost every title when not logged in and was wrongly
+  // hiding the whole Included with Prime list.
+  if (container.includes("rent or buy")) return "Rent/Buy";
+  if (focus.includes("or buy") || focus.includes("or rent")) return "Rent/Buy";
+  if (/\brent from\b/.test(blob) || /\bbuy from\b/.test(blob) || /\bpurchase for\b/.test(blob))
+    return "Rent/Buy";
+  // "Subscribe to MGM+" etc. — not Prime membership trial wording.
+  if (/subscribe to (?!prime\b)/.test(focus)) return "Channel";
+  if (s.includes("prime video channel") || s.includes("(prime video channel)"))
+    return "Channel";
+
+  // Free with Prime when entitlement says so.
+  if (item.included_with_prime === true) return "Prime";
+
+  // Explicitly NOT free with Prime (resolved).
+  if (item.included_with_prime === false) {
+    if (blob.includes("channel") || /subscribe to (?!prime\b)/.test(focus))
+      return "Channel";
+    if (
+      container.includes("rent or buy") ||
+      focus.includes("or buy") ||
+      focus.includes("purchase") ||
+      /\brent from\b/.test(blob) ||
+      /\bbuy from\b/.test(blob)
+    )
+      return "Rent/Buy";
+    // Non-entitled + trial/subscribe focus (e.g. House of Ashur on Prime rows).
+    if (focus.includes("trial") || focus.includes("subscribe") || focus.includes("or buy"))
+      return "Rent/Buy";
+    return "?";
+  }
+
+  // Unresolved (null): weak storefront signals.
+  if (item.prime_catalog === true) return "Prime";
+  if (!s && !focus) return "-";
+
   if (
     s.includes("prime trial") ||
     s.includes("free prime") ||
@@ -229,14 +275,12 @@ export function getAccessLabel(item: PrimeTitle): AccessLabel {
   ) {
     return "Prime";
   }
-  // Regional Prime upsell omits the word "Prime" (e.g. "Auto-renews at SEK 69/month after trial").
   if (
     (s.includes("auto-renew") || s.includes("auto renew")) &&
     s.includes("after trial")
   ) {
     return "Prime";
   }
-  // Paid channel add-on monthly pricing — but not Prime membership renewal.
   const monthlyPrice = /\d+(?:[.,]\d+)?\s*(?:\/|per\s+|a\s+)mo(?:nth)?\b/.test(s);
   const autoRenewMonthly =
     (s.includes("auto-renew") || s.includes("auto renew")) && s.includes("month");

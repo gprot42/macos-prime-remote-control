@@ -676,7 +676,9 @@ export default function TVRemote({
       resumeContentId = resumeContentId.slice(8);
     }
     console.log("[RESUME-SEED] nowPlaying.content_id=", nowPlaying?.content_id, "seriesContentId=", seriesContentId, "episode=", episode, "effective resumeContentId=", resumeContentId);
-    let gotResumeFromScrape = false;
+    // Seed from public resume scrape only (no TV SSAP). get_playback_position
+    // after launch interrupts Prime and re-opens player chrome where In scene /
+    // Cast / Turn on subtitles steal focus. Use "Sync from TV" for a one-shot fix.
     invoke<{ position: number | null }>("get_resume_position", {
       args: {
         contentId: resumeContentId,
@@ -686,41 +688,13 @@ export default function TVRemote({
       .then((r) => {
         console.log("[RESUME-SEED] get_resume_position result:", r);
         if (!active || r.position == null || r.position < 1) return;
-        gotResumeFromScrape = true;
         playRef.current = { pos: r.position, time: Date.now() };
         setPos(r.position);
       })
       .catch((e) => { console.log("[RESUME-SEED] get_resume error", e); });
 
-    // Delayed sync(s) to pull real pos from TV after playback has started.
-    // The unsigned scrape (get_resume_position) almost always returns null for
-    // personal resume positions. We rely on get_playback_position after launch.
-    // Try a few times because the first report may be 0 or unavailable until
-    // the player has settled.
-    const doSync = (delay: number, attempt: number) => setTimeout(() => {
-      if (!active || gotResumeFromScrape) return;
-      console.log(`[RESUME-SEED] delayed get_playback (attempt ${attempt})`);
-      invoke<{ position: number | null; duration: number | null }>("get_playback_position")
-        .then((r) => {
-          console.log("[RESUME-SEED] delayed get_playback result:", r);
-          if (active && r && typeof r.position === "number" && r.position > 0) {
-            // Only correct if we got a meaningful >0 position (resume or current)
-            gotResumeFromScrape = true; // prevent further
-            playRef.current = { pos: r.position, time: Date.now() };
-            setPos(r.position);
-          } else if (attempt < 3) {
-            // try again
-            doSync(3000, attempt + 1);
-          }
-        })
-        .catch((e) => console.log("[RESUME-SEED] delayed get_playback error", e));
-    }, delay);
-
-    doSync(6000, 1);
-
     return () => {
       active = false;
-      // Timers are short and recursive only on failure; no need to clear all
     };
   }, [nowPlaying?.content_id, episode, seekEnabled, seriesContentId]); // eslint-disable-line
 
@@ -875,18 +849,15 @@ export default function TVRemote({
   }, [nowPlaying?.content_id, episode]);
 
   const toggleSubtitles = useCallback(async () => {
-    // Need an active title session on the TV (seek bar enabled). tvOn alone is
-    // not enough — captions are navigated in the Prime player UI.
-    if (!seekEnabled || subtitleBusyRef.current) {
-      if (!seekEnabled) setSubtitleErr("Play a title first");
-      return;
-    }
+    // Captions are pure remote-key navigation on whatever Prime is showing.
+    // Do not require seekEnabled/nowPlaying — the user may have started
+    // playback outside the app, or the dock may only show a selected title.
+    if (subtitleBusyRef.current) return;
     if (tvOn === false) {
       setSubtitleErr("TV is off");
       return;
     }
     const next = !subtitlesOn;
-    const wasPlaying = playbackState === "playing";
     subtitleBusyRef.current = true;
     setSubtitleBusy(true);
     setSubtitleErr(null);
@@ -894,12 +865,9 @@ export default function TVRemote({
       await invoke("set_tv_subtitles", { enabled: next });
       setSubtitlesOn(next);
       setTvOnState(true);
-      if (wasPlaying || next) {
-        // Python already resumes via SSAP play(). Avoid a second media "play"
-        // command immediately after — a remote PLAY while the captions UI is
-        // still closing can act like ENTER and flip On back to Off.
-        onPlaybackStateChange("playing");
-      }
+      // Python dismisses the Off pill (BACK) then SSAP play() to resume.
+      onPlaybackStateChange("playing");
+
     } catch (err) {
       const msg = String(err).replace(/^Error:\s*/, "");
       if (isTvUnreachableMessage(msg)) {
@@ -913,10 +881,8 @@ export default function TVRemote({
       setSubtitleBusy(false);
     }
   }, [
-    seekEnabled,
     subtitlesOn,
     setTvOnState,
-    playbackState,
     onPlaybackStateChange,
     tvOn,
   ]);
@@ -1159,21 +1125,19 @@ export default function TVRemote({
         {subtitlesFeatureEnabled && (
         <>
         <div className={`flex flex-col items-center shrink-0 ${
-          !seekEnabled || tvOn === false ? "opacity-40" : ""
+          tvOn === false ? "opacity-40" : ""
         }`}>
           <button
             type="button"
-            disabled={subtitleBusy || !seekEnabled || tvOn === false}
+            disabled={subtitleBusy || tvOn === false}
             onClick={toggleSubtitles}
             title={
               subtitleErr ?? (
-                !seekEnabled
-                  ? "Play a title on the TV first, then enable subtitles"
-                  : tvOn === false
-                    ? "TV is off"
-                    : subtitlesOn
-                      ? `Subtitles on (${subtitleLabel}) — click to turn off`
-                      : `Subtitles off — click to turn on (${subtitleLabel})`
+                tvOn === false
+                  ? "TV is off"
+                  : subtitlesOn
+                    ? `Subtitles on (${subtitleLabel}) — click to turn off`
+                    : `Subtitles off — click to turn on (${subtitleLabel}). Prime must be in the player (not the home grid).`
               )
             }
             className={`w-9 h-9 flex items-center justify-center rounded-xl border transition-colors

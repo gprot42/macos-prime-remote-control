@@ -375,10 +375,11 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
                       Enable subtitle controls
                     </p>
                     <p className="text-xs text-zinc-500 mt-0.5 leading-relaxed">
-                      Shows a subtitles button in the remote bar (only while media is
-                      playing on TV). The button starts grey (off) each session/title;
-                      it turns blue after you enable captions. Click to turn on or off —
-                      no auto-apply when playback starts.
+                      Shows a subtitles button in the remote bar whenever the TV is on.
+                      Use it while Prime is in the video player (not the home grid).
+                      The button starts grey (off) each session/title; it turns blue
+                      after you enable captions. Click to turn on or off — no auto-apply
+                      when playback starts.
                     </p>
                   </div>
                 </label>
@@ -478,13 +479,12 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
                     </div>
                   </div>
                   <p className="text-xs text-zinc-500 leading-relaxed">
-                    Pause bar (left→right): Start again, Subtitles CC, Audio (speaker).
-                    Navigation: PAUSE → DOWN to the icon row → LEFT-home to Start again →
-                    RIGHT×N (default <strong>1</strong> = Subtitles CC) → ENTER.
-                    RIGHT×2 or 3 selects Audio instead — avoid those. Section left/up stay 0 for the
-                    dedicated Subtitles button; set only if a combined Audio+Subs panel opens on Audio.
-                    Menu down: -1=auto (Off=0, On=1 in the Subtitles column).
-                    Tune per your TV if a title uses a different list order.
+                    Pause bar (left→right): Start again, Next, Subtitles CC, Audio.
+                    Path: pause → DOWN → RIGHT-home to Audio → LEFT to Subtitles CC → ENTER
+                    (collapsed Off pill) → ENTER expand → multi-column panel
+                    (Subtitles Off/On | Languages | Sizes | Styles) → LEFT to Subtitles →
+                    UP Off → DOWN×menu for On (default <strong>1</strong>) → ENTER once → BACK.
+                    Homing right avoids Start again (restarts at 00:00). Menu down: Off=0, On=1.
                   </p>
                 </div>
               </div>
