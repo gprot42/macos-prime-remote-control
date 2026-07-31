@@ -335,7 +335,7 @@ export default function PlayDialog({
             <img
               src={imageUrl}
               alt={item.title}
-              className="w-full h-full object-cover object-[50%_70%]"
+              className="w-full h-full object-cover object-[50%_35%]"
             />
           ) : (
             <div className="w-full h-full bg-gradient-to-br from-[#1A242F] to-[#0a0f15]" />

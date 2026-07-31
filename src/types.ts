@@ -218,8 +218,21 @@ export type AccessLabel = "Prime" | "Channel" | "Rent/Buy" | "Rent" | "Buy" | "?
 export type AccessCategory = "prime" | "channel" | "rent_buy" | "other";
 
 export function getAccessLabel(item: PrimeTitle): AccessLabel {
-  // Strong structured fields first.
+  // Channel add-on is exclusive (not free with Prime membership alone).
   if (item.included_with_channel) return "Channel";
+
+  // Entitlement / storefront-forced Prime wins over weak unsigned scrape copy.
+  // Genre rows often set included_with_prime=true while availability still says
+  // "Free trial of Prime … or rent or buy" — those used to be mislabeled Rent/Buy
+  // and hidden when show_rent_buy is off.
+  if (item.included_with_prime === true) return "Prime";
+
+  // buybox isPrime / prime_catalog: free with Prime membership. Unsigned pages
+  // still list Rent/Buy as non-member alternatives — those must not reclassify
+  // membership titles as transactional (e.g. The Restless Garden).
+  if (item.prime_catalog === true) return "Prime";
+
+  // Strong structured transactional fields.
   if (item.rent_from && item.buy_from) return "Rent/Buy";
   if (item.rent_from) return "Rent";
   if (item.buy_from) return "Buy";
@@ -242,10 +255,7 @@ export function getAccessLabel(item: PrimeTitle): AccessLabel {
   if (s.includes("prime video channel") || s.includes("(prime video channel)"))
     return "Channel";
 
-  // Free with Prime when entitlement says so.
-  if (item.included_with_prime === true) return "Prime";
-
-  // Explicitly NOT free with Prime (resolved).
+  // Explicitly NOT free with Prime (resolved) and not in membership catalog.
   if (item.included_with_prime === false) {
     if (blob.includes("channel") || /subscribe to (?!prime\b)/.test(focus))
       return "Channel";
@@ -264,7 +274,6 @@ export function getAccessLabel(item: PrimeTitle): AccessLabel {
   }
 
   // Unresolved (null): weak storefront signals.
-  if (item.prime_catalog === true) return "Prime";
   if (!s && !focus) return "-";
 
   if (

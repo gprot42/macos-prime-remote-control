@@ -1108,31 +1108,65 @@ async def start_playback(
     if resolved_method == "blocked":
         print(f"  Note: {note}", file=sys.stderr)
         print(
-            "  PLAY only — if the title needs Join Prime/Rent, playback will not start.",
+            "  Public catalog shows no Watch/Play — TV may still offer Play if "
+            "this profile has Prime. Will try ENTER on the primary CTA.",
             file=sys.stderr,
         )
         resolved_method, note = "enter", None
 
-    # ── Prime: PLAY only (all methods) ───────────────────────────────────────
-    # Never call _focus_prime_watch_button (UP×5/DOWN×2) on Prime — when the
-    # player is already open those keys land on In scene / Cast.
+    # ── Prime start ──────────────────────────────────────────────────────────
+    # Never call _focus_prime_watch_button (UP×5/DOWN×2) on Prime when the
+    # player is already open — those keys land on In scene / Cast / captions.
+    #
+    # Branch on whether launch used an autoplay=1 deep link:
+    #   • autoplay used  → player should be up; PLAY only (ENTER steals chrome)
+    #   • no autoplay    → title hub with Play/Watch/Resume CTA; PLAY alone
+    #                      does not select that button — ENTER activates it
     if await _prefer_remote_keys(client):
         settle = delay if delay > 0 else min(DEFAULT_PLAY_DELAY, 4.0)
         why = "autoplay=1" if used_autoplay_launch else f"method={resolved_method}"
+        if play_highlight:
+            print(
+                f"  Prime start ({why}): wait {settle:.1f}s, highlight only "
+                f"(no PLAY/ENTER).",
+                file=sys.stderr,
+            )
+            print("[START-PLAYBACK] Prime highlight-only path", file=sys.stderr)
+            await asyncio.sleep(settle)
+            return
+
+        if used_autoplay_launch:
+            print(
+                f"  Prime start ({why}): wait {settle:.1f}s + PLAY only "
+                f"(no ENTER — avoids In scene / Cast / Turn on subtitles).",
+                file=sys.stderr,
+            )
+            print("[START-PLAYBACK] Prime PLAY-only path (autoplay launch)", file=sys.stderr)
+            await asyncio.sleep(settle)
+            await client.button("PLAY")
+            print("  Sent PLAY after autoplay launch settle (Prime).")
+            # No _playback_position() — SSAP getInfo interrupts Prime and resurfaces
+            # player chrome where In scene steals focus.
+            return
+
+        # Title-page path (no autoplay deep link). Movies often land here when the
+        # unsigned web page has no Watch URL (e.g. "Join Prime" / rent offers only)
+        # even though the signed-in TV profile has a Play button. PLAY alone leaves
+        # focus off Play; ENTER activates the primary CTA (Play / Watch / Resume).
         print(
-            f"  Prime start ({why}): wait {settle:.1f}s + PLAY only "
-            f"(no D-pad/ENTER — avoids In scene / Cast / Turn on subtitles).",
+            f"  Prime start ({why}): wait {settle:.1f}s + ENTER on primary CTA "
+            f"(title page — Play was not auto-selected).",
             file=sys.stderr,
         )
-        print("[START-PLAYBACK] Prime PLAY-only path", file=sys.stderr)
+        print("[START-PLAYBACK] Prime ENTER path (no autoplay launch)", file=sys.stderr)
         await asyncio.sleep(settle)
-        if play_highlight:
-            print("  play_highlight set — not sending PLAY.")
-            return
+        await client.button("ENTER")
+        print("  Sent ENTER to select primary Play/Watch CTA (Prime).")
+        await asyncio.sleep(1.5)
+        # If ENTER opened the player paused, or focus was already in-player,
+        # PLAY resumes without reopening chrome menus.
         await client.button("PLAY")
-        print("  Sent PLAY after launch settle (Prime).")
-        # No _playback_position() — SSAP getInfo interrupts Prime and resurfaces
-        # player chrome where In scene steals focus.
+        print("  Sent PLAY after ENTER (Prime title page).")
         return
 
     # ── Non-Prime players ────────────────────────────────────────────────────

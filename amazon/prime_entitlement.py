@@ -526,8 +526,21 @@ def resume_start_seconds_from_html(html: str, content_id: str) -> int | None:
     return None
 
 
+def _prime_autoplay_detail_url(content_id: str, *, start: int | None = None) -> str:
+    """Native-app deep link that starts playback of a membership-catalog title."""
+    url = f"https://app.primevideo.com/detail/{content_id}?autoplay=1"
+    if start is not None and start > 0:
+        url = f"{url}&t={int(start)}"
+    return url
+
+
 def playback_launch_target_from_html(html: str, content_id: str) -> str | None:
-    """Return a Prime contentTarget that requests autoplay when Watch now is available."""
+    """Return a Prime contentTarget that requests autoplay when Watch now is available.
+
+    Unsigned pages often omit Watch now for membership titles and only show
+    Join Prime / Rent / Buy, while buybox ``isPrime: true`` still marks the
+    title as free with an active Prime subscription on the TV.
+    """
     content_id = content_id.strip()
     # Never auto-select a channel add-on (MGM+, Qello Concerts, etc.). When a
     # title is only available through a channel subscription, decline autoplay
@@ -552,14 +565,23 @@ def playback_launch_target_from_html(html: str, content_id: str) -> str | None:
     if has_watchable_play_button(labels):
         resume_seconds = resume_start_seconds_from_html(html, content_id)
         if resume_seconds is not None and resume_seconds > 0:
-            return f"https://app.primevideo.com/detail/{content_id}?autoplay=1&t={resume_seconds}"
+            return _prime_autoplay_detail_url(content_id, start=resume_seconds)
         # No explicit start and no (public) resume offset found → use autoplay=1
         # WITHOUT a t= param. This lets the native Prime app on the TV honour
         # its per-profile resume position instead of forcing t=0 (beginning).
         # When an explicit --start > 0 is provided, the caller overrides with
         # _prime_target_with_start_offset which forces &t=N.
         # Prefer the app. subdomain for contentTarget deep links to the TV app.
-        return f"https://app.primevideo.com/detail/{content_id}?autoplay=1"
+        return _prime_autoplay_detail_url(content_id)
+
+    # Membership catalog (isPrime) without a public Watch button: still request
+    # autoplay so the signed-in TV profile starts Play instead of landing on Rent.
+    try:
+        ent = parse_entitlement(html, content_id=content_id)
+    except Exception:
+        ent = None
+    if ent is not None and (ent.prime_catalog or ent.included_with_prime):
+        return _prime_autoplay_detail_url(content_id)
     return None
 
 
@@ -790,17 +812,30 @@ def _infer_prime_membership_catalog(
     buy_from: str | None = None,
     channel: str | None = None,
     provider_logo: object | None = None,
+    is_prime_flag: bool | None = None,
 ) -> bool:
-    """True for films/series in the base Prime membership catalog (not rent/buy)."""
-    if rent_from or buy_from:
-        return False
+    """True for films/series in the base Prime membership catalog (not rent/buy-only).
+
+    Unsigned detail pages almost always expose Rent/Buy *alongside* Join Prime for
+    membership titles (e.g. The Restless Garden has isPrime=true plus Rent HD £4.49).
+    Those prices are alternatives for non-members — they must not wipe prime_catalog
+    when Amazon's buybox isPrime flag (or Prime provider logo) says membership.
+    """
     if channel and channel != "Prime":
         return False
 
     messages = (focus_message, glance_message, compact_focus_message)
-    if _messages_indicate_rent_or_buy(*messages):
-        return False
     if _messages_indicate_channel_addon(*messages):
+        return False
+
+    # Official catalog flag from the detail buybox / entity card.
+    if is_prime_flag is True:
+        return True
+
+    # Without isPrime, rent/buy prices usually mean transactional-only.
+    if rent_from or buy_from:
+        return False
+    if _messages_indicate_rent_or_buy(*messages):
         return False
     if _messages_indicate_prime_subscription_offer(
         *messages, compact_focus_message=compact_focus_message
@@ -986,6 +1021,7 @@ def entitlement_from_cues(
         buy_from=buy_from,
         channel=channel,
         provider_logo=provider_logo,
+        is_prime_flag=is_prime_catalog,
     )
 
     return {
@@ -1192,6 +1228,7 @@ def parse_entitlement(
     benefit_id = None
     cues = entitlement_cues
 
+    is_prime_flag: bool | None = None
     if buybox:
         primary_actions = buybox.get("primaryActions")
         buybox_title = buybox.get("title")
@@ -1199,6 +1236,13 @@ def parse_entitlement(
             title = buybox_title.strip()
         cues = buybox.get("messages")
         benefit_id = _benefit_id_from_actions(primary_actions)
+        # Amazon's catalog flag: title streams with Prime membership when signed in.
+        # Present even on unsigned pages that only offer Join Prime / Rent / Buy.
+        raw_is_prime = buybox.get("isPrime")
+        if raw_is_prime is True:
+            is_prime_flag = True
+        elif raw_is_prime is False:
+            is_prime_flag = False
 
     if not isinstance(cues, dict):
         cues = _find_entity_cues_in_blobs(
@@ -1213,6 +1257,7 @@ def parse_entitlement(
             cues,
             html=html,
             benefit_id=benefit_id,
+            is_prime_catalog=is_prime_flag,
             primary_actions=primary_actions,
         )
     elif gti and buybox and isinstance(buybox.get("messages"), dict):
@@ -1220,6 +1265,7 @@ def parse_entitlement(
             buybox["messages"],
             html=html,
             benefit_id=benefit_id,
+            is_prime_catalog=is_prime_flag,
             primary_actions=primary_actions,
         )
     else:
