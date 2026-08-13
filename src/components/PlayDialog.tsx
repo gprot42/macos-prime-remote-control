@@ -60,8 +60,6 @@ export default function PlayDialog({
   onStartPlaying,
   onPlayed,
 }: PlayDialogProps) {
-  // Profile can be quickly overridden per play; IP always comes from settings.
-  const [profile, setProfile] = useState(config.profile);
   const [playState, setPlayState] = useState<PlayState>("idle");
   const [macPlayState, setMacPlayState] = useState<MacPlayState>("idle");
   const [macError, setMacError] = useState<string | null>(null);
@@ -257,7 +255,11 @@ export default function PlayDialog({
       : item;
     onStartPlaying(playedItem, useLaunchId ? epNum : ep);
     try {
-      await playOnTv(item, { tv_ip: config.tv_ip, profile }, {
+      await playOnTv(item, {
+        tv_ip: config.tv_ip,
+        profile: config.profile,
+        profile_name: config.profile_name,
+      }, {
         contentId: useLaunchId,
         episode: ep,
       });
@@ -399,10 +401,12 @@ export default function PlayDialog({
         <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
 
           {/* Synopsis */}
-          {item.synopsis && (
-            <p className="text-zinc-400 text-sm leading-relaxed line-clamp-3 select-text">
+          {item.synopsis ? (
+            <p className="text-zinc-300 text-sm leading-relaxed select-text">
               {item.synopsis}
             </p>
+          ) : (
+            <p className="text-zinc-600 text-sm italic">No synopsis available for this title.</p>
           )}
 
           {/* Availability detail */}
@@ -553,20 +557,11 @@ export default function PlayDialog({
               <p className="text-zinc-500 text-xs">LG TV</p>
             </div>
 
-            {/* Profile quick selector */}
             <div className="flex items-center gap-2 shrink-0">
               <label className="text-xs text-zinc-400 whitespace-nowrap">Profile</label>
-              <input
-                type="number"
-                min={0}
-                max={9}
-                value={profile}
-                onChange={(e) => setProfile(Math.max(0, parseInt(e.target.value) || 0))}
-                disabled={playState === "playing"}
-                className="w-14 bg-zinc-700 border border-zinc-600 rounded-lg px-2 py-1 text-sm text-white
-                           text-center focus:outline-none focus:border-emerald-500 transition-colors
-                           disabled:opacity-50"
-              />
+              <span className="text-sm text-white">
+                {config.profile_name?.trim() || `slot ${config.profile}`}
+              </span>
             </div>
 
             {/* Settings shortcut */}

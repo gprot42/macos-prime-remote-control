@@ -72,19 +72,22 @@ export async function playOnMac(
 
 export async function playOnTv(
   item: PrimeTitle,
-  config: { tv_ip: string; profile: number },
+  config: { tv_ip: string; profile: number; profile_name?: string },
   options?: { episode?: number | null; contentId?: string | null; startSeconds?: number | null },
 ): Promise<void> {
   const contentId = options?.contentId?.trim() || item.content_id;
   const episode = options?.contentId ? null : options?.episode ?? null;
   const startSeconds = options?.startSeconds ?? null;
+  const profileName = config.profile_name?.trim() || null;
   await invoke("play_on_tv", {
     args: {
       contentId,
       profile: config.profile,
+      profileName,
       tvIp: config.tv_ip,
       episode: episode != null && episode >= 1 ? episode : null,
       startSeconds: startSeconds != null && startSeconds >= 1 ? Math.round(startSeconds) : null,
+      title: item.title,
     },
   });
 }

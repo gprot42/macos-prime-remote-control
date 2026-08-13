@@ -120,10 +120,13 @@ export default function App() {
     items: ContextMenuItem[];
   } | null>(null);
 
-  // Now-playing (drives the TVRemote bar)
+  // Now-playing (drives the TVRemote bar). Persisted to disk so a restart can
+  // re-show the last title — we cannot re-query Amazon for what's on the TV.
   const [nowPlaying, setNowPlaying]         = useState<PrimeTitle | null>(null);
   const [nowPlayingEpisode, setNPEpisode]   = useState<number | null>(null);
   const [playbackState, setPlaybackState]   = useState<PlaybackState>("playing");
+  /** False until the saved session has been loaded (or found empty). */
+  const [nowPlayingHydrated, setNowPlayingHydrated] = useState(false);
 
   const stopTvPlayback = useCallback(async () => {
     try {
@@ -134,6 +137,7 @@ export default function App() {
     setPlaybackState("paused");
     setNowPlaying(null);
     setNPEpisode(null);
+    invoke("clear_now_playing").catch(() => {});
   }, []);
 
   // Escape stops TV playback when something is playing (same as the stop button).
@@ -243,6 +247,25 @@ export default function App() {
     invoke<{ ip: string | null; country: string | null }>("get_public_ip")
       .then((info) => setPublicIp(info.ip ? { ip: info.ip, country: info.country ?? "" } : null))
       .catch(() => {});
+
+    let cancelled = false;
+    const unlistenIp = listen<{ ip: string | null; country: string | null }>(
+      "public-ip-updated",
+      (event) => {
+        if (cancelled) return;
+        const info = event.payload;
+        setPublicIp(info.ip ? { ip: info.ip, country: info.country ?? "" } : null);
+      },
+    );
+    const unlistenRegion = listen<string>("prime-region-updated", (event) => {
+      if (cancelled) return;
+      setPrimeRegion(event.payload && event.payload !== "unknown" ? event.payload : null);
+    });
+    return () => {
+      cancelled = true;
+      unlistenIp.then((fn) => fn());
+      unlistenRegion.then((fn) => fn());
+    };
   }, [config.detect_vpn_region]);
 
   // ── Bookmarks load ──────────────────────────────────────────────────────────
@@ -255,6 +278,26 @@ export default function App() {
   useEffect(() => {
     reloadBookmarks();
   }, [reloadBookmarks]);
+
+  // ── Restore last now-playing session after app restart ──────────────────────
+  useEffect(() => {
+    invoke<{
+      item: PrimeTitle;
+      episode?: number | null;
+      series_content_id?: string | null;
+      updated_at: number;
+    } | null>("get_now_playing")
+      .then((session) => {
+        if (session?.item?.content_id && session.item.title) {
+          setNowPlaying(session.item);
+          setNPEpisode(session.episode ?? null);
+          // Assume paused after restart — TV state is unknown without SSAP title APIs.
+          setPlaybackState("paused");
+        }
+      })
+      .catch(() => {})
+      .finally(() => setNowPlayingHydrated(true));
+  }, []);
 
   useEffect(() => {
     if (bookmarks.length === 0 || !imgPort) return;
@@ -349,8 +392,10 @@ export default function App() {
           args: {
             contentId,
             profile: config.profile,
+            profileName: config.profile_name?.trim() || null,
             tvIp: config.tv_ip,
             episode,
+            title: bookmark.item.title,
           },
         });
         return true;
@@ -411,6 +456,20 @@ export default function App() {
     }
     return nowPlaying.content_id;
   }, [nowPlaying, nowPlayingEpisode, bookmarks]);
+
+  // Persist / clear the dock session whenever it changes (after first hydrate).
+  useEffect(() => {
+    if (!nowPlayingHydrated) return;
+    if (!nowPlaying) {
+      invoke("clear_now_playing").catch(() => {});
+      return;
+    }
+    invoke("save_now_playing", {
+      item: nowPlaying,
+      episode: nowPlayingEpisode,
+      seriesContentId: playingSeriesContentId,
+    }).catch(() => {});
+  }, [nowPlaying, nowPlayingEpisode, playingSeriesContentId, nowPlayingHydrated]);
 
   const bookmarkedIds = useMemo(
     () => new Set(bookmarks.map((b) => b.content_id)),
@@ -777,7 +836,7 @@ export default function App() {
               </div>
               {config.detect_vpn_region && publicIp && (
                 <div
-                  title={`Outgoing VPN IP address: ${publicIp.ip}${publicIp.country ? ` (${publicIp.country})` : ""}. This is the public address Prime Video sees your connection from.`}
+                  title={`Outgoing public IP: ${publicIp.ip}${publicIp.country ? ` (${publicIp.country})` : ""}. Country is from the IP geo database (not your street address) and can lag a VPN change.`}
                   className="flex items-center gap-1.5"
                 >
                   <svg className="w-3.5 h-3.5 text-zinc-500" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
@@ -822,8 +881,8 @@ export default function App() {
 
             {/* Settings */}
             <button onClick={() => setShowSettings(true)} title="Settings"
-              className="p-1.5 text-zinc-400 hover:text-white hover:bg-zinc-700/60 rounded-lg transition-colors">
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+              className="shrink-0 p-2.5 text-zinc-300 hover:text-white hover:bg-zinc-700/60 rounded-xl transition-colors">
+              <svg className="w-7 h-7" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round"
                   d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"
                 />
@@ -1100,7 +1159,19 @@ export default function App() {
             : undefined;
         })()}
         onPlaybackStateChange={setPlaybackState}
-        onDismissPlaying={() => { setNowPlaying(null); setNPEpisode(null); }}
+        onDismissPlaying={() => {
+          setNowPlaying(null);
+          setNPEpisode(null);
+          invoke("clear_now_playing").catch(() => {});
+        }}
+        onOpenDetails={() => {
+          if (!nowPlaying) return;
+          // Re-open the title dialog (synopsis, year, availability) for whatever
+          // is currently in the dock — without interrupting the TV session.
+          setSelectedLaunchContentId(null);
+          setSelectedItem(nowPlaying);
+          setSelectedEpisode(nowPlayingEpisode);
+        }}
       />
     </div>
   );

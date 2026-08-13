@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capabilities for Prime Catalog UI",
+  "description": "Default capabilities for Prime Remote Control",
   "windows": ["main", "prime-player"],
   "permissions": [
     "core:default",

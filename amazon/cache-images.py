@@ -4,7 +4,7 @@ cache-images.py — Download and cache Prime Video poster images locally.
 
 Reads a JSON array of {content_id, url} objects from stdin.
 For each item, downloads the image (resized to a card-friendly size) and saves
-it to ~/.cache/prime-catalog-ui/images/<content_id>.jpg.
+it to ~/.cache/prime-remote-control/images/<content_id>.jpg.
 
 Progress is reported to stdout one line per image:
   CACHED\t<content_id>\t<absolute_path>
@@ -23,7 +23,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-CACHE_DIR = Path.home() / ".cache" / "prime-catalog-ui" / "images"
+CACHE_DIR = Path.home() / ".cache" / "prime-remote-control" / "images"
+LEGACY_CACHE_DIR = Path.home() / ".cache" / "prime-catalog-ui" / "images"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -56,13 +57,21 @@ def download_image(content_id: str, url: str) -> tuple[str, str | None]:
     dest = CACHE_DIR / safe_filename(content_id)
     meta = CACHE_DIR / meta_filename(content_id)
 
+    def _reuse(jpeg: Path, sidecar: Path) -> bool:
+        if jpeg.exists() and jpeg.stat().st_size > 512 and sidecar.exists():
+            try:
+                return sidecar.read_text().strip() == url
+            except OSError:
+                return False
+        return False
+
     # Reuse only when the on-disk JPEG matches this exact source URL.
-    if dest.exists() and dest.stat().st_size > 512 and meta.exists():
-        try:
-            if meta.read_text().strip() == url:
-                return content_id, str(dest)
-        except OSError:
-            pass
+    if _reuse(dest, meta):
+        return content_id, str(dest)
+    legacy_dest = LEGACY_CACHE_DIR / safe_filename(content_id)
+    legacy_meta = LEGACY_CACHE_DIR / meta_filename(content_id)
+    if _reuse(legacy_dest, legacy_meta):
+        return content_id, str(legacy_dest)
 
     sized_url = resize_amazon_url(url, CARD_WIDTH, CARD_HEIGHT)
     try:

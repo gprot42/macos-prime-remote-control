@@ -27,6 +27,7 @@ import socket
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -78,12 +79,20 @@ if TYPE_CHECKING:
     from aiowebostv import WebOsClient
 
 KEY_FILE = Path.home() / ".lg-tv-key"
+# App-private cache (not ~/.cache/prime-catalog-ui used by lgtv-fun).
+APP_CACHE_DIR = Path.home() / ".cache" / "prime-remote-control"
+# Cross-process SSAP lock so this app and our CLI do not share the TV socket
+# with a second copy of the same stack.
+TV_SSAP_LOCK_PATH = APP_CACHE_DIR / "tv.ssap.lock"
 DEFAULT_IP = "192.168.0.79"
 PRIME_VIDEO_APP_ID = "amazon"
 PRIME_BROWSER_APP_ID = "com.webos.app.browser"
-DEFAULT_PROFILE_DELAY = 8.0
-DEFAULT_CONTENT_DELAY = 6.0
-DEFAULT_PLAY_DELAY = 8.0
+AMAZOFF_APP_ID = "com.amazoff.patcher"
+# Cold start: webOS home then Prime. We wait until Prime is foreground
+# plus a short extra (not a fixed 14s) so a warm start is not stuck on the picker.
+DEFAULT_PROFILE_DELAY = 6.0
+DEFAULT_CONTENT_DELAY = 4.0
+DEFAULT_PLAY_DELAY = 5.0
 DEFAULT_PLAY_FOCUS_UP = 5
 DEFAULT_PLAY_FOCUS_DOWN = 2
 DEFAULT_PLAY_FOCUS_LEFT = 2
@@ -91,6 +100,12 @@ MIN_PROFILE_DELAY = 3.0
 PROFILE_KEY_DELAY = 0.35
 DEFAULT_PIN_DELAY = 2.0
 DEFAULT_PROFILE_STEP_DELAY = 3.0
+# After profile ENTER, wait for the title hub (not Home) before Watch/Resume.
+DEFAULT_POST_PROFILE_HUB_DELAY = 4.0
+# Last-used is pre-focused. Home toward the first avatar. This list is
+# 3 profiles + a trailing "+ / New" tile — 5 UPs can wrap onto New and
+# ENTER leaves you stuck on the picker. 2 UPs reach the top from D/Kids.
+PROFILE_HOME_STEPS = 2
 PLAY_KEY_DELAY = 0.45
 SUBTITLE_KEY_DELAY = 0.4
 DEFAULT_SUBTITLE_DELAY = 0.0
@@ -171,6 +186,40 @@ def save_key(key: str) -> None:
 DEFAULT_CONNECT_TIMEOUT = float(os.environ.get("LG_TV_CONNECT_TIMEOUT", "15"))
 
 
+_tv_ssap_lock_fh: object | None = None
+
+
+def acquire_tv_ssap_lock() -> None:
+    """Exclusive flock for the WebOS client socket (one process at a time)."""
+    global _tv_ssap_lock_fh
+    if _tv_ssap_lock_fh is not None:
+        return
+    import fcntl
+
+    TV_SSAP_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(TV_SSAP_LOCK_PATH, "a+")
+    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    _tv_ssap_lock_fh = fh
+
+
+def release_tv_ssap_lock() -> None:
+    global _tv_ssap_lock_fh
+    fh = _tv_ssap_lock_fh
+    _tv_ssap_lock_fh = None
+    if fh is None:
+        return
+    try:
+        import fcntl
+
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        fh.close()
+    except Exception:
+        pass
+
+
 async def _safe_disconnect(client: "WebOsClient | None") -> None:
     if client is None:
         return
@@ -215,6 +264,7 @@ async def connect(ip: str) -> "WebOsClient":
     attempts = max(1, int(os.environ.get("LG_TV_CONNECT_ATTEMPTS", "3")))
     backoff = float(os.environ.get("LG_TV_CONNECT_BACKOFF", "1.5"))
 
+    acquire_tv_ssap_lock()
     print(f"Connecting to {ip}:3000 ...")
     if not key:
         print("  No saved key — TV will show a pairing prompt. Accept it now.")
@@ -304,6 +354,66 @@ async def cmd_apps(client: "WebOsClient") -> None:
         print(f"  {title:<30} {app_id}")
 
 
+def amazoff_match_from_apps(apps: object) -> dict[str, str] | None:
+    """Return {app_id, title, version} if AmazOff is in a listApps / launchPoints payload."""
+    entries: list[object] = []
+    if isinstance(apps, dict):
+        nested = apps.get("apps")
+        if isinstance(nested, list):
+            entries = list(nested)
+        else:
+            nested = apps.get("launchPoints")
+            if isinstance(nested, list):
+                entries = list(nested)
+            else:
+                for key, val in apps.items():
+                    if isinstance(val, dict):
+                        merged = dict(val)
+                        merged.setdefault("id", val.get("id") or key)
+                        entries.append(merged)
+                    else:
+                        entries.append({"id": str(key), "title": str(val)})
+    elif isinstance(apps, list):
+        entries = list(apps)
+
+    for app in entries:
+        if not isinstance(app, dict):
+            continue
+        aid = str(app.get("id") or app.get("appId") or "").strip()
+        title = str(app.get("title") or app.get("name") or "").strip()
+        blob = f"{aid} {title}".lower()
+        if aid.lower() == AMAZOFF_APP_ID or "amazoff" in blob:
+            version = str(app.get("version") or "").strip()
+            out = {
+                "app_id": aid or AMAZOFF_APP_ID,
+                "title": title or "AmazOff",
+            }
+            if version:
+                out["version"] = version
+            return out
+    return None
+
+
+async def cmd_detect_amazoff(client: "WebOsClient") -> None:
+    """Print JSON: whether AmazOff (com.amazoff.patcher) is installed on the TV."""
+    match: dict[str, str] | None = None
+    try:
+        match = amazoff_match_from_apps(await client.get_apps_all())
+    except Exception as exc:
+        print(f"  listApps failed ({exc})", file=sys.stderr)
+    if match is None:
+        try:
+            match = amazoff_match_from_apps(await client.get_apps())
+        except Exception as exc:
+            print(f"  listLaunchPoints failed ({exc})", file=sys.stderr)
+    if match is None:
+        match = amazoff_match_from_apps(getattr(client.tv_state, "apps", None))
+    out: dict[str, object] = {"detected": match is not None}
+    if match:
+        out.update(match)
+    print(json.dumps(out))
+
+
 def _prime_detail_url(content_id: str) -> str:
     return f"{PRIME_WWW_BASE}/detail/{content_id}"
 
@@ -370,6 +480,221 @@ def _prime_target_uses_params(target: str) -> bool:
         or target.startswith("primevideo://")
         or "autoplay=" in target
     )
+
+
+def bare_prime_launch_ids(
+    content_id: str,
+    *,
+    html: str | None = None,
+    episode: int | None = None,
+    prefer_episode: bool = False,
+) -> list[str]:
+    """GTI / ASIN / detail IDs only — no HTTPS contentTarget URLs.
+
+    AmazOff ignores ``contentTarget`` HTTPS /autoplay links (Home carousel only).
+    A second launch after the profile gate re-opens the profile picker.
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+    raw = (content_id or "").strip()
+    try:
+        resolved = resolve_prime_launch_ids(
+            raw,
+            html=html,
+            episode=episode,
+            prefer_episode=prefer_episode,
+            autoplay=False,
+            start=0,
+        )
+        for lid in resolved:
+            if lid and not _prime_target_uses_params(lid):
+                _append_launch_id(ids, seen, lid)
+    except ValueError:
+        raise
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        print(f"  Warning: could not resolve bare launch IDs ({exc})", file=sys.stderr)
+    if raw and not _prime_target_uses_params(raw):
+        _append_launch_id(ids, seen, raw)
+    return ids or ([raw] if raw else [])
+
+
+def storefront_launch_id(
+    content_id: str,
+    *,
+    html: str | None,
+    episode: int | None,
+    play: bool,
+) -> str:
+    """Catalog detail id the signed-in TV profile can entitle.
+
+    ``amzn1.dv.gti.*`` as SSAP contentId often opens the title shell with
+    "this video is currently unavailable". Season hubs are ignored (Home).
+    Movies keep the card id. Series use the chosen episode's 0… detail id.
+    """
+    raw = (content_id or "").strip()
+    ep_num = episode if episode is not None and episode >= 1 else None
+    if html:
+        try:
+            resolved = resolve_episode_content_id(html, raw, episode=ep_num)
+        except Exception as exc:
+            print(f"  Warning: episode id resolve failed ({exc})", file=sys.stderr)
+            resolved = None
+        if (
+            resolved
+            and resolved != raw
+            and PRIME_DETAIL_ID_RE.match(resolved)
+        ):
+            print(
+                f"  Storefront launch: episode detail {resolved} "
+                f"(not season {raw}, not GTI)",
+                file=sys.stderr,
+            )
+            return resolved
+    if PRIME_DETAIL_ID_RE.match(raw):
+        print(f"  Storefront launch: catalog detail {raw}", file=sys.stderr)
+        return raw
+    ids = bare_prime_launch_ids(
+        raw, html=html, episode=ep_num, prefer_episode=bool(play) or ep_num is not None
+    )
+    for lid in ids:
+        if lid and PRIME_DETAIL_ID_RE.match(lid):
+            print(f"  Storefront launch: first detail in candidates {lid}", file=sys.stderr)
+            return lid
+    fallback = (ids[0] if ids else raw)
+    print(f"  Storefront launch: fallback {fallback}", file=sys.stderr)
+    return fallback
+
+
+def amazoff_play_launch_id(
+    content_id: str,
+    *,
+    html: str | None,
+    episode: int | None,
+    play: bool,
+) -> str:
+    """contentTarget string AmazOff/Prime ignition actually opens.
+
+    AmazOff (github.com/azoffshowy/AmazOff) does **not** rewrite launches.
+    It only hijacks ``cloudfront.xp-assets.aiv-cdn.net`` to serve a patched
+    ``ATVUnfPlayerBundle.js`` (strip ads). ``appinfo.json`` maps
+    ``contentId`` → ``contentTarget: $CONTENTID`` unchanged.
+
+    On this TV that means:
+      • season ``0…`` id → ignored (Home / Reacher)
+      • ``/detail/0…`` or bare ``0…`` → title shell / "currently unavailable"
+      • episode ``amzn1.dv.gti.*`` as contentId → the chosen episode page
+    """
+    raw = (content_id or "").strip()
+    ep_num = episode if episode is not None and episode >= 1 else None
+    ids = bare_prime_launch_ids(
+        raw,
+        html=html,
+        episode=ep_num,
+        prefer_episode=bool(play) or ep_num is not None,
+    )
+    for lid in ids:
+        if lid and PRIME_GTI_RE.match(lid):
+            print(f"  AmazOff launch: GTI {lid}", file=sys.stderr)
+            return lid
+    print(
+        f"  AmazOff launch: no GTI in {ids[:4]!r}; falling back to catalog id",
+        file=sys.stderr,
+    )
+    return storefront_launch_id(raw, html=html, episode=episode, play=play)
+
+
+def none_picker_real_count() -> int:
+    """How many real avatars sit above the trailing + / New tile."""
+    try:
+        n = max(
+            (entry.index for ptype, entry in list_profiles() if ptype == "none"),
+            default=-1,
+        )
+        if n >= 0:
+            return n + 1
+    except Exception:
+        pass
+    return 3
+
+
+def _last_profile_focus_path() -> Path:
+    return APP_CACHE_DIR / "last-prime-profile.txt"
+
+
+def clear_last_profile_focus() -> None:
+    """Drop the guessed last-avatar file."""
+    path = _last_profile_focus_path()
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def read_last_profile_focus() -> int | None:
+    path = _last_profile_focus_path()
+    try:
+        n = int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return n if n >= 0 else None
+
+
+def write_last_profile_focus(index: int) -> None:
+    path = _last_profile_focus_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{index}\n")
+    except OSError:
+        pass
+
+
+def profile_nav_keys(
+    profile: int,
+    *,
+    row: int = 0,
+    profile_type: str = "none",
+    list_size: int | None = None,
+    last_focused: int | None = None,
+) -> list[str]:
+    """D-pad keys to a real profile. Never move onto + / New.
+
+    Highlighting New opens Adult/Kids. After a failed run last-used is New.
+    From New, one UP is D. From D, do not DOWN (that is New).
+    """
+    if profile < 0:
+        raise ValueError("profile must be >= 0")
+    if row < 0:
+        raise ValueError("profile-row must be >= 0")
+    if profile_type not in PRIME_PROFILE_TYPES:
+        raise ValueError(
+            f"profile-type must be one of {PRIME_PROFILE_TYPES}, not {profile_type!r}"
+        )
+    if profile_type != "none":
+        keys: list[str] = []
+        keys.extend(["LEFT"] * PROFILE_HOME_STEPS)
+        keys.extend(["DOWN"] * row)
+        keys.extend(["RIGHT"] * profile)
+        return keys
+
+    size = list_size if list_size is not None else none_picker_real_count()
+    size = max(size, profile + 1, 1)
+    last_real = size - 1
+    new_index = size
+    target = min(profile, last_real)
+    start = new_index if last_focused is None else last_focused
+    if start > last_real:
+        start = new_index
+
+    keys: list[str] = []
+    if start == target:
+        pass
+    elif start == new_index:
+        keys.extend(["UP"] * (new_index - target))
+    elif start < target:
+        keys.extend(["DOWN"] * (target - start))
+    else:
+        keys.extend(["UP"] * (start - target))
+    return keys
 
 
 def _prime_target_with_start_offset(target: str, pos: int) -> str:
@@ -725,7 +1050,7 @@ def resolve_profile_selection(
     profile_pin: str | None,
 ) -> tuple[int, int, str | None, str | None, str]:
     """Return (index, row, pin, display_name, picker_type) from --profile or --profile-name."""
-    if profile_name:
+    if profile_name and profile is None:
         resolved_type, entry = resolve_profile_name(
             profile_name,
             profile_type=profile_type,
@@ -735,7 +1060,39 @@ def resolve_profile_selection(
         return entry.index, row, pin, entry.name, resolved_type
     if profile is None:
         raise ValueError("either --profile or --profile-name is required")
-    return profile, profile_row, profile_pin, None, profile_type or "adult"
+    # Settings sends both index and name. The index is the TV slot; do not let
+    # a leftover Adult/Kids mapping change the picker type or the slot.
+    display = profile_name.strip() if profile_name else None
+    return profile, profile_row, profile_pin, display, profile_type or "none"
+
+
+async def wait_for_prime_profile_picker(
+    client: "WebOsClient",
+    *,
+    extra: float = 2.0,
+    timeout: float = 10.0,
+) -> None:
+    """Wait until Prime is in front, then a short beat for the avatar list.
+
+    A fixed 14s sleep made warm starts look stuck on the profile screen.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + max(timeout, extra)
+    while loop.time() < deadline:
+        app_id = await _current_app_id(client)
+        if _is_prime_app(app_id):
+            print(
+                f"  Prime in foreground ({app_id or 'amazon'}); "
+                f"waiting {extra:.1f}s for the profile list ...",
+                file=sys.stderr,
+            )
+            await asyncio.sleep(max(0.0, extra))
+            return
+        await asyncio.sleep(0.35)
+    print(
+        "  Prime not reported in foreground yet; sending profile keys anyway ...",
+        file=sys.stderr,
+    )
 
 
 async def select_profile(
@@ -744,7 +1101,7 @@ async def select_profile(
     *,
     delay: float = DEFAULT_PROFILE_DELAY,
     row: int = 0,
-    profile_type: str = "adult",
+    profile_type: str = "none",
     profile_type_right: int | None = None,
     profile_step_delay: float = DEFAULT_PROFILE_STEP_DELAY,
     pin: str | None = None,
@@ -754,9 +1111,16 @@ async def select_profile(
 ) -> None:
     """Pick a Prime Video profile on the name picker (after optional type step).
 
-    Newer Prime builds ask for profile type (Adult/Kids) first, then profile name.
-    Use --profile-type adult and --profile 0 for the first adult name. Legacy
-    single-screen pickers can use --profile-type none.
+    Default is a single-screen picker (``profile_type="none"``): a vertical list
+    of profiles (device capture: Margaret Evans / Kids / D / New). Index moves
+    with DOWN, not RIGHT.
+
+    Last-used is pre-focused, so we home to the first avatar (UP / LEFT) before
+    applying the index. One ENTER — a second ENTER re-opens the picker or
+    activates Home.
+
+    Two-step Adult/Kids UIs use ``--profile-type adult|kid`` then a horizontal
+    name row (RIGHT for index).
     """
     if profile < 0:
         raise ValueError("profile must be >= 0")
@@ -767,14 +1131,35 @@ async def select_profile(
             f"profile-type must be one of {PRIME_PROFILE_TYPES}, not {profile_type!r}"
         )
 
-    row_note = f", row {row}" if row else ""
+    size = none_picker_real_count() if profile_type == "none" else 0
+    # Prime pre-focuses last-used. Do not trust a saved "we are on D" after a
+    # play that actually selected Kids — ENTER-only then keeps picking Kids.
+    # Never BACK (that quits Prime). Never UP off D onto Kids.
+    last = read_last_profile_focus()
+    if last is None and profile_type == "none":
+        # Prime pre-focuses last-used. After a successful D select that is D.
+        # Do not assume Kids (DOWN from D is New).
+        last = profile
+    nav = profile_nav_keys(
+        profile,
+        row=row,
+        profile_type=profile_type,
+        list_size=size or None,
+        last_focused=last,
+    )
     label = profile_display_name or f"profile {profile}"
     action = "highlighting" if highlight_only else "selecting"
     print(
-        f"  Waiting {delay:.1f}s for profile picker, then {action} "
-        f"{label!r} (index {profile}{row_note}) ..."
+        f"  Waiting for profile picker, then {action} "
+        f"{label!r} (type={profile_type}, index {profile}, "
+        f"assume-focus={last}, keys={'+'.join(nav) or 'ENTER only'}) ...",
+        file=sys.stderr,
     )
-    await asyncio.sleep(delay)
+    await wait_for_prime_profile_picker(
+        client,
+        extra=9.0,
+        timeout=18.0,
+    )
 
     await select_profile_type(
         client,
@@ -786,13 +1171,16 @@ async def select_profile(
         print(f"  Waiting {profile_step_delay:.1f}s for profile name picker ...")
         await asyncio.sleep(profile_step_delay)
 
-    for _ in range(row):
-        await client.button("DOWN")
-        await asyncio.sleep(PROFILE_KEY_DELAY)
-
-    for _ in range(profile):
-        await client.button("RIGHT")
-        await asyncio.sleep(PROFILE_KEY_DELAY)
+    print(
+        f"  Profile keys → slot {profile}: {nav or ['ENTER']}",
+        file=sys.stderr,
+    )
+    for key in nav:
+        print(f"  → {key}", file=sys.stderr)
+        await client.button(key)
+        await asyncio.sleep(0.7)
+    if nav:
+        await asyncio.sleep(0.9)
 
     if highlight_only:
         print(
@@ -802,7 +1190,15 @@ async def select_profile(
         return
 
     await client.button("ENTER")
-    print(f"  {label!r} selected.")
+    print(
+        f"  {label!r} selected (type={profile_type}, ENTER×1, nav={'+'.join(nav) or 'none'}). "
+        "No BACK (that quits Prime).",
+        file=sys.stderr,
+    )
+    # Only record last-used when we actually moved onto the Settings slot.
+    # Writing the target after ENTER-only is how we kept selecting Kids.
+    if profile_type == "none" and not highlight_only:
+        write_last_profile_focus(profile)
 
     if pin:
         await enter_profile_pin(client, pin, delay=pin_delay)
@@ -1257,6 +1653,7 @@ async def cmd_launch_prime(
     close_after_profile: bool = False,
     skip_entitlement_check: bool = False,
     episode: int | None = None,
+    title: str | None = None,
     start: int = 0,
     set_subtitles: str | None = None,
     subtitle_delay: float = DEFAULT_SUBTITLE_DELAY,
@@ -1267,17 +1664,26 @@ async def cmd_launch_prime(
     subtitle_menu_down: int | None = None,
 ) -> None:
     profile_display_name: str | None = None
-    effective_profile_type = profile_type or "adult"
+    # Default single-screen vertical picker (see select_profile docstring / 0.mp4).
+    effective_profile_type = profile_type or "none"
     detail_html: str | None = None
     used_autoplay_launch = False
     title_page_settled = False
+    skip_watch_enter = False
+    html_fetch: asyncio.Task[str | None] | None = None
     if content_id and not skip_entitlement_check:
-        detail_html = fetch_prime_detail_html(content_id)
-        if detail_html:
-            report_prime_entitlement(content_id, html=detail_html)
-    print(f"[CMD-LAUNCH] content_id={content_id} episode={episode} play={play} start={start} profile={profile}", file=sys.stderr)
+        html_fetch = asyncio.create_task(
+            asyncio.to_thread(fetch_prime_detail_html, content_id)
+        )
+    print(
+        f"[CMD-LAUNCH] content_id={content_id} episode={episode} play={play} "
+        f"start={start} profile={profile} profile_type={effective_profile_type}",
+        file=sys.stderr,
+    )
 
     if browser:
+        if html_fetch is not None:
+            html_fetch.cancel()
         if not content_id:
             print("error: --browser requires --content-id", file=sys.stderr)
             sys.exit(2)
@@ -1288,10 +1694,11 @@ async def cmd_launch_prime(
         print("  Done.")
         return
 
-    if profile_name is not None:
-        if profile is not None:
+    if profile_name is not None or profile is not None:
+        if profile is not None and profile_name:
             print(
-                "  Note: --profile-name overrides --profile index.",
+                f"  Using Settings slot {profile} ({profile_name!r}); "
+                "single-screen picker (no Adult/Kids step).",
                 file=sys.stderr,
             )
         (
@@ -1301,9 +1708,9 @@ async def cmd_launch_prime(
             profile_display_name,
             effective_profile_type,
         ) = resolve_profile_selection(
-            profile=None,
-            profile_name=profile_name,
-            profile_type=profile_type,
+            profile=profile,
+            profile_name=profile_name if profile is None else profile_name,
+            profile_type=profile_type or "none",
             profile_row=profile_row,
             profile_pin=profile_pin,
         )
@@ -1316,47 +1723,35 @@ async def cmd_launch_prime(
         )
 
     if profile is not None and content_id is not None:
-        # NEVER open bare Prime home before profile keys (home-rail picks wrong
-        # titles like "Jesy Nelson"). And NEVER re-deep-link after profile:
-        # a second content launch re-opens the profile picker (users saw:
-        # profile → title → profile again → homepage without Resume focused).
-        #
-        # One content deep link → profile picker gates on that title → after
-        # profile selection Prime lands on the hub → focus Resume → ENTER.
-        #
-        # For play without seek on ep≤1: launch the season/series hub so the
-        # hero "Resume Sx Ey" CTA is present (not a one-shot episode flash).
-        launch_episode = episode
-        if play and not (start and start > 0) and (episode is None or episode <= 1):
-            launch_episode = None
-            print(
-                "  Using series/season hub for Resume/Watch CTA "
-                f"(requested episode={episode}).",
-                file=sys.stderr,
-            )
-        elif start and start > 0:
-            launch_episode = episode
+        # AmazOff does not rewrite launches (only the player JS bundle).
+        # Season 0-ids and /detail/0-ids miss or show "unavailable".
+        # Episode GTI as contentId opened the series; a second launch
+        # re-opened the picker (handlesRelaunch: true). One GTI → D → Watch.
+        if html_fetch is not None:
+            try:
+                detail_html = await asyncio.wait_for(html_fetch, timeout=15.0)
+            except Exception as exc:
+                print(f"  Warning: detail fetch failed ({exc})", file=sys.stderr)
+                detail_html = None
+            if detail_html:
+                report_prime_entitlement(content_id, html=detail_html)
 
-        print("  Prime flow: content deep link → profile once → Resume/play")
+        launch_id = amazoff_play_launch_id(
+            content_id.strip(),
+            html=detail_html,
+            episode=episode,
+            play=bool(play),
+        )
         print(
-            f"[PLAY] content-gate: content_id={content_id} episode={launch_episode} "
-            f"start={start} close_after_profile={close_after_profile}",
+            f"[PLAY] series gate content_id={content_id} episode={episode} "
+            f"launch_id={launch_id}",
             file=sys.stderr,
         )
-        # Always request autoplay when we intend to play — otherwise the player
-        # starts, shows "Turn on subtitles", and a later ENTER opens that menu.
-        use_autoplay = bool(play) or bool(start and start > 0)
-        _, used_autoplay_launch = await launch_prime_content_candidates(
-            client,
-            content_id,
-            try_all_ids=try_all_ids,
-            cold_start=False,
-            detail_html=detail_html,
-            episode=launch_episode,
-            prefer_episode=launch_episode is not None,
-            autoplay=use_autoplay,
-            start=start,
+
+        result = await launch_prime_content(
+            client, launch_id, cold_start=False
         )
+        _check_launch_result(result)
         await select_profile(
             client,
             profile,
@@ -1373,32 +1768,39 @@ async def cmd_launch_prime(
         if profile_highlight:
             print("  Done (profile highlight only).")
             return
+
+        # One launch only. A second amazon launch (even with the GTI) returns
+        # to the profile picker and play stops there.
+        print(
+            "  Waiting 6s on the title after profile "
+            "(no second launch — that re-opens the picker) ...",
+            file=sys.stderr,
+        )
+        await asyncio.sleep(6.0)
+
         if close_after_profile:
-            # Rare: force a cold content launch after profile without a second
-            # picker cycle on builds that drop the deep link at the gate.
+            print("  --close-after-profile: closing and re-launching content ...")
             if await close_app(client, PRIME_VIDEO_APP_ID):
                 await asyncio.sleep(1.5)
-            _, used_autoplay_launch = await launch_prime_content_candidates(
-                client,
-                content_id,
-                try_all_ids=try_all_ids,
-                cold_start=False,
-                detail_html=detail_html,
-                episode=launch_episode,
-                prefer_episode=launch_episode is not None,
-                autoplay=use_autoplay,
-                start=start,
+            result = await launch_prime_content(
+                client, launch_id, cold_start=False
             )
+            _check_launch_result(result)
+            await asyncio.sleep(5.0)
 
-        print(f"[PLAY] after profile used_autoplay={used_autoplay_launch}", file=sys.stderr)
-        # After profile, give the deep link / player time to paint. Prefer
-        # autoplay+PLAY over ENTER on player chrome.
-        settle = max(content_delay, DEFAULT_PLAY_DELAY) if play else content_delay
-        if settle > 0:
-            print(f"  Waiting {settle:.1f}s for the title / player ...")
-            await asyncio.sleep(settle)
-            title_page_settled = True
+        # Title page is up (user: series appears after D). ENTER Watch.
+        # Not a second launch. Not Home hero.
+        used_autoplay_launch = False
+        title_page_settled = True
+        skip_watch_enter = not play
+        _ = title
     elif content_id is not None:
+        if html_fetch is not None:
+            try:
+                detail_html = await html_fetch
+            except Exception as exc:
+                print(f"  Warning: detail fetch failed ({exc})", file=sys.stderr)
+                detail_html = None
         print(f"[PLAY] no-profile direct launch path: content_id={content_id} episode={episode} play={play} start={start}", file=sys.stderr)
         use_autoplay = bool(play) or bool(start and start > 0)
         _, used_autoplay_launch = await launch_prime_content_candidates(
@@ -1431,6 +1833,8 @@ async def cmd_launch_prime(
                 print("  Done (profile highlight only).")
                 return
     else:
+        if html_fetch is not None:
+            html_fetch.cancel()
         result = await launch_app(client, PRIME_VIDEO_APP_ID)
         _check_launch_result(result)
         if profile is not None:
@@ -1483,6 +1887,12 @@ async def cmd_launch_prime(
             print(
                 f"  Skipping auto-play: this title is only available via {label}. "
                 "Opened the title page so you can start it manually."
+            )
+        elif skip_watch_enter:
+            print(
+                "  Skipping Watch ENTER — not on a title page "
+                "(avoids Adult/Kids and the Home hero).",
+                file=sys.stderr,
             )
         else:
             await start_playback(
@@ -1539,6 +1949,7 @@ async def cmd_launch(
     close_after_profile: bool = False,
     skip_entitlement_check: bool = False,
     episode: int | None = None,
+    title: str | None = None,
     start: int = 0,
     set_subtitles: str | None = None,
     subtitle_delay: float = DEFAULT_SUBTITLE_DELAY,
@@ -1575,6 +1986,7 @@ async def cmd_launch(
             close_after_profile=close_after_profile,
             skip_entitlement_check=skip_entitlement_check,
             episode=episode,
+            title=title,
             start=start,
             set_subtitles=set_subtitles,
             subtitle_delay=subtitle_delay,
@@ -1593,7 +2005,7 @@ async def cmd_launch(
     result = await launch_app(client, app_id, content_id=content_id)
     _check_launch_result(result)
     profile_display_name: str | None = None
-    effective_profile_type = profile_type or "adult"
+    effective_profile_type = profile_type or "none"
     if profile_name is not None:
         (
             profile,
@@ -1651,11 +2063,21 @@ Use --profile-highlight to verify the mapped index on TV.""",
     parser.add_argument("ip", nargs="?", default=DEFAULT_IP, help="TV IP address")
     parser.add_argument("--info", action="store_true", help="Show TV info & state")
     parser.add_argument("--apps", action="store_true", help="List installed apps")
+    parser.add_argument(
+        "--detect-amazoff",
+        action="store_true",
+        help="Print JSON whether AmazOff (com.amazoff.patcher) is installed on the TV",
+    )
     parser.add_argument("--launch", metavar="APP_ID", help="Launch an app by ID")
     parser.add_argument(
         "--content-id",
         metavar="ID",
         help="Optional contentId passed to the launched app (e.g. Prime ASIN, YouTube v=...)",
+    )
+    parser.add_argument(
+        "--title",
+        metavar="NAME",
+        help="Title to open via Prime in-app search after the profile picker (AmazOff ignores most deep links)",
     )
     parser.add_argument(
         "--profile",
@@ -1683,8 +2105,9 @@ Use --profile-highlight to verify the mapped index on TV.""",
         choices=PRIME_PROFILE_TYPES,
         default=None,
         help=(
-            "Prime profile picker step 1: adult, kid, or none for legacy single-screen "
-            "pickers (default adult with --profile; auto from --profile-name when saved)"
+            "Prime profile picker: none = single vertical list (default; DOWN for index); "
+            "adult/kid = two-step Adult/Kids then horizontal names (RIGHT for index). "
+            "Auto from --profile-name when saved."
         ),
     )
     parser.add_argument(
@@ -2050,6 +2473,152 @@ async def _prefer_remote_keys(client: "WebOsClient") -> bool:
     if app_id is None:
         return True
     return _is_prime_app(app_id)
+
+
+async def _ime_is_focused(client: "WebOsClient") -> bool:
+    """True when an on-screen keyboard has a text field (add-profile name)."""
+    try:
+        result = await client.request(
+            "com.webos.service.ime/insertText",
+            {"text": "", "replace": False},
+        )
+        return bool(result.get("returnValue", False))
+    except Exception as exc:
+        print(
+            f"  IME focus check failed ({exc}) — assuming no keyboard.",
+            file=sys.stderr,
+        )
+        return False
+
+
+async def dismiss_add_profile_keyboard(client: "WebOsClient") -> bool:
+    """If ENTER hit + / New, the add-profile keyboard is up. BACK to the list.
+
+    Do not type a name and do not ENTER — that submits the wizard and opens
+    Adult/Kids. One BACK only: BACK on the avatar list can leave Prime.
+    """
+    if not await _ime_is_focused(client):
+        return False
+    print(
+        "  Keyboard after profile ENTER — Add profile (New), not Search. "
+        "BACK (not typing a name).",
+        file=sys.stderr,
+    )
+    await client.button("BACK")
+    await asyncio.sleep(1.4)
+    return True
+
+
+async def _ime_insert_text(client: "WebOsClient", text: str, *, replace: bool = True) -> bool:
+    """Type into the focused IME field via com.webos.service.ime/insertText."""
+    try:
+        result = await client.request(
+            "com.webos.service.ime/insertText",
+            {"text": text, "replace": replace},
+        )
+        ok = bool(result.get("returnValue", False))
+        print(f"  IME insertText ok={ok} text={text!r}", file=sys.stderr)
+        return ok
+    except Exception as exc:
+        print(f"  IME insertText failed: {exc}", file=sys.stderr)
+        return False
+
+
+async def _ime_send_enter(client: "WebOsClient") -> bool:
+    try:
+        result = await client.request("com.webos.service.ime/sendEnterKey", {})
+        ok = bool(result.get("returnValue", True))
+        print(f"  IME sendEnterKey ok={ok}", file=sys.stderr)
+        return ok
+    except Exception as exc:
+        print(f"  IME sendEnterKey failed: {exc}", file=sys.stderr)
+        return False
+
+
+def _prime_search_targets(title: str) -> list[str]:
+    """Launch targets that should open Prime's search page for `title`."""
+    q = urllib.parse.quote(title)
+    return [
+        f"/search?phrase={q}",
+        f"{PRIME_DEEP_LINK_BASE}/search?phrase={q}",
+        f"{PRIME_WWW_BASE}/search?phrase={q}",
+    ]
+
+
+async def prime_search_open_title(
+    client: "WebOsClient",
+    title: str,
+) -> bool:
+    """Open a title via Prime search + IME. Return True if a result was opened.
+
+    Call only after the avatar list is gone. Never hardware-ENTER to submit
+    search — that plays the Home hero (Reacher) if Search is not focused.
+    """
+    title = (title or "").strip()
+    if not title:
+        print("  prime_search_open_title: empty title, skip", file=sys.stderr)
+        return False
+
+    print(
+        f"  Opening Prime search and typing {title!r} ...",
+        file=sys.stderr,
+    )
+    typed = False
+
+    # Prefer an in-app search page (no D-pad to the header Search chip).
+    for target in _prime_search_targets(title):
+        try:
+            print(f"  Search launch {target}", file=sys.stderr)
+            await client.launch_app_with_params(
+                PRIME_VIDEO_APP_ID,
+                {"contentTarget": target},
+            )
+            await asyncio.sleep(2.4)
+            typed = await _ime_insert_text(client, title, replace=True)
+        except Exception as exc:
+            print(f"  Search launch failed ({exc})", file=sys.stderr)
+            typed = False
+        if typed:
+            break
+
+    if not typed:
+        for attempt in range(2):
+            try:
+                await client.button("SEARCH")
+                await asyncio.sleep(2.2)
+                typed = await _ime_insert_text(client, title, replace=True)
+            except Exception as exc:
+                print(f"  SEARCH key failed ({exc})", file=sys.stderr)
+                typed = False
+            if typed:
+                break
+            print("  IME not focused after SEARCH — retrying ...", file=sys.stderr)
+            await asyncio.sleep(0.8)
+
+    if not typed:
+        print(
+            "  IME did not take the title — not pressing ENTER "
+            "(that starts Reacher on Home).",
+            file=sys.stderr,
+        )
+        return False
+
+    await asyncio.sleep(0.6)
+    if not await _ime_send_enter(client):
+        print(
+            "  IME Enter failed — not sending remote ENTER "
+            "(that starts Reacher on Home).",
+            file=sys.stderr,
+        )
+        return False
+    await asyncio.sleep(3.5)
+
+    await client.button("DOWN")
+    await asyncio.sleep(0.4)
+    await client.button("ENTER")
+    print(f"  Search: opened first result for {title!r}", file=sys.stderr)
+    await asyncio.sleep(4.0)
+    return True
 
 
 async def _send_button(client: "WebOsClient", name: str) -> bool:
@@ -2985,6 +3554,7 @@ async def cmd_power_on(ip: str, tv_mac: str | None = None) -> None:
         }))
     finally:
         await client.disconnect()
+        release_tv_ssap_lock()
 
 
 async def main() -> None:
@@ -3160,6 +3730,7 @@ async def main() -> None:
                 close_after_profile=args.close_after_profile,
                 skip_entitlement_check=args.skip_entitlement_check,
                 episode=args.episode,
+                title=args.title,
                 start=int(args.start) if args.start else 0,
                 set_subtitles=args.set_subtitles,
                 subtitle_delay=args.subtitle_delay,
@@ -3220,10 +3791,13 @@ async def main() -> None:
             await cmd_get_position(client)
         elif args.apps:
             await cmd_apps(client)
+        elif args.detect_amazoff:
+            await cmd_detect_amazoff(client)
         else:
             await cmd_info(client)
     finally:
         await client.disconnect()
+        release_tv_ssap_lock()
 
 
 if __name__ == "__main__":

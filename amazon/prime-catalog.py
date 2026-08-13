@@ -96,6 +96,10 @@ class PrimeTitle:
 
     def access_label(self) -> str:
         """Short token for how the title can be watched."""
+        if is_known_non_prime_membership_title(self.title):
+            if self.included_with_channel:
+                return "Channel"
+            return "Rent/Buy"
         if self.included_with_prime or self.prime_catalog:
             return "Prime"
         if self.included_with_channel:
@@ -314,6 +318,7 @@ def entity_to_title(entity: dict[str, Any], *, source: str) -> PrimeTitle | None
     cues = entity.get("entitlementCues")
     if isinstance(cues, dict) and cues.get("entitlementType"):
         apply_entitlement_cues(item, cues)
+    demote_known_non_prime_membership(item)
     return item
 
 
@@ -578,6 +583,37 @@ def _entities_to_titles(
     return dedupe_titles(titles)
 
 
+# Amazon's "Included with Prime" storefront still cards these as Prime-trial /
+# isPrime titles. They are not watchable with a Prime membership (add-on, Max,
+# or buy). Unsigned listing cues are identical to real Prime shows (same
+# "7 day free Prime trial" copy), so title match is the reliable filter.
+NON_PRIME_MEMBERSHIP_TITLE_PREFIXES: tuple[str, ...] = (
+    "the vampire diaries",
+)
+
+
+def is_known_non_prime_membership_title(title: str | None) -> bool:
+    text = (title or "").strip().lower()
+    if not text:
+        return False
+    for prefix in NON_PRIME_MEMBERSHIP_TITLE_PREFIXES:
+        if text == prefix or text.startswith(f"{prefix} ") or text.startswith(f"{prefix}:") or text.startswith(f"{prefix} -"):
+            return True
+    return False
+
+
+def demote_known_non_prime_membership(item: PrimeTitle) -> None:
+    """Clear Prime-membership flags so the UI hides the title (show_rent_buy off)."""
+    if not is_known_non_prime_membership_title(item.title):
+        return
+    item.included_with_prime = False
+    item.prime_catalog = False
+    if item.included_with_channel or item.rent_from or item.buy_from:
+        return
+    item.availability = "Get an add-on subscription or buy"
+    item.focus_message = "Get an add-on subscription or buy"
+
+
 COLLECTION_ALIASES: dict[str, str] = {
     # Prime Video's /collection/TopRatedMovies page is empty; TopRated has the catalog.
     "TopRatedMovies": "TopRated",
@@ -749,8 +785,11 @@ def list_collection(
                 item.included_with_channel is None
                 and not item.rent_from
                 and not item.buy_from
+                and not is_known_non_prime_membership_title(item.title)
             ):
                 item.included_with_prime = True
+        for item in items:
+            demote_known_non_prime_membership(item)
     elif kind == "genre":
         # For genre storefronts, the primary rows ("Movies", "TV shows", etc.)
         # usually surface included-with-Prime titles; the "Explore: Rent..." ones
@@ -765,8 +804,11 @@ def list_collection(
                 item.included_with_channel is None
                 and not item.rent_from
                 and not item.buy_from
+                and not is_known_non_prime_membership_title(item.title)
             ):
                 item.included_with_prime = True
+        for item in items:
+            demote_known_non_prime_membership(item)
 
     return merge_hero_banner_images(html, items)
 
@@ -958,6 +1000,7 @@ def _apply_entitlement_fields(item: PrimeTitle, ent) -> None:
     item.prime_catalog = getattr(ent, "prime_catalog", None)
     if ent.gti and not item.gti:
         item.gti = ent.gti.removeprefix("amzn1.dv.gti.")
+    demote_known_non_prime_membership(item)
 
 
 def apply_entitlement_cues(item: PrimeTitle, cues: dict) -> None:

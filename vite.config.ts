@@ -7,14 +7,15 @@ export default defineConfig(async () => ({
   plugins: [react()],
   clearScreen: false,
   server: {
-    port: 5173,
+    // Unique ports so other Tauri/Vite apps on 5173 (NeoPad, etc.) do not collide.
+    port: 14217,
     strictPort: true,
     host: host || false,
     hmr: host
       ? {
           protocol: "ws",
           host,
-          port: 5183,
+          port: 14218,
         }
       : undefined,
     watch: {

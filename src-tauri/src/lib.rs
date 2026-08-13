@@ -75,6 +75,9 @@ async fn run_tv_command(
 pub struct AppConfig {
     pub tv_ip: String,
     pub profile: i32,
+    /// Named Prime picker profile (see ~/.lg-tv-prime-profiles.json). Wins over index.
+    #[serde(default)]
+    pub profile_name: String,
     pub project_root: String,
     /// Cache TTL in seconds (default 6 hours).
     #[serde(default = "default_ttl")]
@@ -82,7 +85,7 @@ pub struct AppConfig {
     /// Show titles that are included with a Prime subscription.
     #[serde(default = "default_true")]
     pub show_prime: bool,
-    /// Show titles available via a channel add-on (e.g. Lionsgate+, Max).
+    /// Show titles available via a channel add-on (e.g. HBO, Max, Lionsgate+).
     #[serde(default = "default_false")]
     pub show_channel: bool,
     /// Show titles that require renting or buying.
@@ -183,6 +186,7 @@ impl Default for AppConfig {
         AppConfig {
             tv_ip: "192.168.0.79".to_string(),
             profile: 0,
+            profile_name: String::new(),
             project_root: default_project_root().to_string_lossy().to_string(),
             cache_ttl_secs: default_ttl(),
             show_prime: true,
@@ -295,9 +299,16 @@ fn open_prime_player_window(app: &tauri::AppHandle, url: Url, title: &str) -> Re
         .title(window_title)
         .inner_size(1280.0, 720.0)
         .min_inner_size(640.0, 360.0)
+        .data_directory(prime_player_data_dir())
         .build()
         .map_err(|e| format!("Failed to open Prime player window: {e}"))?;
     Ok(())
+}
+
+fn prime_player_data_dir() -> PathBuf {
+    let dir = cache_dir().join("webview").join("prime-player");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 fn config_path() -> PathBuf {
@@ -409,6 +420,51 @@ fn bookmark_content_id(item: &serde_json::Value) -> Result<String, String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Now-playing session (survives app restarts; does not query the TV)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Last title this app launched / tracked in the dock.
+/// Restored on startup so the UI still shows "what was playing" after a relaunch.
+/// This is local app state only — the TV is not re-queried for the title.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NowPlayingSession {
+    pub item: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode: Option<i32>,
+    /// Series/season detail id when an episode is playing (for seek/resume).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series_content_id: Option<String>,
+    pub updated_at: u64,
+}
+
+fn now_playing_path() -> PathBuf {
+    home_dir()
+        .join(".config")
+        .join("prime-remote-control-now-playing.json")
+}
+
+fn load_now_playing_session() -> Option<NowPlayingSession> {
+    let path = now_playing_path();
+    let raw = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn save_now_playing_to_disk(session: &NowPlayingSession) -> Result<(), String> {
+    let path = now_playing_path();
+    ensure_dir(&path)?;
+    let data = serde_json::to_string_pretty(session).map_err(|e| e.to_string())?;
+    std::fs::write(&path, data).map_err(|e| e.to_string())
+}
+
+fn clear_now_playing_on_disk() -> Result<(), String> {
+    let path = now_playing_path();
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Filesystem helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -503,22 +559,21 @@ async fn handle_image_conn(mut conn: tokio::net::TcpStream) {
             .chars()
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.');
 
-    let cache_dir = image_cache_dir();
-    let file_path = cache_dir.join(&filename);
-
     if safe_name {
-        if let Ok(data) = tokio::fs::read(&file_path).await {
-            let header = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: image/jpeg\r\n\
-                 Content-Length: {}\r\n\
-                 Cache-Control: max-age=86400\r\n\
-                 Access-Control-Allow-Origin: *\r\n\r\n",
-                data.len()
-            );
-            let _ = conn.write_all(header.as_bytes()).await;
-            let _ = conn.write_all(&data).await;
-            return;
+        if let Some(file_path) = resolve_cached_image(&filename) {
+            if let Ok(data) = tokio::fs::read(&file_path).await {
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: image/jpeg\r\n\
+                     Content-Length: {}\r\n\
+                     Cache-Control: max-age=86400\r\n\
+                     Access-Control-Allow-Origin: *\r\n\r\n",
+                    data.len()
+                );
+                let _ = conn.write_all(header.as_bytes()).await;
+                let _ = conn.write_all(&data).await;
+                return;
+            }
         }
     }
 
@@ -540,7 +595,24 @@ struct CacheEntry {
 }
 
 fn cache_dir() -> PathBuf {
-    home_dir().join(".cache").join("prime-catalog-ui")
+    // Isolated from lgtv-fun / prime-catalog-ui and other same-stack tools.
+    home_dir().join(".cache").join("prime-remote-control")
+}
+
+fn legacy_image_cache_dir() -> PathBuf {
+    home_dir().join(".cache").join("prime-catalog-ui").join("images")
+}
+
+fn resolve_cached_image(filename: &str) -> Option<PathBuf> {
+    let ours = image_cache_dir().join(filename);
+    if ours.is_file() {
+        return Some(ours);
+    }
+    let legacy = legacy_image_cache_dir().join(filename);
+    if legacy.is_file() {
+        return Some(legacy);
+    }
+    None
 }
 
 /// Sanitise a cache key to a safe filename.
@@ -638,7 +710,6 @@ fn write_stored_region(region: &str) -> Result<(), String> {
 
 /// Scrape Prime Video's detected storefront country from a lightweight page.
 fn detect_prime_region() -> Option<String> {
-    const MARKER: &str = "\"countryCode\":\"";
     let response = ureq::get("https://www.primevideo.com/categories")
         .set(
             "User-Agent",
@@ -650,15 +721,24 @@ fn detect_prime_region() -> Option<String> {
         .call()
         .ok()?;
     let html = response.into_string().ok()?;
-    let start = html.find(MARKER)? + MARKER.len();
-    let rest = &html[start..];
-    let end = rest.find('"')?;
-    let region = rest[..end].trim().to_string();
-    if region.is_empty() {
-        None
-    } else {
-        Some(region)
+    // Current Prime pages use currentTerritory; older ones used "countryCode":"...".
+    const MARKERS: &[&str] = &[
+        "\"currentTerritory\":\"",
+        "\"countryCode\":\"",
+        "currentTerritory\":\"",
+    ];
+    for marker in MARKERS {
+        if let Some(pos) = html.find(marker) {
+            let rest = &html[pos + marker.len()..];
+            if let Some(end) = rest.find('"') {
+                let region = rest[..end].trim();
+                if region.len() == 2 && region.chars().all(|c| c.is_ascii_alphabetic()) {
+                    return Some(region.to_ascii_uppercase());
+                }
+            }
+        }
     }
+    None
 }
 
 fn clear_catalog_cache_files() {
@@ -858,6 +938,145 @@ fn open_tmdb_trailer(query: String, media_kind: String) -> Result<(), String> {
 // Tauri commands — config
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrimeProfileInfo {
+    pub name: String,
+    pub index: i32,
+    pub row: i32,
+    pub profile_type: String,
+}
+
+fn prime_profiles_path() -> PathBuf {
+    home_dir().join(".lg-tv-prime-profiles.json")
+}
+
+/// Named Prime picker slots from ~/.lg-tv-prime-profiles.json (used by Settings / play).
+#[tauri::command]
+async fn list_prime_profiles() -> Result<Vec<PrimeProfileInfo>, String> {
+    let path = prime_profiles_path();
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let data: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let Some(profiles) = data.get("profiles").and_then(|v| v.as_object()) else {
+        return Ok(vec![]);
+    };
+    let mut out = Vec::new();
+    // Single-screen list first (current AmazOff picker), then adult/kid.
+    for ptype in ["none", "adult", "kid"] {
+        let Some(arr) = profiles.get(ptype).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for entry in arr {
+            let name = entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if name.is_empty() {
+                continue;
+            }
+            let index = entry.get("index").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let row = entry.get("row").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            out.push(PrimeProfileInfo {
+                name: name.to_string(),
+                index,
+                row,
+                profile_type: ptype.to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AmazoffStatus {
+    detected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+}
+
+/// Ask the TV whether AmazOff (`com.amazoff.patcher`) is installed.
+/// Returns `detected: false` when the TV is off or the list fails — Settings
+/// only mentions AmazOff when this is true.
+#[tauri::command]
+async fn detect_amazoff() -> Result<AmazoffStatus, String> {
+    let _tv = tv_cmd_lock().lock().await;
+    let cfg = load_config();
+    let ip = cfg.tv_ip.trim();
+    if ip.is_empty() {
+        return Ok(AmazoffStatus {
+            detected: false,
+            app_id: None,
+            title: None,
+            version: None,
+        });
+    }
+    let root = resolve_project_root(&cfg);
+    let python = python_exe(&root);
+    let script = root
+        .join("amazon")
+        .join("lg-tv-connect.py")
+        .to_string_lossy()
+        .to_string();
+
+    let mut cmd = tokio::process::Command::new(&python);
+    cmd.current_dir(&root)
+        .arg(&script)
+        .arg(ip)
+        .arg("--detect-amazoff")
+        .env("LG_TV_CONNECT_ATTEMPTS", "1")
+        .env("LG_TV_CONNECT_TIMEOUT", "8");
+    let output = match run_tv_command(cmd, Duration::from_secs(20)).await {
+        Ok(out) => out,
+        Err(_) => {
+            return Ok(AmazoffStatus {
+                detected: false,
+                app_id: None,
+                title: None,
+                version: None,
+            });
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or("");
+    if json_line.is_empty() {
+        return Ok(AmazoffStatus {
+            detected: false,
+            app_id: None,
+            title: None,
+            version: None,
+        });
+    }
+    let val: serde_json::Value = serde_json::from_str(json_line).unwrap_or(serde_json::json!({}));
+    Ok(AmazoffStatus {
+        detected: val.get("detected").and_then(|v| v.as_bool()).unwrap_or(false),
+        app_id: val
+            .get("app_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        title: val
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        version: val
+            .get("version")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    })
+}
+
 #[tauri::command]
 async fn get_config() -> Result<AppConfig, String> {
     Ok(load_config())
@@ -1002,6 +1221,31 @@ async fn toggle_bookmark(
     }
 }
 
+#[tauri::command]
+async fn get_now_playing() -> Result<Option<NowPlayingSession>, String> {
+    Ok(load_now_playing_session())
+}
+
+#[tauri::command]
+async fn save_now_playing(
+    item: serde_json::Value,
+    episode: Option<i32>,
+    series_content_id: Option<String>,
+) -> Result<(), String> {
+    let session = NowPlayingSession {
+        item,
+        episode,
+        series_content_id,
+        updated_at: now_secs(),
+    };
+    save_now_playing_to_disk(&session)
+}
+
+#[tauri::command]
+async fn clear_now_playing() -> Result<(), String> {
+    clear_now_playing_on_disk()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tauri commands — cache info
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1040,7 +1284,9 @@ async fn get_prime_region() -> String {
         return "unknown".to_string();
     }
     if let Some(stored) = read_stored_region() {
-        return stored;
+        if stored != "unknown" {
+            return stored;
+        }
     }
     // First time or no cache: compute via blocking I/O but on the blocking thread pool
     // so we don't starve async workers or (in some contexts) block the main event loop.
@@ -1057,6 +1303,15 @@ fn public_ip_state_path() -> PathBuf {
     cache_dir().join("public_ip.txt")
 }
 
+/// How long a stored egress IP may be reused. VPN exits change; a file from
+/// weeks ago (US hosting IP while the Mac is now in CH) is worse than a miss.
+const PUBLIC_IP_CACHE_TTL_SECS: u64 = 120;
+
+fn public_ip_cache_age_secs() -> Option<u64> {
+    let meta = std::fs::metadata(public_ip_state_path()).ok()?;
+    Some(meta.modified().ok()?.elapsed().ok()?.as_secs())
+}
+
 fn read_stored_public_ip() -> Option<(String, String)> {
     let raw = std::fs::read_to_string(public_ip_state_path()).ok()?;
     let mut parts = raw.trim().splitn(2, '|');
@@ -1067,6 +1322,14 @@ fn read_stored_public_ip() -> Option<(String, String)> {
     } else {
         Some((ip, country))
     }
+}
+
+fn read_fresh_public_ip() -> Option<(String, String)> {
+    let age = public_ip_cache_age_secs()?;
+    if age > PUBLIC_IP_CACHE_TTL_SECS {
+        return None;
+    }
+    read_stored_public_ip()
 }
 
 fn write_stored_public_ip(ip: &str, country: &str) -> Result<(), String> {
@@ -1103,22 +1366,30 @@ fn detect_public_ip() -> Option<(String, String)> {
 
 /// Return the outgoing public IP address and country (e.g. the VPN exit), so the
 /// user can confirm which network/location Prime Video sees them from.
+///
+/// The on-disk value is only a short-lived hint. Returning it forever made the
+/// header show a previous US VPN exit after the Mac was back on a Swiss path.
 #[tauri::command]
-async fn get_public_ip() -> serde_json::Value {
+async fn get_public_ip(app: tauri::AppHandle) -> serde_json::Value {
     let cfg = load_config();
     if !cfg.detect_vpn_region {
         return serde_json::json!({ "ip": null, "country": null });
     }
-    if let Some((ip, country)) = read_stored_public_ip() {
+    if let Some((ip, country)) = read_fresh_public_ip() {
         return serde_json::json!({ "ip": ip, "country": country });
     }
-    // First time: detect on blocking pool to avoid main-thread / event-loop hang.
+    // Cache missing or older than PUBLIC_IP_CACHE_TTL_SECS — look up again.
     match tauri::async_runtime::spawn_blocking(detect_public_ip).await {
         Ok(Some((ip, country))) => {
             let _ = write_stored_public_ip(&ip, &country);
-            serde_json::json!({ "ip": ip, "country": country })
+            let payload = serde_json::json!({ "ip": ip, "country": country });
+            let _ = app.emit("public-ip-updated", &payload);
+            payload
         }
-        _ => serde_json::json!({ "ip": null, "country": null }),
+        _ => match read_stored_public_ip() {
+            Some((ip, country)) => serde_json::json!({ "ip": ip, "country": country }),
+            None => serde_json::json!({ "ip": null, "country": null }),
+        },
     }
 }
 
@@ -1384,19 +1655,23 @@ async fn prefetch_images(app: tauri::AppHandle, items: Vec<ImageItem>) -> Result
 /// The frontend constructs the HTTP URL using the image-server port.
 #[tauri::command]
 async fn list_cached_images() -> Result<Vec<String>, String> {
-    let dir = image_cache_dir();
-    if !dir.exists() {
-        return Ok(vec![]);
-    }
     let mut ids = Vec::new();
-    let mut read_dir = tokio::fs::read_dir(&dir)
-        .await
-        .map_err(|e| e.to_string())?;
-    while let Ok(Some(entry)) = read_dir.next_entry().await {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("jpg") {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                ids.push(stem.to_string());
+    let mut seen = std::collections::HashSet::new();
+    for dir in [image_cache_dir(), legacy_image_cache_dir()] {
+        if !dir.exists() {
+            continue;
+        }
+        let mut read_dir = tokio::fs::read_dir(&dir)
+            .await
+            .map_err(|e| e.to_string())?;
+        while let Ok(Some(entry)) = read_dir.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jpg") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if seen.insert(stem.to_string()) {
+                        ids.push(stem.to_string());
+                    }
+                }
             }
         }
     }
@@ -1803,6 +2078,7 @@ async fn clear_prime_login(app: tauri::AppHandle) -> Result<(), String> {
     let window = WebviewWindowBuilder::new(&app, PRIME_PLAYER_LABEL, WebviewUrl::External(url))
         .title("Prime Video")
         .visible(false)
+        .data_directory(prime_player_data_dir())
         .build()
         .map_err(|e| format!("Failed to open player for cookie clear: {e}"))?;
     window
@@ -1819,20 +2095,29 @@ async fn clear_prime_login(app: tauri::AppHandle) -> Result<(), String> {
 #[serde(rename_all = "camelCase")]
 struct PlayOnTvArgs {
     content_id: String,
+    /// Accepted from the UI but ignored — Settings (`cfg.profile`) is authoritative.
+    #[allow(dead_code)]
     profile: i32,
+    #[serde(default)]
+    #[allow(dead_code)]
+    profile_name: Option<String>,
     tv_ip: String,
     episode: Option<i32>,
     start_seconds: Option<i32>,
+    #[serde(default)]
+    title: Option<String>,
 }
 
 #[tauri::command]
 async fn play_on_tv(app: tauri::AppHandle, args: PlayOnTvArgs) -> Result<String, String> {
     let PlayOnTvArgs {
         content_id,
-        profile,
+        profile: _,
+        profile_name: _,
         tv_ip,
         episode,
         start_seconds,
+        title,
     } = args;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1849,7 +2134,24 @@ async fn play_on_tv(app: tauri::AppHandle, args: PlayOnTvArgs) -> Result<String,
         .to_string_lossy()
         .to_string();
 
-    let _ = app.emit("play-progress", format!("[RUST-PLAY] args: content_id={content_id} episode={:?} start_seconds={:?} profile={}\n", episode, start_seconds, profile));
+    // Settings are the only source for which Prime profile to open.
+    // Do not take a per-play override or a hardcoded name.
+    let profile = cfg.profile;
+    let profile_name = {
+        let n = cfg.profile_name.trim();
+        if n.is_empty() {
+            None
+        } else {
+            Some(n.to_string())
+        }
+    };
+    let _ = app.emit(
+        "play-progress",
+        format!(
+            "[RUST-PLAY] settings profile={profile} profile_name={:?} content_id={content_id} episode={:?} start_seconds={:?}\n",
+            profile_name, episode, start_seconds
+        ),
+    );
     let _ = app.emit("play-progress", format!("Connecting to TV at {tv_ip}...\n"));
 
     let mut command = tokio::process::Command::new(&python);
@@ -1863,7 +2165,18 @@ async fn play_on_tv(app: tauri::AppHandle, args: PlayOnTvArgs) -> Result<String,
         .arg(&content_id)
         .arg("--profile")
         .arg(profile.to_string())
+        .arg("--profile-type")
+        .arg("none")
         .arg("--play");
+    if let Some(ref name) = profile_name {
+        command.arg("--profile-name").arg(name);
+    }
+    if let Some(ref t) = title {
+        let trimmed = t.trim();
+        if !trimmed.is_empty() {
+            command.arg("--title").arg(trimmed);
+        }
+    }
 
     // For TV series, specify which episode to play (season deep links don't
     // auto-play on the TV without an episode).
@@ -2610,8 +2923,42 @@ fn prevent_default_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
         .build()
 }
 
+/// localhost port reserved so another Tauri/Vite app cannot sit on our stack.
+const APP_ISOLATION_PORT: u16 = 14219;
+
+fn isolation_listener() -> &'static Mutex<Option<std::net::TcpListener>> {
+    static HOLDER: OnceLock<Mutex<Option<std::net::TcpListener>>> = OnceLock::new();
+    HOLDER.get_or_init(|| Mutex::new(None))
+}
+
+/// Bind our isolation port. If it is taken, another Prime Remote Control is up.
+fn claim_app_isolation() -> bool {
+    match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, APP_ISOLATION_PORT)) {
+        Ok(listener) => {
+            let _ = listener.set_nonblocking(true);
+            *isolation_listener().lock().unwrap() = Some(listener);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn activate_existing_instance() {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", "tell application \"Prime Remote Control\" to activate"])
+            .status();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if !claim_app_isolation() {
+        activate_existing_instance();
+        return;
+    }
+
     #[cfg(target_os = "macos")]
     set_macos_process_name("Prime Remote Control");
 
@@ -2632,12 +2979,18 @@ pub fn run() {
             // Run region/IP detection in background thread so get_prime_region/get_public_ip
             // and early cache key computation never block the main thread or event loop.
             // This prevents UI hangs on startup (see previous hang reports from ureq blocking).
-            tauri::async_runtime::spawn_blocking(|| {
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
                 if let Some(region) = detect_prime_region() {
                     let _ = write_stored_region(&region);
+                    let _ = handle.emit("prime-region-updated", region);
                 }
                 if let Some((ip, country)) = detect_public_ip() {
                     let _ = write_stored_public_ip(&ip, &country);
+                    let _ = handle.emit(
+                        "public-ip-updated",
+                        serde_json::json!({ "ip": ip, "country": country }),
+                    );
                 }
             });
 
@@ -2647,12 +3000,17 @@ pub fn run() {
             open_external_url,
             open_tmdb_trailer,
             get_config,
+            list_prime_profiles,
+            detect_amazoff,
             save_config,
             discover_tv_mac,
             get_bookmarks,
             add_bookmark,
             remove_bookmark,
             toggle_bookmark,
+            get_now_playing,
+            save_now_playing,
+            clear_now_playing,
             load_catalog,
             search_catalog,
             play_on_mac,

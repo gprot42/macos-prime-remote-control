@@ -40,6 +40,8 @@ interface TVRemoteProps {
   seriesContentId?: string | null;
   onPlaybackStateChange: (s: PlaybackState) => void;
   onDismissPlaying: () => void;
+  /** Open title details (synopsis, year, etc.) for the current now-playing item. */
+  onOpenDetails?: () => void;
 }
 
 // ─── Transport controls (stable module-level components — must NOT be defined
@@ -318,7 +320,7 @@ export default function TVRemote({
   subtitlesFeatureEnabled = false,
   subtitleLanguage = "en",
   seekEnabled = false, seriesContentId = null,
-  onPlaybackStateChange, onDismissPlaying,
+  onPlaybackStateChange, onDismissPlaying, onOpenDetails,
 }: TVRemoteProps) {
 
   const subtitleLabel =
@@ -942,66 +944,81 @@ export default function TVRemote({
       <div className="flex items-center gap-3 h-[72px] px-4 max-w-screen-2xl mx-auto">
 
         {/* ── LEFT: Now Playing ─────────────────────────────────────────── */}
-        <div className="flex items-center gap-3 shrink-0 w-64">
-          {/* Thumbnail — 16:9, prominent */}
-          <div className="shrink-0 w-20 h-[45px] rounded-lg overflow-hidden
-                          bg-zinc-800 border border-zinc-700/60 shadow-md">
-            {nowPlaying && (cachedImageSrc || nowPlaying.image_url) ? (
-              <img
-                src={cachedImageSrc || nowPlaying.image_url!.replace(/\._UR\d+,\d+_\./, "._UR320,180_.")}
-                alt={nowPlaying.title}
-                className="w-full h-full object-cover object-[50%_65%]"
-              />
-            ) : (
-              <div className="w-full h-full flex items-center justify-center">
-                <svg className="w-5 h-5 text-zinc-600" fill="currentColor" viewBox="0 0 20 20">
-                  <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z"/>
-                </svg>
-              </div>
-            )}
-          </div>
+        <div className="flex items-center gap-2 shrink-0 w-64">
+          {/* Thumbnail + title — click opens details for the current title */}
+          <button
+            type="button"
+            disabled={!nowPlaying || !onOpenDetails}
+            onClick={() => { if (nowPlaying && onOpenDetails) onOpenDetails(); }}
+            title={nowPlaying ? `About ${nowPlaying.title}` : undefined}
+            className={`flex items-center gap-3 flex-1 min-w-0 text-left rounded-lg
+                        transition-colors -m-1 p-1
+                        ${nowPlaying && onOpenDetails
+                          ? "hover:bg-zinc-800/70 cursor-pointer"
+                          : "cursor-default"}`}
+          >
+            {/* Thumbnail — 16:9, prominent */}
+            <div className="shrink-0 w-20 h-[45px] rounded-lg overflow-hidden
+                            bg-zinc-800 border border-zinc-700/60 shadow-md">
+              {nowPlaying && (cachedImageSrc || nowPlaying.image_url) ? (
+                <img
+                  src={cachedImageSrc || nowPlaying.image_url!.replace(/\._UR\d+,\d+_\./, "._UR320,180_.")}
+                  alt={nowPlaying.title}
+                  className="w-full h-full object-cover object-[50%_65%]"
+                />
+              ) : (
+                <div className="w-full h-full flex items-center justify-center">
+                  <svg className="w-5 h-5 text-zinc-600" fill="currentColor" viewBox="0 0 20 20">
+                    <path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z"/>
+                  </svg>
+                </div>
+              )}
+            </div>
 
-          {/* Title + meta */}
-          <div className="flex-1 min-w-0">
-            {nowPlaying ? (
-              <>
-                <p className="text-white text-sm font-semibold truncate leading-snug">
-                  {nowPlaying.title}
-                </p>
-                <div className="flex items-center gap-1.5 mt-0.5">
-                  <span className={`w-2 h-2 rounded-full shrink-0 ${
-                    tvOn === false
-                      ? "bg-red-500"
-                      : playbackState === "playing"
-                        ? "bg-emerald-400 animate-pulse"
-                        : "bg-zinc-500"
-                  }`} />
-                  <span className={`text-xs truncate ${tvOn === false ? "text-red-400 font-medium" : "text-zinc-400"}`}>
-                    {tvOn === false
-                      ? "TV unreachable"
-                      : playbackState === "playing" ? "Playing on TV" : "Paused"}
-                    {tvOn !== false && episode != null ? ` · Episode ${episode}` : ""}
-                    {tvOn !== false && episode == null && nowPlaying.year ? ` · ${nowPlaying.year}` : ""}
-                  </span>
-                  {tvOn === false && <QuickFixButton fixing={fixingTv} onClick={handleQuickFix} />}
+            {/* Title + meta */}
+            <div className="flex-1 min-w-0">
+              {nowPlaying ? (
+                <>
+                  <p className="text-white text-sm font-semibold truncate leading-snug">
+                    {nowPlaying.title}
+                  </p>
+                  <div className="flex items-center gap-1.5 mt-0.5">
+                    <span className={`w-2 h-2 rounded-full shrink-0 ${
+                      tvOn === false
+                        ? "bg-red-500"
+                        : playbackState === "playing"
+                          ? "bg-emerald-400 animate-pulse"
+                          : "bg-zinc-500"
+                    }`} />
+                    <span className={`text-xs truncate ${tvOn === false ? "text-red-400 font-medium" : "text-zinc-400"}`}>
+                      {tvOn === false
+                        ? "TV unreachable"
+                        : playbackState === "playing" ? "Playing on TV" : "Paused"}
+                      {tvOn !== false && episode != null ? ` · Episode ${episode}` : ""}
+                      {tvOn !== false && episode == null && nowPlaying.year ? ` · ${nowPlaying.year}` : ""}
+                    </span>
+                  </div>
+                </>
+              ) : tvOn === false ? (
+                <div className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full shrink-0 bg-red-500" />
+                  <div className="flex flex-col gap-0.5 min-w-0">
+                    <p className="text-sm text-red-400 font-semibold leading-tight">TV unreachable</p>
+                    <p className="text-xs text-red-400/70">Power it on, or try a quick fix</p>
+                  </div>
                 </div>
-              </>
-            ) : tvOn === false ? (
-              <div className="flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full shrink-0 bg-red-500" />
-                <div className="flex flex-col gap-0.5 min-w-0">
-                  <p className="text-sm text-red-400 font-semibold leading-tight">TV unreachable</p>
-                  <p className="text-xs text-red-400/70">Power it on, or try a quick fix</p>
+              ) : (
+                <div className="flex flex-col gap-0.5">
+                  <p className="text-sm text-zinc-500 font-medium">Nothing playing</p>
+                  <p className="text-xs text-zinc-700">Select a title to play</p>
                 </div>
-                <QuickFixButton fixing={fixingTv} onClick={handleQuickFix} />
-              </div>
-            ) : (
-              <div className="flex flex-col gap-0.5">
-                <p className="text-sm text-zinc-500 font-medium">Nothing playing</p>
-                <p className="text-xs text-zinc-700">Select a title to play</p>
-              </div>
-            )}
-          </div>
+              )}
+            </div>
+          </button>
+
+          {tvOn === false && (
+            <QuickFixButton fixing={fixingTv} onClick={handleQuickFix} />
+          )}
 
           {/* Dismiss — only when something is playing */}
           {nowPlaying && (

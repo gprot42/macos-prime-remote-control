@@ -72,14 +72,23 @@ export interface PrimeEpisode {
   runtime_min: number | null;
 }
 
+export interface PrimeProfileOption {
+  name: string;
+  index: number;
+  row: number;
+  profile_type: string;
+}
+
 export interface AppConfig {
   tv_ip: string;
   profile: number;
+  /** Optional named Prime picker profile from Settings. When set, play uses this name. */
+  profile_name?: string;
   project_root: string;
   cache_ttl_secs: number;
   /** Show titles included with a Prime subscription (green). */
   show_prime: boolean;
-  /** Show titles requiring a channel add-on (purple). */
+  /** Show titles requiring a channel add-on (HBO, Max, Lionsgate+, …). */
   show_channel: boolean;
   /** Show titles available to rent or buy (orange). */
   show_rent_buy: boolean;
@@ -160,6 +169,7 @@ export const SUBTITLE_LANGUAGES: { code: string; label: string }[] = [
 export const DEFAULT_CONFIG: AppConfig = {
   tv_ip: "192.168.0.79",
   profile: 0,
+  profile_name: "",
   project_root: "",
   cache_ttl_secs: 21600,
   show_prime: true,
@@ -217,9 +227,33 @@ export type AccessLabel = "Prime" | "Channel" | "Rent/Buy" | "Rent" | "Buy" | "?
 /** Broad bucket used for category filtering (maps many labels → 4 categories). */
 export type AccessCategory = "prime" | "channel" | "rent_buy" | "other";
 
+/**
+ * Titles Amazon still cards on "Included with Prime" that are not watchable
+ * with a Prime membership. Unsigned listing copy matches real Prime titles
+ * (same trial/auto-renew offer), so we match by name.
+ */
+export function isKnownNonPrimeMembershipTitle(title: string | null | undefined): boolean {
+  const text = (title || "").trim().toLowerCase();
+  if (!text) return false;
+  return (
+    text === "the vampire diaries" ||
+    text.startsWith("the vampire diaries ") ||
+    text.startsWith("the vampire diaries:") ||
+    text.startsWith("the vampire diaries -")
+  );
+}
+
 export function getAccessLabel(item: PrimeTitle): AccessLabel {
   // Channel add-on is exclusive (not free with Prime membership alone).
   if (item.included_with_channel) return "Channel";
+
+  // Warner / Max series Amazon still parks on Prime storefronts.
+  if (isKnownNonPrimeMembershipTitle(item.title)) {
+    if (item.rent_from && item.buy_from) return "Rent/Buy";
+    if (item.rent_from) return "Rent";
+    if (item.buy_from) return "Buy";
+    return "Rent/Buy";
+  }
 
   // Entitlement / storefront-forced Prime wins over weak unsigned scrape copy.
   // Genre rows often set included_with_prime=true while availability still says

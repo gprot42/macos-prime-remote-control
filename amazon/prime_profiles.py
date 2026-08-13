@@ -197,24 +197,34 @@ def resolve_profile_name(
                 f"{exc} for type {profile_type!r}; configured: {known}"
             ) from exc
 
-    matches: list[tuple[str, PrimeProfileEntry]] = []
-    for ptype in PROFILE_TYPES:
+    # Exact name first. Prefer the single-screen list (`none`) so "D" is not
+    # swallowed by leftover Adult/Kids mappings ("d" is a substring of "Adult").
+    exact: list[tuple[str, PrimeProfileEntry]] = []
+    for ptype in ("none", "adult", "kid"):
         for entry in _entries_for_type(config, ptype):
-            if entry.name.lower() == name.lower() or name.lower() in entry.name.lower():
-                matches.append((ptype, entry))
-
-    exact = [(ptype, entry) for ptype, entry in matches if entry.name.lower() == name.lower()]
+            if entry.name.lower() == name.lower():
+                exact.append((ptype, entry))
+    none_exact = [m for m in exact if m[0] == "none"]
+    if len(none_exact) == 1:
+        return none_exact[0]
     if len(exact) == 1:
         return exact[0]
     if len(exact) > 1:
         options = ", ".join(f'{entry.name!r} ({ptype})' for ptype, entry in exact)
         raise ValueError(f"profile name {name!r} is ambiguous; matches: {options}")
 
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        options = ", ".join(f'{entry.name!r} ({ptype})' for ptype, entry in matches)
-        raise ValueError(f'profile name {name!r} is ambiguous; matches: {options}')
+    if len(name) >= 3:
+        matches = [
+            (ptype, entry)
+            for ptype in ("none", "adult", "kid")
+            for entry in _entries_for_type(config, ptype)
+            if name.lower() in entry.name.lower()
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            options = ", ".join(f'{entry.name!r} ({ptype})' for ptype, entry in matches)
+            raise ValueError(f'profile name {name!r} is ambiguous; matches: {options}')
 
     all_rows = list_profiles(config)
     if not all_rows:

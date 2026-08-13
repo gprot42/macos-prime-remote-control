@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -10,7 +10,9 @@ import {
   CATEGORY_TEXT,
   CATEGORY_BORDER,
   migrateSubtitleFocusRight,
+  PrimeProfileOption,
 } from "../types";
+import { buildPrimeProfilePickerRows } from "../primeProfiles";
 
 const TTL_OPTIONS = [
   { label: "1 hour", secs: 3600 },
@@ -38,7 +40,7 @@ const AVAIL_CATEGORIES: {
     key: "show_channel",
     cat: "channel",
     label: "Channel add-ons",
-    description: "Titles requiring a Prime Video channel (e.g. Lionsgate+, Max)",
+    description: "Titles requiring a Prime Video channel (e.g. HBO, Max, Lionsgate+)",
   },
   {
     key: "show_rent_buy",
@@ -67,6 +69,8 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
   const [scanning, setScanning] = useState(false);
   const [scanMsg, setScanMsg] = useState<string | null>(null);
   const [profile, setProfile] = useState(config.profile);
+  const [profileName, setProfileName] = useState(config.profile_name?.trim() || "");
+  const [profileOptions, setProfileOptions] = useState<PrimeProfileOption[]>([]);
 
   useEffect(() => {
     setTvMac(config.tv_mac ?? "");
@@ -101,10 +105,37 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
   const [error, setError] = useState<string | null>(null);
   const [clearMsg, setClearMsg] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [amazoff, setAmazoff] = useState<{
+    detected: boolean;
+    version?: string;
+  } | null>(null);
 
   useEffect(() => {
     getVersion().then(setAppVersion).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<{ detected: boolean; version?: string | null }>("detect_amazoff")
+      .then((status) => {
+        if (!cancelled) setAmazoff({ detected: !!status?.detected, version: status?.version || undefined });
+      })
+      .catch(() => {
+        if (!cancelled) setAmazoff({ detected: false });
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    invoke<PrimeProfileOption[]>("list_prime_profiles")
+      .then((rows) => setProfileOptions(Array.isArray(rows) ? rows : []))
+      .catch(() => setProfileOptions([]));
+  }, []);
+
+  const profilePickerRows = useMemo(
+    () => buildPrimeProfilePickerRows(profileOptions, profile),
+    [profileOptions, profile],
+  );
 
   const categoryValues: Record<
     "show_prime" | "show_channel" | "show_rent_buy" | "show_other",
@@ -123,6 +154,7 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
       tv_ip: tvIp,
       tv_mac: config.tv_mac ?? tvMac.trim(),
       profile,
+      profile_name: profileName,
       project_root: projectRoot,
       cache_ttl_secs: cacheTtl,
       show_prime: showPrime,
@@ -199,6 +231,12 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
               <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
             </svg>
             <h2 className="text-white font-semibold text-base">Settings</h2>
+            {amazoff?.detected && (
+              <span className="text-[10px] uppercase tracking-wide font-semibold
+                               px-1.5 py-0.5 rounded-md bg-sky-500/20 text-sky-300">
+                AmazOff{amazoff.version ? ` ${amazoff.version}` : ""}
+              </span>
+            )}
           </div>
           <button
             onClick={onClose}
@@ -212,6 +250,17 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
 
         {/* Scrollable body */}
         <div className="flex-1 overflow-y-auto p-6 space-y-7">
+
+          {amazoff?.detected && (
+            <div className="rounded-xl border border-sky-500/40 bg-sky-500/10 px-3.5 py-2.5">
+              <p className="text-sm text-sky-100 font-medium">AmazOff detected</p>
+              <p className="text-xs text-sky-200/75 mt-0.5 leading-relaxed">
+                Prime on this TV is the patched AmazOff app
+                {amazoff.version ? ` (${amazoff.version})` : ""}.
+                Deep links may open Home instead of the chosen title.
+              </p>
+            </div>
+          )}
 
           {/* ── TV Connection ───────────────────────────────────────────── */}
           <section>
@@ -310,18 +359,53 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
                 </p>
               </div>
               <div>
-                <label className="block text-sm text-zinc-300 mb-1.5">Default Profile Index</label>
-                <input
-                  type="number"
-                  min={0}
-                  max={9}
-                  value={profile}
-                  onChange={(e) => setProfile(Math.max(0, parseInt(e.target.value) || 0))}
-                  className="w-24 bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
-                             text-white text-center focus:outline-none focus:border-emerald-500 transition-colors"
-                />
+                <label className="block text-sm text-zinc-300 mb-1.5">Default Prime profile</label>
+                <ul className="space-y-1.5">
+                  {profilePickerRows.map((row) => {
+                    const selected =
+                      (profileName && row.name && profileName === row.name) ||
+                      (!profileName && row.index === profile);
+                    return (
+                      <li key={row.index}>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setProfile(row.index);
+                            setProfileName(row.name);
+                          }}
+                          className={`w-full flex items-center gap-3 rounded-xl px-3 py-2.5 text-left transition-colors
+                            ${selected
+                              ? "bg-emerald-600/20 border border-emerald-500/70"
+                              : "bg-zinc-800 border border-zinc-700 hover:border-zinc-500"}`}
+                        >
+                          <span className="w-8 h-8 shrink-0 rounded-lg bg-zinc-900 border border-zinc-600
+                                           flex items-center justify-center text-sm font-mono text-zinc-200">
+                            {row.index}
+                          </span>
+                          <span className="min-w-0 flex-1">
+                            <span className="flex items-center gap-2 min-w-0">
+                              <span className={`text-sm truncate ${row.name ? "text-white" : "text-zinc-500 italic"}`}>
+                                {row.name || "Unnamed"}
+                              </span>
+                              {row.kids && (
+                                <span className="shrink-0 text-[10px] uppercase tracking-wide font-semibold
+                                                 px-1.5 py-0.5 rounded-md bg-amber-500/20 text-amber-300">
+                                  Kids
+                                </span>
+                              )}
+                            </span>
+                            <span className="block text-[11px] text-zinc-500">Index {row.index}</span>
+                          </span>
+                          {selected && (
+                            <span className="text-emerald-400 text-xs font-medium shrink-0">Selected</span>
+                          )}
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
                 <p className="text-xs text-zinc-500 mt-1.5">
-                  0 = first profile slot in the Prime Video picker
+                  Used for every TV play. Index is the slot on the TV list (0, 1, 2). Save after choosing.
                 </p>
               </div>
               <div>
@@ -667,7 +751,7 @@ export default function SettingsDialog({ config, onClose, onSaved }: SettingsDia
                   onChange={(e) => setProjectRoot(e.target.value)}
                   className="w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2.5 text-sm
                              text-white font-mono focus:outline-none focus:border-emerald-500 transition-colors"
-                  placeholder="/home/user/src/lgtv-fun"
+                  placeholder="/Users/you/src/public/macos-prime-remote-control"
                 />
                 <p className="text-xs text-zinc-500 mt-1.5">
                   Directory containing{" "}
